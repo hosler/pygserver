@@ -11,7 +11,7 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, List, Dict
 
-from .protocol.constants import PLO
+from .protocol.constants import PLO, PLPROP
 from .protocol.packets import PacketBuilder, build_horse_add, build_horse_del
 
 if TYPE_CHECKING:
@@ -274,7 +274,10 @@ class HorseManager:
         await self._broadcast_horse_del(player.level.name, horse.x, horse.y)
 
         # Update player props to show horse
-        # TODO: Send horse props to player
+        await player.send_props({
+            PLPROP.HORSEGIF: horse.image,
+            PLPROP.HORSEBUSHES: horse.bushes,
+        })
 
         logger.info(f"Player {player.id} mounted horse {horse.id}")
         return True

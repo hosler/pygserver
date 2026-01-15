@@ -518,12 +518,14 @@ class CombatManager:
         logger.info(f"Player {player.id} ({player.nickname}) died")
 
         # Update stats
-        # player.deaths += 1  # TODO: Add death tracking
+        player.deaths += 1
+        await player.send_props({PLPROP.DEATHSCOUNT: player.deaths})
 
         if killer_id is not None:
             killer = self.server.get_player(killer_id)
             if killer:
-                # killer.kills += 1  # TODO: Add kill tracking
+                killer.kills += 1
+                await killer.send_props({PLPROP.KILLSCOUNT: killer.kills})
                 logger.info(f"  Killed by {killer.nickname}")
 
         # Trigger NPC death event

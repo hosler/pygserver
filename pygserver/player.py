@@ -90,6 +90,10 @@ class Player:
         self.sword_power = 1
         self.shield_power = 1
 
+        # Combat stats
+        self.kills = 0
+        self.deaths = 0
+
         # Appearance
         self.head_image = "head19.png"
         self.body_image = "body.png"
@@ -327,29 +331,36 @@ class Player:
             self.nickname = self.account_name
 
             # Load account data if available
+            logger.debug(f"Loading account data for {self.account_name}")
             if hasattr(self.server, 'account_manager'):
                 account = self.server.account_manager.get_account(self.account_name)
                 if not account:
                     account = self.server.account_manager.create_account(self.account_name)
                 self.server.account_manager.load_player_from_account(self, account)
                 self.admin_rights = account.admin_rights
+            logger.debug(f"Account data loaded for {self.account_name}")
 
             # Check if banned
+            logger.debug(f"Checking ban status for {self.account_name}")
             if hasattr(self.server, 'account_manager'):
                 account = self.server.account_manager.get_account(self.account_name)
                 if account and account.is_banned:
                     await self.disconnect(f"You are banned: {account.ban_reason}")
                     return False
+            logger.debug(f"Ban check passed for {self.account_name}")
 
             # Verify login (skip if noverifylogin)
+            logger.debug(f"Verify login: {self.server.config.verify_login}")
             if self.server.config.verify_login:
                 password = login.get('password', '')
                 if hasattr(self.server, 'account_manager'):
                     if not self.server.account_manager.verify_password(self.account_name, password):
                         await self.disconnect("Invalid password")
                         return False
+            logger.debug(f"Login verification passed for {self.account_name}")
 
             # Send login response
+            logger.debug(f"About to send login response for {self.account_name}")
             await self._send_login_response()
 
             self.logged_in = True
@@ -357,11 +368,13 @@ class Player:
             logger.info(f"Player {self.id} logged in as {self.account_name}")
 
             # Warp to start level
+            logger.debug(f"Warping player {self.id} to {self.server.config.start_level}")
             await self.warp(
                 self.server.config.start_level,
                 self.server.config.start_x,
                 self.server.config.start_y
             )
+            logger.debug(f"Warp complete for player {self.id}")
 
             return True
 
@@ -369,12 +382,14 @@ class Player:
             logger.warning(f"Login timeout for {self.id}")
             return False
         except Exception as e:
+            import traceback
             logger.error(f"Login error for {self.id}: {e}")
+            logger.error(traceback.format_exc())
             return False
 
     async def _send_login_response(self):
         """Send the login response packet."""
-        builder = PacketBuilder()
+        logger.debug(f"Sending login response for player {self.id}")
 
         # Add PLO_PLAYERPROPS with initial state
         props = {
@@ -393,9 +408,12 @@ class Player:
         }
 
         packet = build_player_props(props)
+        logger.debug(f"Built player props packet, length={len(packet)}")
         encoded = self._codec.encode_packet(packet, is_login_response=True)
+        logger.debug(f"Encoded packet, length={len(encoded)}")
         self._writer.write(encoded)
         await self._writer.drain()
+        logger.debug(f"Login response sent for player {self.id}")
 
     async def _process_data(self, data: bytes):
         """Process received data."""
@@ -1116,11 +1134,16 @@ class Player:
 
         # Build packets
         level_name_pkt = build_level_name(level.name)
-        board_data = level.get_board_packet()
-        announcement = build_raw_data_announcement(len(board_data))
+
+        # Board data format: [packet_id + 32] + [8192 tile bytes] + [\n]
+        tile_data = level.get_board_packet()  # 8192 bytes
+        board_packet = bytes([PLO.BOARDPACKET + 32]) + tile_data + b'\n'
+
+        # Announce raw data size (1 + 8192 + 1 = 8194)
+        announcement = build_raw_data_announcement(len(board_packet))
         warp_packet = build_warp(self.x, self.y, level.name)
 
-        combined = level_name_pkt + announcement + board_data + warp_packet
+        combined = level_name_pkt + announcement + board_packet + warp_packet
         await self.send_raw(combined)
 
         # Send NPCs on level
@@ -1162,6 +1185,11 @@ class Player:
     async def send_packet(self, packet_id: int, data: bytes = b""):
         """Send a packet with given ID and data."""
         packet = PacketBuilder().write_gchar(packet_id).write_bytes(data).write_byte(ord('\n')).build()
+        await self.send_raw(packet)
+
+    async def send_props(self, props: dict):
+        """Send player props to this player (PLO_PLAYERPROPS)."""
+        packet = build_player_props(props)
         await self.send_raw(packet)
 
     def build_props_packet(self) -> bytes:

@@ -202,10 +202,14 @@ class GameServer:
         logger.info("All subsystems stopped")
 
     async def _load_world(self):
-        """Load world data (levels, NPCs, etc.)."""
+        """Load world data (levels, GMAPs, NPCs, etc.)."""
+        from .world import GMap
+
         levels_path = Path(self.config.levels_dir)
         if levels_path.exists():
             logger.info(f"Loading levels from {levels_path}")
+
+            # Load individual levels
             for level_file in levels_path.glob("*.nw"):
                 try:
                     level = Level.load(str(level_file))
@@ -213,6 +217,17 @@ class GameServer:
                     logger.debug(f"Loaded level: {level.name}")
                 except Exception as e:
                     logger.warning(f"Failed to load level {level_file}: {e}")
+
+            # Load GMAPs
+            for gmap_name in self.config.gmaps:
+                gmap_path = levels_path / gmap_name
+                if gmap_path.exists():
+                    try:
+                        gmap = GMap.load(str(gmap_path))
+                        self.world.add_gmap(gmap)
+                        logger.info(f"Loaded GMAP: {gmap.name} ({gmap.width}x{gmap.height})")
+                    except Exception as e:
+                        logger.warning(f"Failed to load GMAP {gmap_name}: {e}")
 
         # Load NPCs from scripts
         npcs_path = Path(self.config.npcs_dir)

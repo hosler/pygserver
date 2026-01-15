@@ -85,34 +85,72 @@ class Level:
 
         return level
 
+    # Base64-like encoding used in NW files for tile data
+    BASE64_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
+
+    def _decode_board_string(self, board_str: str) -> List[int]:
+        """Decode a row of tile data from base64-like encoding."""
+        tiles = []
+        i = 0
+        while i + 1 < len(board_str):
+            char1 = board_str[i]
+            char2 = board_str[i + 1]
+            idx1 = self.BASE64_CHARS.find(char1)
+            idx2 = self.BASE64_CHARS.find(char2)
+            if idx1 >= 0 and idx2 >= 0:
+                tile_id = idx1 * 64 + idx2
+            else:
+                tile_id = 0
+            tiles.append(tile_id)
+            i += 2
+        return tiles
+
     def _parse_nw_file(self, data: bytes):
         """
         Parse NW level file format.
 
         NW format sections:
-        - BOARD: Tile data (4096 tiles, 2 bytes each little-endian)
+        - BOARD: Tile data as base64-encoded text rows
         - LINKS: Level warps
         - SIGNS: Sign text
         - NPCS: Level NPCs
         """
-        # Find BOARD section
-        board_marker = b'BOARD'
-        board_idx = data.find(board_marker)
+        # Decode to text for parsing BOARD lines
+        try:
+            text = data.decode('latin-1', errors='replace')
+        except:
+            text = data.decode('utf-8', errors='replace')
 
-        if board_idx >= 0:
-            # Skip marker and size info
-            tile_start = board_idx + len(board_marker)
+        lines = text.split('\n')
 
-            # Skip any header bytes (format varies)
-            # Try to find where the actual tile data starts
-            # In most NW files, tiles start right after BOARD marker + some bytes
-            while tile_start < len(data) and tile_start < board_idx + 20:
-                # Check if this looks like tile data
-                if tile_start + self.BOARD_SIZE <= len(data):
-                    # Copy tile data
-                    self._tiles = bytearray(data[tile_start:tile_start + self.BOARD_SIZE])
-                    break
-                tile_start += 1
+        # Parse BOARD lines - each is: "BOARD x y width height tile_data"
+        # y is row number (0-63), tile_data is base64-encoded
+        board_rows: Dict[int, List[int]] = {}
+
+        for line in lines:
+            line = line.strip()
+            if line.startswith('BOARD '):
+                parts = line.split(None, 5)  # Split max 6 parts
+                if len(parts) >= 6:
+                    try:
+                        y = int(parts[2])  # Row number
+                        tile_str = parts[5]  # Tile data string
+                        if 0 <= y < 64:
+                            row_tiles = self._decode_board_string(tile_str)
+                            board_rows[y] = row_tiles
+                    except (ValueError, IndexError):
+                        pass
+
+        # Convert parsed rows to binary tile data
+        if board_rows:
+            self._tiles = bytearray(self.BOARD_SIZE)
+            for y in range(64):
+                if y in board_rows:
+                    row_tiles = board_rows[y]
+                    for x, tile_id in enumerate(row_tiles[:64]):
+                        idx = (y * 64 + x) * 2
+                        self._tiles[idx] = tile_id & 0xFF
+                        self._tiles[idx + 1] = (tile_id >> 8) & 0xFF
 
         # Parse LINKS section
         links_marker = b'LINKS'

@@ -552,8 +552,15 @@ def build_warp2(x: float, y: float, level_name: str, gmap_x: int = 0, gmap_y: in
 
 
 def build_player_left(player_id: int) -> bytes:
-    """Build PLO_PLAYERLEFT packet."""
-    return PacketBuilder().write_gchar(PLO.PLAYERLEFT).write_gshort(player_id).write_byte(ord('\n')).build()
+    """Build player left packet using PLO_OTHERPLPROPS with JOINLEAVELVL=0."""
+    # Send PLPROP_JOINLEAVELVL = 0 (leave) via PLO_OTHERPLPROPS
+    return (PacketBuilder()
+        .write_gchar(PLO.OTHERPLPROPS)
+        .write_gshort(player_id)
+        .write_gchar(PLPROP.JOINLEAVELVL)
+        .write_gchar(0)  # 0 = leave
+        .write_byte(ord('\n'))
+        .build())
 
 
 def build_world_time() -> bytes:

@@ -168,6 +168,10 @@ class World:
         """
         return self._level_manager.get_level(name)
 
+    def add_gmap(self, gmap: GMap):
+        """Add a GMAP to the world."""
+        self._gmaps[gmap.name] = gmap
+
     def load_gmap(self, file_path: str) -> Optional[GMap]:
         """Load a GMAP file."""
         gmap = GMap.load(file_path)

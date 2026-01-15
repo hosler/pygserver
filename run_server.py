@@ -3,10 +3,15 @@
 pygserver - Example server runner
 
 Usage:
-    python run_server.py [config_file]
+    python run_server.py [server_dir]
+
+Examples:
+    python run_server.py                    # Run with default config
+    python run_server.py ../funtimes        # Run with funtimes server
+    python run_server.py /path/to/server    # Run with absolute path
 
 Or:
-    python -m pygserver [config_file]
+    python -m pygserver [server_dir]
 """
 
 import asyncio
@@ -29,10 +34,19 @@ async def main():
     )
 
     # Load config
-    config_path = sys.argv[1] if len(sys.argv) > 1 else None
+    server_dir = sys.argv[1] if len(sys.argv) > 1 else None
 
-    if config_path and Path(config_path).exists():
-        config = ServerConfig.from_file(config_path)
+    if server_dir:
+        server_path = Path(server_dir)
+        if server_path.is_dir():
+            # Load from server directory (like funtimes/)
+            config = ServerConfig.from_server_dir(server_dir)
+        elif server_path.is_file():
+            # Load from config file
+            config = ServerConfig.from_file(server_dir)
+        else:
+            print(f"Error: {server_dir} not found")
+            sys.exit(1)
     else:
         config = ServerConfig()
         # Default development settings

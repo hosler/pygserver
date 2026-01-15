@@ -12,7 +12,7 @@ import random
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, List, Dict, Tuple, Set
 
-from .protocol.constants import PLO, LevelItemType
+from .protocol.constants import PLO, PLPROP, LevelItemType
 from .protocol.packets import (
     PacketBuilder,
     build_item_add,
@@ -300,27 +300,39 @@ class ItemManager:
 
         attr, value = ITEM_EFFECTS[item_type]
 
+        props_to_send = {}
+
         if attr == 'rupees':
             player.rupees = min(player.rupees + value, 9999)
+            props_to_send[PLPROP.RUPEESCOUNT] = player.rupees
         elif attr == 'hearts':
             player.hearts = min(player.hearts + value, player.max_hearts)
+            props_to_send[PLPROP.CURPOWER] = int(player.hearts * 2)
         elif attr == 'arrows':
             player.arrows = min(player.arrows + value, 99)
+            props_to_send[PLPROP.ARROWSCOUNT] = player.arrows
         elif attr == 'bombs':
             player.bombs = min(player.bombs + value, 99)
+            props_to_send[PLPROP.BOMBSCOUNT] = player.bombs
         elif attr == 'darts':
             if hasattr(player, 'darts'):
                 player.darts = min(player.darts + value, 99)
+                # Note: DARTS prop not commonly used
         elif attr == 'glove_power':
             player.glove_power = max(player.glove_power, value)
+            props_to_send[PLPROP.GLOVEPOWER] = player.glove_power
         elif attr == 'max_hearts':
             player.max_hearts = min(player.max_hearts + value, 20)
             player.hearts = player.max_hearts  # Full heal on heart container
+            props_to_send[PLPROP.MAXPOWER] = int(player.max_hearts * 2)
+            props_to_send[PLPROP.CURPOWER] = int(player.hearts * 2)
         elif attr == 'spin_attack':
             if hasattr(player, 'has_spin_attack'):
                 player.has_spin_attack = True
 
-        # TODO: Send stat update to player
+        # Send stat update to player
+        if props_to_send:
+            asyncio.create_task(player.send_props(props_to_send))
 
     def add_chest(self, level: 'Level', x: int, y: int,
                   item_type: LevelItemType, sign_index: int = 0) -> LevelChest:
