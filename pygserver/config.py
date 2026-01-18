@@ -16,10 +16,21 @@ class ServerConfig:
     # Server identity
     name: str = "pygserver"
     description: str = "Python Reborn Server"
+    language: str = "English"
+    url: str = "http://www.graal.in/"
 
     # Network
     host: str = "0.0.0.0"
     port: int = 14900
+    serverip: str = "AUTO"  # IP to advertise (AUTO = detect)
+    localip: str = "AUTO"   # Local IP (AUTO = detect)
+
+    # List server connection
+    listip: str = "listserver.graal.in"
+    listport: int = 14900
+    enable_listserver: bool = False  # Enable list server registration
+    hq_password: str = ""            # HQ password
+    hq_level: int = 1                # HQ access level
 
     # Base directory (server root)
     base_dir: str = "."
@@ -98,8 +109,20 @@ class ServerConfig:
                             config.name = value
                         elif key == 'description':
                             config.description = value
+                        elif key == 'language':
+                            config.language = value
+                        elif key == 'url':
+                            config.url = value
                         elif key == 'serverport':
                             config.port = int(value)
+                        elif key == 'serverip':
+                            config.serverip = value
+                        elif key == 'localip':
+                            config.localip = value
+                        elif key == 'listip':
+                            config.listip = value
+                        elif key == 'listport':
+                            config.listport = int(value)
                         elif key == 'staff':
                             config.staff = [s.strip() for s in value.split(',')]
                         elif key == 'noverifylogin':

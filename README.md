@@ -8,6 +8,11 @@ A Python implementation of the Reborn game server, supporting v6.037 protocol wi
 - **Python NPC Scripting**: Write NPC behaviors in Python
 - **Asyncio-based**: Efficient async networking
 - **Compatible with pyReborn**: Connect with the pyReborn pygame client
+- **List Server Integration**: Optional registration with Graal list server for:
+  - Server discovery and player browsing
+  - Account verification (when enabled)
+  - Cross-server messaging
+  - Automatic reconnection with exponential backoff
 
 ## Quick Start
 
@@ -40,14 +45,22 @@ pygserver/
 ├── weapon.py             # Weapon definitions
 ├── world.py              # World/GMAP management
 ├── config.py             # Server configuration
-├── protocol/
-│   ├── encryption.py     # ENCRYPT_GEN_5 implementation
-│   ├── codec.py          # Packet encoding/decoding
-│   ├── constants.py      # Packet IDs (PLI_*, PLO_*)
-│   └── packets.py        # Packet parsing/building
-└── scripting/
-    └── __init__.py       # Python scripting docs
+├── listserver.py         # List server client (registration/verification)
+├── combat.py             # Combat system (bombs, arrows, damage)
+├── items.py              # Item system (ground items, chests)
+├── baddy.py              # Baddy/enemy system
+├── horse.py              # Horse/mount system
+├── rc.py                 # RC (Remote Control) admin system
+├── nc.py                 # NC (NPC Control) system
+├── filesystem.py         # File serving system
+├── account.py            # Account management and persistence
+└── protocol/
+    └── packets.py        # Packet builders (uses reborn-protocol)
 ```
+
+The server uses the shared `reborn-protocol` library for:
+- Encryption/codec (ENCRYPT_GEN_5, packet framing)
+- Protocol constants (PLI/PLO/SVI/SVO packet IDs, PLPROP/NPCPROP property IDs)
 
 ## Python NPC Scripting
 
@@ -120,15 +133,55 @@ npc.set_flag(name, value)     # Set flag
 Create `serveroptions.txt`:
 
 ```ini
+# Server Identity
 name = My Server
-port = 14900
+description = A Python-powered game server
+language = English
+url = http://www.example.com/
+
+# Network
+serverport = 14900
+serverip = AUTO
+localip = AUTO
+
+# List Server (Optional)
+listip = listserver.graal.in
+listport = 14900
+# Set enable_listserver = true in Python config to activate
+
+# Access Control
 staff = admin,moderator
 noverifylogin = true
+
+# Starting Location
 startlevel = onlinestartlocal.nw
 startx = 30
 starty = 30.5
+
+# Limits
 maxplayers = 100
 ```
+
+### List Server Setup
+
+To enable list server registration:
+
+```python
+from pygserver import GameServer, ServerConfig
+
+config = ServerConfig.from_file("serveroptions.txt")
+config.enable_listserver = True  # Enable registration
+config.hq_password = "your-hq-password"  # Optional HQ password
+config.hq_level = 1  # HQ access level (1-3)
+
+server = GameServer(config)
+```
+
+When enabled, the server will:
+- Register with the list server on startup
+- Send player join/leave notifications
+- Support account verification (if `verify_login = True`)
+- Automatically reconnect if disconnected
 
 ## Protocol Support
 

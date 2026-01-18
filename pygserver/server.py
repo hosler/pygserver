@@ -82,6 +82,12 @@ class GameServer:
         # Weapon manager
         self.weapon_manager = None
 
+        # List server client
+        self.listserver = None
+
+        # Remote IP (set by list server)
+        self.remote_ip = ""
+
         # Asyncio server
         self._server: Optional[asyncio.Server] = None
         self._last_heartbeat = 0.0
@@ -178,6 +184,11 @@ class GameServer:
         # Profile manager
         self.profile_manager = ProfileManager(self)
 
+        # List server client
+        from .listserver import ServerListClient
+        self.listserver = ServerListClient(self)
+        await self.listserver.start()
+
         logger.info("All subsystems initialized")
 
     async def _stop_subsystems(self):
@@ -198,6 +209,9 @@ class GameServer:
 
         if self.account_manager:
             await self.account_manager.stop()
+
+        if self.listserver:
+            await self.listserver.stop()
 
         logger.info("All subsystems stopped")
 
@@ -273,6 +287,10 @@ class GameServer:
 
     async def _remove_player(self, player: Player):
         """Remove a player from the server."""
+        # Remove from listserver
+        if self.listserver and player.logged_in:
+            await self.listserver.remove_player(player)
+
         if player.id in self.players:
             del self.players[player.id]
 

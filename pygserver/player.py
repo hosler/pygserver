@@ -359,13 +359,25 @@ class Player:
                         return False
             logger.debug(f"Login verification passed for {self.account_name}")
 
-            # Send login response
-            logger.debug(f"About to send login response for {self.account_name}")
-            await self._send_login_response()
+            # Send login response (may be delayed if using listserver verification)
+            if self.server.config.verify_login and hasattr(self.server, 'listserver') and self.server.listserver:
+                # Use listserver for account verification
+                logger.debug(f"Requesting account verification from listserver for {self.account_name}")
+                await self.server.listserver.verify_account(self, password)
+                # send_login will be called by listserver on success
+                return True
+            else:
+                # Local verification or no verification
+                logger.debug(f"About to send login response for {self.account_name}")
+                await self._send_login_response()
 
             self.logged_in = True
             self.login_time = time.time()
             logger.info(f"Player {self.id} logged in as {self.account_name}")
+
+            # Add player to listserver
+            if hasattr(self.server, 'listserver') and self.server.listserver:
+                await self.server.listserver.add_player(self)
 
             # Warp to start level
             logger.debug(f"Warping player {self.id} to {self.server.config.start_level}")
@@ -386,6 +398,26 @@ class Player:
             logger.error(f"Login error for {self.id}: {e}")
             logger.error(traceback.format_exc())
             return False
+
+    async def send_login(self):
+        """Send login data to player (called after verification)."""
+        await self._send_login_response()
+
+        # Mark as logged in
+        self.logged_in = True
+        self.login_time = time.time()
+        logger.info(f"Player {self.id} logged in as {self.account_name}")
+
+        # Add player to listserver
+        if hasattr(self.server, 'listserver') and self.server.listserver:
+            await self.server.listserver.add_player(self)
+
+        # Warp to start level
+        await self.warp(
+            self.server.config.start_level,
+            self.server.config.start_x,
+            self.server.config.start_y
+        )
 
     async def _send_login_response(self):
         """Send the login response packet."""
