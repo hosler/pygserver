@@ -53,6 +53,11 @@ async def main():
         config.name = "pygserver Development"
         config.verify_login = False
 
+    # Enable list server for testing
+    config.enable_listserver = True
+    config.listip = "listserver.graal.in"
+    config.listport = 14900
+
     # Ensure directories exist
     for dir_name in [config.levels_dir, config.npcs_dir, config.accounts_dir]:
         Path(dir_name).mkdir(exist_ok=True)
@@ -68,15 +73,17 @@ async def main():
     if not example_npc.exists():
         create_example_npc_script(example_npc)
 
+    listserver_status = f"{config.listip}:{config.listport}" if config.enable_listserver else "Disabled"
     print(f"""
 ========================================
       pygserver - Python Reborn Server
 ========================================
-  Name:     {config.name}
-  Port:     {config.port}
-  Levels:   {config.levels_dir}
-  NPCs:     {config.npcs_dir}
-  Protocol: v6.037 (ENCRYPT_GEN_5)
+  Name:       {config.name}
+  Port:       {config.port}
+  Levels:     {config.levels_dir}
+  NPCs:       {config.npcs_dir}
+  Protocol:   v6.037 (ENCRYPT_GEN_5)
+  ListServer: {listserver_status}
 ========================================
 
 Connect with pyReborn:

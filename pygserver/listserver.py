@@ -322,9 +322,16 @@ class ServerListClient:
 
     async def _handle_packet(self, data: bytes):
         """Handle an incoming packet from list server."""
-        reader = PacketReader(data)
+        # Listserver packets are newline-delimited within the decompressed buffer
+        # Split by newlines and process each line as a separate packet
+        lines = data.split(b'\n')
 
-        while reader.has_data():
+        for line in lines:
+            if not line:
+                continue
+
+            reader = PacketReader(line)
+
             # Read packet ID
             packet_id = reader.read_gchar()
             logger.debug(f"Processing packet ID: {packet_id} (SVI enum)")
