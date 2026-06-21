@@ -102,6 +102,9 @@ class Baddy:
     # Animation
     ani: str = ""
 
+    # Baddy image (sent with POWERIMAGE prop)
+    image: str = ""
+
     # Respawn settings
     respawn_time: float = 60.0
     dead: bool = False
@@ -125,7 +128,7 @@ class Baddy:
             BDPROP.X: self.x,
             BDPROP.Y: self.y,
             BDPROP.TYPE: self.baddy_type,
-            BDPROP.POWER: self.health,
+            BDPROP.POWERIMAGE: (self.health, self.image),
             BDPROP.MODE: self.mode,
             BDPROP.DIR: self.direction,
         }

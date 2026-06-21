@@ -16,6 +16,20 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
+# Item name -> id, mirrors GServer-v2 LevelItem::ItemNames (index == LevelItemType).
+from .protocol.constants import LevelItemType as _LevelItemType
+ITEM_NAME_TO_ID: Dict[str, int] = {
+    t.name.lower(): int(t) for t in _LevelItemType if int(t) >= 0
+}
+
+# Baddy name -> type id, mirrors GServer-v2 LevelBaddy::BaddyNames.
+BADDY_NAME_TO_TYPE: Dict[str, int] = {
+    "graysoldier": 0, "bluesoldier": 1, "redsoldier": 2, "shootingsoldier": 3,
+    "swampsoldier": 4, "frog": 5, "octopus": 6, "goldenwarrior": 7,
+    "lizardon": 8, "dragon": 9,
+}
+
+
 class Level:
     """
     Represents a game level (64x64 tiles).
@@ -51,8 +65,14 @@ class Level:
         # Items on ground
         self._items: List[Dict] = []
 
-        # Chests
+        # Chests (parsed from file: {x, y, item, sign})
         self._chests: List[Dict] = []
+
+        # Baddies (parsed from file: {x, y, type, verses})
+        self._baddies: List[Dict] = []
+
+        # NPC definitions (parsed from file: {x, y, image, code})
+        self._npc_defs: List[Dict] = []
 
     @classmethod
     def load(cls, file_path: str) -> 'Level':
@@ -152,84 +172,100 @@ class Level:
                         self._tiles[idx] = tile_id & 0xFF
                         self._tiles[idx + 1] = (tile_id >> 8) & 0xFF
 
-        # Parse LINKS section
-        links_marker = b'LINKS'
-        links_idx = data.find(links_marker)
-        if links_idx >= 0:
-            self._parse_links_section(data, links_idx + len(links_marker))
+        # Parse line-based features (GLEVNW01 text format): LINK, SIGN/SIGNEND,
+        # CHEST, BADDY/BADDYEND. Mirrors GServer-v2 LevelLoader.
+        self._parse_features(lines)
 
-        # Parse SIGNS section
-        signs_marker = b'SIGNS'
-        signs_idx = data.find(signs_marker)
-        if signs_idx >= 0:
-            self._parse_signs_section(data, signs_idx + len(signs_marker))
+    def _parse_features(self, lines: List[str]):
+        """Parse LINK/SIGN/CHEST/BADDY entries from GLEVNW01 lines."""
+        i = 0
+        n = len(lines)
+        while i < n:
+            raw = lines[i].rstrip('\r\n')
+            i += 1
+            stripped = raw.strip()
+            if not stripped:
+                continue
+            parts = stripped.split()
+            section = parts[0]
 
-    def _parse_links_section(self, data: bytes, start: int):
-        """Parse LINKS section from NW file."""
-        # LINKS format: newline-separated link definitions
-        # Each link: "destLevel x y width height destX destY"
-        try:
-            # Find end of section (next section or EOF)
-            end = len(data)
-            for marker in [b'SIGNS', b'NPCS', b'BOARD']:
-                idx = data.find(marker, start)
-                if idx > start:
-                    end = min(end, idx)
-
-            section = data[start:end]
-            lines = section.decode('latin-1', errors='replace').split('\n')
-
-            for line in lines:
-                line = line.strip()
-                if not line:
-                    continue
-                parts = line.split()
-                if len(parts) >= 7:
+            if section == 'LINK' and len(parts) >= 8:
+                # LINK destLevel... x y w h destX destY (level name may contain spaces)
+                try:
+                    dest_level = ' '.join(parts[1:-6])
+                    x, y, w, h = (int(parts[-6]), int(parts[-5]),
+                                  int(parts[-4]), int(parts[-3]))
                     self._links.append({
-                        'dest_level': parts[0],
-                        'x': int(parts[1]),
-                        'y': int(parts[2]),
-                        'width': int(parts[3]),
-                        'height': int(parts[4]),
-                        'dest_x': parts[5],
-                        'dest_y': parts[6]
+                        'dest_level': dest_level,
+                        'x': x, 'y': y, 'width': w, 'height': h,
+                        'dest_x': parts[-2], 'dest_y': parts[-1],
                     })
-        except Exception as e:
-            logger.debug(f"Error parsing links: {e}")
+                except ValueError:
+                    pass
 
-    def _parse_signs_section(self, data: bytes, start: int):
-        """Parse SIGNS section from NW file."""
-        # SIGNS format: x y text (newline separated)
-        try:
-            end = len(data)
-            for marker in [b'LINKS', b'NPCS', b'BOARD']:
-                idx = data.find(marker, start)
-                if idx > start:
-                    end = min(end, idx)
-
-            section = data[start:end]
-            lines = section.decode('latin-1', errors='replace').split('\n')
-
-            i = 0
-            while i < len(lines):
-                line = lines[i].strip()
-                if not line:
-                    i += 1
+            elif section == 'SIGN' and len(parts) == 3:
+                try:
+                    sx, sy = int(parts[1]), int(parts[2])
+                except ValueError:
                     continue
+                text_lines = []
+                while i < n and lines[i].strip() != 'SIGNEND':
+                    text_lines.append(lines[i].rstrip('\r\n'))
+                    i += 1
+                i += 1  # skip SIGNEND
+                self._signs[(sx, sy)] = '\n'.join(text_lines)
 
-                parts = line.split(None, 2)
-                if len(parts) >= 3:
+            elif section == 'CHEST' and len(parts) >= 4:
+                try:
+                    cx, cy = int(parts[1]), int(parts[2])
+                    item_id = ITEM_NAME_TO_ID.get(parts[3].lower())
+                    if item_id is None:
+                        item_id = int(parts[3])
+                    sign = int(parts[4]) if len(parts) >= 5 else 0
+                    self._chests.append({
+                        'x': cx, 'y': cy, 'item': item_id, 'sign': sign,
+                    })
+                except (ValueError, KeyError):
+                    pass
+
+            elif section == 'NPC' and len(parts) >= 3:
+                # NPC <image...> <x> <y>, then GS1 code until NPCEND.
+                try:
+                    nx, ny = float(parts[-2]), float(parts[-1])
+                except ValueError:
+                    continue
+                image = ' '.join(parts[1:-2]).strip()
+                if image == '-':
+                    image = ''
+                code_lines = []
+                while i < n and lines[i].strip() != 'NPCEND':
+                    code_lines.append(lines[i].rstrip('\r\n'))
+                    i += 1
+                i += 1  # skip NPCEND
+                self._npc_defs.append({
+                    'x': nx, 'y': ny, 'image': image,
+                    'code': '\n'.join(code_lines),
+                })
+
+            elif section == 'BADDY' and len(parts) == 4:
+                try:
+                    bx, by = float(parts[1]), float(parts[2])
+                except ValueError:
+                    continue
+                btype = BADDY_NAME_TO_TYPE.get(parts[3].lower())
+                if btype is None:
                     try:
-                        x = int(parts[0])
-                        y = int(parts[1])
-                        text = parts[2]
-                        self._signs[(x, y)] = text
+                        btype = int(parts[3])
                     except ValueError:
-                        pass
-                i += 1
-
-        except Exception as e:
-            logger.debug(f"Error parsing signs: {e}")
+                        btype = 0
+                verses = []
+                while i < n and lines[i].strip() != 'BADDYEND':
+                    verses.append(lines[i].rstrip('\r\n'))
+                    i += 1
+                i += 1  # skip BADDYEND
+                self._baddies.append({
+                    'x': bx, 'y': by, 'type': btype, 'verses': verses,
+                })
 
     def get_tile(self, x: int, y: int) -> int:
         """Get tile ID at position."""
@@ -287,6 +323,22 @@ class Level:
     def get_sign(self, x: int, y: int) -> Optional[str]:
         """Get sign text at position."""
         return self._signs.get((x, y))
+
+    def get_signs(self) -> Dict[Tuple[int, int], str]:
+        """Get all signs as {(x, y): text}."""
+        return self._signs.copy()
+
+    def get_chest_defs(self) -> List[Dict]:
+        """Get chest definitions parsed from the level file."""
+        return self._chests.copy()
+
+    def get_baddy_defs(self) -> List[Dict]:
+        """Get baddy definitions parsed from the level file."""
+        return self._baddies.copy()
+
+    def get_npc_defs(self) -> List[Dict]:
+        """Get NPC definitions parsed from the level file."""
+        return self._npc_defs.copy()
 
     def check_warp(self, x: float, y: float) -> Optional[Dict]:
         """

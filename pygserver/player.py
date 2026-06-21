@@ -639,15 +639,24 @@ class Player:
             await self.server.combat_manager.handle_throw_carried(self, x, y, carried_type)
 
     async def _handle_hurt_player(self, data: bytes):
-        """Handle PLI_HURTPLAYER packet."""
+        """Handle PLI_HURTPLAYER packet.
+
+        Packet format per protocol:
+        - victim_id (gshort)
+        - hurt_dx (gchar) - knockback X direction
+        - hurt_dy (gchar) - knockback Y direction
+        - power (gchar) - damage amount
+        - npc_id (guint) - optional
+        """
         reader = PacketReader(data)
         target_id = reader.read_gshort()
-        power = reader.read_gchar()
-        from_x = reader.read_gchar() / 2.0 if reader.remaining() else self.x
-        from_y = reader.read_gchar() / 2.0 if reader.remaining() else self.y
+        hurt_dx = reader.read_gchar()
+        hurt_dy = reader.read_gchar()
+        power = reader.read_gchar() if reader.remaining() else 1
+        # npc_id = reader.read_guint() if reader.remaining() else 0  # Not used yet
 
         if hasattr(self.server, 'combat_manager'):
-            await self.server.combat_manager.handle_hurt_player(self, target_id, power, from_x, from_y)
+            await self.server.combat_manager.handle_hurt_player(self, target_id, power, hurt_dx, hurt_dy)
 
     async def _handle_explosion(self, data: bytes):
         """Handle PLI_EXPLOSION packet."""
@@ -781,11 +790,14 @@ class Player:
         pass
 
     async def _handle_baddy_hurt(self, data: bytes):
-        """Handle PLI_BADDYHURT packet."""
+        """Handle PLI_BADDYHURT packet.
+
+        Client format (build_baddy_hurt): [gchar baddy_id][gchar damage].
+        """
         if not self.level:
             return
         reader = PacketReader(data)
-        baddy_id = reader.read_gint3()
+        baddy_id = reader.read_gchar()
         damage = reader.read_gchar() if reader.remaining() else 1
 
         if hasattr(self.server, 'baddy_manager'):
@@ -869,29 +881,35 @@ class Player:
             await self.server.npc_manager.on_player_chats(self, message)
 
     async def _handle_private_message(self, data: bytes):
-        """Handle PLI_PRIVATEMESSAGE packet."""
-        reader = PacketReader(data)
-        target_name = reader.read_string()
-        message = reader.remaining().decode('latin-1', errors='replace')
+        """Handle PLI_PRIVATEMESSAGE packet.
 
+        Format: [gshort count][gshort player_id]*count[raw message].
+        """
         if self.is_muted:
             return
 
-        # Find target player
-        target = self.server.get_player_by_name(target_name)
-        if target:
-            packet = build_private_message(self.nickname, message)
-            await target.send_raw(packet)
+        reader = PacketReader(data)
+        count = reader.read_gshort()
+        target_ids = [reader.read_gshort() for _ in range(count)]
+        message = reader.remaining().decode('latin-1', errors='replace')
+
+        for target_id in target_ids:
+            target = self.server.get_player(target_id)
+            if target:
+                packet = build_private_message(self.id, self.nickname, message)
+                await target.send_raw(packet)
 
     async def _handle_show_img(self, data: bytes):
-        """Handle PLI_SHOWIMG packet (level chat)."""
+        """Handle PLI_SHOWIMG packet (used here for level chat).
+
+        The client parses PLO_SHOWIMG with the same layout as chat
+        (gshort id + message), so relay it via build_chat.
+        """
         reader = PacketReader(data)
         message = reader.remaining().decode('latin-1', errors='replace')
 
-        # This is used for level chat messages with coordinates
         if self.level and not self.is_muted:
-            from .protocol.packets import build_show_img
-            packet = build_show_img(self.id, message)
+            packet = build_chat(self.id, message)
             await self.server.broadcast_to_level(self.level.name, packet)
 
     # =========================================================================
@@ -1004,13 +1022,44 @@ class Player:
         """Handle PLI_BOARDMODIFY packet."""
         if not self.level:
             return
-        # Requires admin rights for permanent changes
+
+        # Parse modification data
         reader = PacketReader(data)
         x = reader.read_gchar()
         y = reader.read_gchar()
         w = reader.read_gchar()
         h = reader.read_gchar()
-        # Tile data follows...
+        tile_data = reader.remaining()
+
+        # Validate bounds
+        if x < 0 or y < 0 or w <= 0 or h <= 0:
+            return
+        if x + w > 64 or y + h > 64:
+            return
+
+        # Check permissions (require admin rights for permanent changes)
+        # For now, allow all players to modify tiles (temporary changes)
+        # Permanent changes would require: if not (self.admin_rights & PLPERM.UPDATELEVEL):
+
+        # Apply tile changes
+        expected_size = w * h * 2  # 2 bytes per tile
+        if len(tile_data) < expected_size:
+            return
+
+        idx = 0
+        for ty in range(y, y + h):
+            for tx in range(x, x + w):
+                if idx + 1 < len(tile_data):
+                    tile_id = tile_data[idx] | (tile_data[idx + 1] << 8)
+                    self.level.set_tile(tx, ty, tile_id)
+                    idx += 2
+
+        # Broadcast modification to other players on level
+        from .protocol.packets import build_board_modify
+        packet = build_board_modify(x, y, w, h, tile_data[:expected_size])
+        await self.server.broadcast_to_level(
+            self.level.name, packet, exclude={self.id}
+        )
 
     async def _handle_request_update_board(self, data: bytes):
         """Handle PLI_REQUESTUPDATEBOARD packet."""
@@ -1177,6 +1226,16 @@ class Player:
 
         combined = level_name_pkt + announcement + board_packet + warp_packet
         await self.send_raw(combined)
+
+        # Send signs and links on level
+        from .protocol.packets import build_level_sign, build_level_link
+        for (sx, sy), text in level.get_signs().items():
+            await self.send_raw(build_level_sign(sx, sy, text))
+        for link in level.get_links():
+            await self.send_raw(build_level_link(
+                link['dest_level'], link['x'], link['y'],
+                link['width'], link['height'], link['dest_x'], link['dest_y'],
+            ))
 
         # Send NPCs on level
         for npc in level.get_npcs():

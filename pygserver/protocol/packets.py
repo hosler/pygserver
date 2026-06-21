@@ -7,11 +7,14 @@ for constructing outgoing packets using Reborn protocol encodings.
 Based on GServer-v2 packet formats.
 """
 
+import logging
 from typing import Dict, Any, Optional, List, Tuple
 from .constants import (
     PLO, PLI, PLPROP, NPCPROP, BDPROP, BDMODE, LevelItemType,
     PLSTATUS, PLPERM, NPCVISFLAG, NPCBLOCKFLAG
 )
+
+logger = logging.getLogger(__name__)
 
 
 class PacketReader:
@@ -408,47 +411,108 @@ def build_player_props(props: dict) -> bytes:
     builder = PacketBuilder().write_gchar(PLO.PLAYERPROPS)
 
     for prop_id, value in props.items():
-        builder.write_gchar(prop_id)
-
-        # String properties
-        if prop_id in [PLPROP.NICKNAME, PLPROP.GANI, PLPROP.HEADIMAGE,
-                       PLPROP.CURCHAT, PLPROP.CURLEVEL, PLPROP.BODYIMAGE,
-                       PLPROP.ACCOUNTNAME]:
-            builder.write_gstring(str(value))
-
-        # GATTRIB strings
-        elif PLPROP.GATTRIB1 <= prop_id <= PLPROP.GATTRIB30:
-            builder.write_gstring(str(value))
-
-        # Single byte
-        elif prop_id in [PLPROP.MAXPOWER, PLPROP.CURPOWER, PLPROP.ARROWSCOUNT,
-                         PLPROP.BOMBSCOUNT, PLPROP.GLOVEPOWER, PLPROP.BOMBPOWER,
-                         PLPROP.SPRITE, PLPROP.DIRECTION, PLPROP.STATUS]:
-            builder.write_gchar(int(value))
-
-        # Low-precision position
-        elif prop_id == PLPROP.X:
-            builder.write_gchar(int(value * 2))
-        elif prop_id == PLPROP.Y:
-            builder.write_gchar(int(value * 2))
-
-        # High-precision position
-        elif prop_id == PLPROP.X2:
-            builder.write_position2(float(value))
-        elif prop_id == PLPROP.Y2:
-            builder.write_position2(float(value))
-
-        # Colors (5 bytes)
-        elif prop_id == PLPROP.COLORS:
-            for c in value[:5]:
-                builder.write_gchar(int(c))
-
-        # Rupees (gInt3)
-        elif prop_id == PLPROP.RUPEESCOUNT:
-            builder.write_gint3(int(value))
+        _write_player_prop(builder, prop_id, value)
 
     builder.write_byte(ord('\n'))
     return builder.build()
+
+
+# Sword/shield power: a raw value below the threshold is a bare preset power; at
+# or above it the power is (raw - threshold) followed by an image string. Match
+# the v6.037 (new-world) client reader in pyReborn (_read_sword).
+_SWORD_THRESHOLD = 30
+_SHIELD_THRESHOLD = 10
+
+
+def _write_player_prop(builder: 'PacketBuilder', prop_id: int, value) -> None:
+    """Write a single player property (id + correctly-sized payload).
+
+    Unknown props are skipped WITHOUT writing the prop id, since a bare id with
+    no payload desyncs every following prop in the packet.
+    """
+    # String properties
+    if prop_id in (PLPROP.NICKNAME, PLPROP.GANI,
+                   PLPROP.CURCHAT, PLPROP.CURLEVEL, PLPROP.BODYIMAGE,
+                   PLPROP.ACCOUNTNAME):
+        builder.write_gchar(prop_id)
+        builder.write_gstring(str(value))
+
+    # Head image (HEADGIF, prop 11): a preset id 0-99 is a bare gchar; a custom
+    # image string is gchar(100 + len) followed by the raw chars. Matches
+    # GServer-v2 PropertyHeadGif::serialize and the client _read_headgif.
+    elif prop_id == PLPROP.HEADIMAGE:
+        builder.write_gchar(prop_id)
+        if isinstance(value, int):
+            builder.write_gchar(min(99, value))
+        else:
+            name = str(value).encode('latin-1')
+            builder.write_gchar(100 + len(name))
+            builder.write_bytes(name)
+
+    # GATTRIB strings
+    elif PLPROP.GATTRIB1 <= prop_id <= PLPROP.GATTRIB30:
+        builder.write_gchar(prop_id)
+        builder.write_gstring(str(value))
+
+    # Single byte
+    elif prop_id in (PLPROP.MAXPOWER, PLPROP.CURPOWER, PLPROP.ARROWSCOUNT,
+                     PLPROP.BOMBSCOUNT, PLPROP.GLOVEPOWER, PLPROP.BOMBPOWER,
+                     PLPROP.SPRITE, PLPROP.DIRECTION, PLPROP.STATUS):
+        builder.write_gchar(prop_id)
+        builder.write_gchar(int(value))
+
+    # Sword/shield power (bare gchar for preset powers; image form above threshold)
+    elif prop_id == PLPROP.SWORDPOWER:
+        builder.write_gchar(prop_id)
+        _write_sword_prop(builder, value, _SWORD_THRESHOLD)
+    elif prop_id == PLPROP.SHIELDPOWER:
+        builder.write_gchar(prop_id)
+        _write_sword_prop(builder, value, _SHIELD_THRESHOLD)
+
+    # Low-precision position (half-tiles)
+    elif prop_id == PLPROP.X:
+        builder.write_gchar(prop_id)
+        builder.write_gchar(int(value * 2))
+    elif prop_id == PLPROP.Y:
+        builder.write_gchar(prop_id)
+        builder.write_gchar(int(value * 2))
+
+    # High-precision position
+    elif prop_id == PLPROP.X2:
+        builder.write_gchar(prop_id)
+        builder.write_position2(float(value))
+    elif prop_id == PLPROP.Y2:
+        builder.write_gchar(prop_id)
+        builder.write_position2(float(value))
+
+    # Colors: v6.037 new-world expects 8 bytes (pad shorter lists with 0).
+    elif prop_id == PLPROP.COLORS:
+        builder.write_gchar(prop_id)
+        colors = list(value)[:8]
+        colors += [0] * (8 - len(colors))
+        for c in colors:
+            builder.write_gchar(int(c))
+
+    # Rupees (gInt3)
+    elif prop_id == PLPROP.RUPEESCOUNT:
+        builder.write_gchar(prop_id)
+        builder.write_gint3(int(value))
+
+    else:
+        logger.warning("build_player_props: unhandled prop %s (skipped)", prop_id)
+
+
+def _write_sword_prop(builder: 'PacketBuilder', value, threshold: int) -> None:
+    """Write a SWORDPOWER/SHIELDPOWER payload.
+
+    `value` may be an int power (no image) or a (power, image) tuple.
+    """
+    if isinstance(value, (tuple, list)):
+        power, image = int(value[0]), str(value[1])
+        builder.write_gchar(threshold + power)
+        builder.write_gstring(image)
+    else:
+        builder.write_gchar(int(value))
 
 
 def build_other_player_props(player_id: int, props: dict) -> bytes:
@@ -456,61 +520,45 @@ def build_other_player_props(player_id: int, props: dict) -> bytes:
     builder = PacketBuilder().write_gchar(PLO.OTHERPLPROPS).write_gshort(player_id)
 
     for prop_id, value in props.items():
-        builder.write_gchar(prop_id)
-
-        # String properties
-        if prop_id in [PLPROP.NICKNAME, PLPROP.GANI, PLPROP.HEADIMAGE,
-                       PLPROP.CURCHAT, PLPROP.CURLEVEL, PLPROP.BODYIMAGE,
-                       PLPROP.ACCOUNTNAME]:
-            builder.write_gstring(str(value))
-
-        # GATTRIB strings
-        elif PLPROP.GATTRIB1 <= prop_id <= PLPROP.GATTRIB30:
-            builder.write_gstring(str(value))
-
-        # Single byte
-        elif prop_id in [PLPROP.MAXPOWER, PLPROP.CURPOWER, PLPROP.ARROWSCOUNT,
-                         PLPROP.BOMBSCOUNT, PLPROP.GLOVEPOWER, PLPROP.BOMBPOWER,
-                         PLPROP.SPRITE, PLPROP.DIRECTION, PLPROP.STATUS]:
-            builder.write_gchar(int(value))
-
-        # Low-precision position
-        elif prop_id == PLPROP.X:
-            builder.write_gchar(int(value * 2))
-        elif prop_id == PLPROP.Y:
-            builder.write_gchar(int(value * 2))
-
-        # High-precision position
-        elif prop_id == PLPROP.X2:
-            builder.write_position2(float(value))
-        elif prop_id == PLPROP.Y2:
-            builder.write_position2(float(value))
-
-        # Colors (5 bytes)
-        elif prop_id == PLPROP.COLORS:
-            for c in value[:5]:
-                builder.write_gchar(int(c))
+        _write_player_prop(builder, prop_id, value)
 
     builder.write_byte(ord('\n'))
     return builder.build()
 
 
+# NPCProp string ids (length-prefixed strings), per GServer-v2 NPC.h + the
+# client parse_npc_props. IMAGE, SWORD/SHIELD image, GANI, MESSAGE, NICKNAME,
+# HORSEIMAGE, BODYIMAGE and all GATTRIBs.
+_NPC_STRING_PROPS = frozenset(
+    {0, 10, 11, 12, 15, 20, 21, 35} | set(range(36, 48)) | set(range(53, 74))
+)
+
+
 def build_npc_props(npc_id: int, props: dict) -> bytes:
-    """Build PLO_NPCPROPS packet."""
+    """Build PLO_NPCPROPS packet.
+
+    Encodings mirror GServer-v2 NPC props / the client parse_npc_props:
+    IMAGE/GANI/etc are length-prefixed strings, SCRIPT is a gshort-length string,
+    X/Y are half-tiles, HEADIMAGE uses the HEADGIF 100-offset form, everything
+    else is a single byte.
+    """
     builder = PacketBuilder().write_gchar(PLO.NPCPROPS).write_gint3(npc_id)
 
     for prop_id, value in props.items():
         builder.write_gchar(prop_id)
 
-        if prop_id == 0:  # Image
+        if prop_id in _NPC_STRING_PROPS:
             builder.write_gstring(str(value))
-        elif prop_id == 1:  # Script (gShort length)
+        elif prop_id == NPCPROP.SCRIPT:  # gShort length + raw
             encoded = str(value).encode('latin-1', errors='replace')
             builder.write_gshort(len(encoded)).write_bytes(encoded)
-        elif prop_id in [2, 3]:  # X, Y position
+        elif prop_id in (NPCPROP.X, NPCPROP.Y):
             builder.write_gchar(int(value * 2))
-        elif prop_id == 5:  # Direction
-            builder.write_gchar(int(value))
+        elif prop_id == NPCPROP.HEADIMAGE:  # HEADGIF 100-offset string
+            name = str(value).encode('latin-1')
+            builder.write_gchar(100 + len(name)).write_bytes(name)
+        elif prop_id == NPCPROP.RUPEES:
+            builder.write_gint3(int(value))
         else:
             builder.write_gchar(int(value) if isinstance(value, (int, float)) else 0)
 
@@ -538,15 +586,22 @@ def build_warp(x: float, y: float, level_name: str = "") -> bytes:
     return builder.build()
 
 
-def build_warp2(x: float, y: float, level_name: str, gmap_x: int = 0, gmap_y: int = 0) -> bytes:
-    """Build PLO_PLAYERWARP2 packet for GMAP warps."""
+def build_warp2(x: float, y: float, level_name: str, gmap_x: int = 0,
+                gmap_y: int = 0, z: int = 0) -> bytes:
+    """Build PLO_PLAYERWARP2 packet for GMAP warps.
+
+    Format (GServer-v2 PlayerClient + client parse_playerwarp2):
+        [gchar x*2][gchar y*2][gchar z][gchar gmap_x][gchar gmap_y][raw level name]
+    The level name is a raw trailing string (no length prefix), so this packet
+    is self-terminating and must come last in its frame.
+    """
     builder = PacketBuilder().write_gchar(PLO.PLAYERWARP2)
     builder.write_gchar(int(x * 2))
     builder.write_gchar(int(y * 2))
-    builder.write_gstring(level_name)
-    # GMAP grid position
+    builder.write_gchar(int(z))
     builder.write_gchar(gmap_x)
     builder.write_gchar(gmap_y)
+    builder.write_string(level_name)
     builder.write_byte(ord('\n'))
     return builder.build()
 
@@ -577,12 +632,41 @@ def build_npc_del(npc_id: int) -> bytes:
     return PacketBuilder().write_gchar(PLO.NPCDEL).write_gint3(npc_id).write_byte(ord('\n')).build()
 
 
-def build_level_sign(x: float, y: float, text: str) -> bytes:
-    """Build PLO_LEVELSIGN packet."""
+# Graal sign-text alphabet (GServer-v2 LevelSign.cpp `signText`). Each plain
+# character maps to its index in this string, written as a GChar (index + 32).
+_SIGN_ALPHABET = (
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+    "0123456789!?-.,#>()#####\"####':/~&### <####;\n"
+)
+
+
+def encode_sign_text(text: str) -> bytes:
+    """Encode plain sign text into the Graal sign-code byte stream.
+
+    Mirrors GServer-v2 encodeSign/encodeSignCode for the common (non-symbol)
+    case: each line is encoded char-by-char against the sign alphabet and
+    terminated with an encoded newline. Characters absent from the alphabet are
+    dropped (button-symbol '#' escapes are not emitted by the server fixtures).
+    """
+    out = bytearray()
+    for line in text.split('\n'):
+        for ch in line:
+            idx = _SIGN_ALPHABET.find(ch)
+            if idx == -1 and ch == '#':
+                idx = 86
+            if idx != -1:
+                out.append((idx + 32) & 0xFF)
+        # Encoded newline (alphabet index of '\n').
+        out.append((_SIGN_ALPHABET.find('\n') + 32) & 0xFF)
+    return bytes(out)
+
+
+def build_level_sign(x: int, y: int, text: str) -> bytes:
+    """Build PLO_LEVELSIGN packet: [gchar x][gchar y][encoded text]."""
     builder = PacketBuilder().write_gchar(PLO.LEVELSIGN)
-    builder.write_gchar(int(x * 2))
-    builder.write_gchar(int(y * 2))
-    builder.write_string(text)
+    builder.write_gchar(int(x))
+    builder.write_gchar(int(y))
+    builder.write_bytes(encode_sign_text(text))
     builder.write_byte(ord('\n'))
     return builder.build()
 
@@ -634,13 +718,21 @@ def build_explosion(x: float, y: float, radius: int, power: int) -> bytes:
     return builder.build()
 
 
-def build_hurt_player(player_id: int, power: int, from_x: float, from_y: float) -> bytes:
-    """Build PLO_HURTPLAYER packet."""
+def build_hurt_player(attacker_id: int, hurt_dx: int, hurt_dy: int,
+                      power: int, npc_id: int = 0) -> bytes:
+    """Build PLO_HURTPLAYER packet.
+
+    Format (GServer-v2 msgPLI_HURTPLAYER relay):
+        [gshort attacker_id][gchar hurtdx][gchar hurtdy][gchar power][gint3 npc]
+    `power` is the damage in half-hearts. attacker_id is the player dealing the
+    damage (0 = environment).
+    """
     builder = PacketBuilder().write_gchar(PLO.HURTPLAYER)
-    builder.write_gshort(player_id)
-    builder.write_gchar(power)
-    builder.write_gchar(int(from_x * 2))
-    builder.write_gchar(int(from_y * 2))
+    builder.write_gshort(attacker_id)
+    builder.write_gchar(int(hurt_dx))
+    builder.write_gchar(int(hurt_dy))
+    builder.write_gchar(int(power))
+    builder.write_gint3(npc_id)
     builder.write_newline()
     return builder.build()
 
@@ -706,13 +798,20 @@ def build_item_del(x: float, y: float) -> bytes:
     return builder.build()
 
 
-def build_level_chest(x: int, y: int, item_type: int, sign_index: int) -> bytes:
-    """Build PLO_LEVELCHEST packet."""
+def build_level_chest(opened: bool, x: int, y: int,
+                      item_type: int = 0, sign_index: int = 0) -> bytes:
+    """Build PLO_LEVELCHEST packet.
+
+    Format (GServer-v2 sendChestsToPlayer): [gchar opened][gchar x][gchar y],
+    plus [gchar item][gchar sign] only for *unopened* chests announced on entry.
+    """
     builder = PacketBuilder().write_gchar(PLO.LEVELCHEST)
+    builder.write_gchar(1 if opened else 0)
     builder.write_gchar(x)
     builder.write_gchar(y)
-    builder.write_gchar(item_type)
-    builder.write_gchar(sign_index)
+    if not opened:
+        builder.write_gchar(item_type)
+        builder.write_gchar(sign_index)
     builder.write_newline()
     return builder.build()
 
@@ -855,12 +954,18 @@ def build_hide_npcs(hide: bool) -> bytes:
 # Communication Packets
 # =============================================================================
 
-def build_private_message(sender: str, message: str) -> bytes:
-    """Build PLO_PRIVATEMESSAGE packet."""
+def build_private_message(from_id: int, sender_name: str, message: str) -> bytes:
+    """Build PLO_PRIVATEMESSAGE packet.
+
+    Format (GServer-v2 Player.cpp:1037): [gshort from_id][raw typed message],
+    where the body is `"<sender>","Private message:",<message>`. The client
+    (parse_private_message) reads the leading short as the sender id, then splits
+    the comma-quoted body into type + message.
+    """
+    body = f'"{sender_name}","Private message:",{message}'
     builder = PacketBuilder().write_gchar(PLO.PRIVATEMESSAGE)
-    builder.write_gshort(len(sender))
-    builder.write_string(sender)
-    builder.write_string(message)
+    builder.write_gshort(from_id)
+    builder.write_string(body)
     builder.write_newline()
     return builder.build()
 
@@ -979,11 +1084,22 @@ def build_minimap(text: str) -> bytes:
 # File Packets
 # =============================================================================
 
-def build_file(filename: str, data: bytes) -> bytes:
-    """Build PLO_FILE packet."""
+def build_file(filename: str, data: bytes, mod_time: int = 0) -> bytes:
+    """Build PLO_FILE packet.
+
+    Format (GServer-v2 sendFile, client >= 2.1):
+        [gchar PLO_FILE][gint5 modTime][gchar len(filename)][filename][data][\\n]
+
+    This packet contains arbitrary bytes (incl. newlines) so it must be preceded
+    by a PLO_RAWDATA announcement of its total length.
+    """
+    name = filename.encode('latin-1')
     builder = PacketBuilder().write_gchar(PLO.FILE)
-    builder.write_gstring(filename)
+    builder.write_gint5(mod_time)
+    builder.write_gchar(len(name))
+    builder.write_bytes(name)
     builder.write_bytes(data)
+    builder.write_byte(ord('\n'))
     return builder.build()
 
 

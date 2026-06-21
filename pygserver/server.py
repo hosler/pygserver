@@ -228,6 +228,7 @@ class GameServer:
                 try:
                     level = Level.load(str(level_file))
                     self.world.add_level(level)
+                    await self._register_level_features(level)
                     logger.debug(f"Loaded level: {level.name}")
                 except Exception as e:
                     logger.warning(f"Failed to load level {level_file}: {e}")
@@ -248,6 +249,43 @@ class GameServer:
         if npcs_path.exists():
             logger.info(f"Loading NPC scripts from {npcs_path}")
             await self.npc_manager.load_scripts(npcs_path)
+
+    async def _register_level_features(self, level):
+        """Register chests/baddies parsed from a level file into the managers."""
+        from .protocol.constants import LevelItemType
+        from .baddy import BaddyType
+
+        if hasattr(self, 'item_manager') and self.item_manager:
+            for chest in level.get_chest_defs():
+                try:
+                    self.item_manager.add_chest(
+                        level, chest['x'], chest['y'],
+                        LevelItemType(chest['item']), chest.get('sign', 0)
+                    )
+                except (ValueError, KeyError) as e:
+                    logger.debug(f"Skipping chest in {level.name}: {e}")
+
+        if hasattr(self, 'baddy_manager') and self.baddy_manager:
+            for baddy in level.get_baddy_defs():
+                try:
+                    await self.baddy_manager.add_baddy(
+                        level, baddy['x'], baddy['y'], BaddyType(baddy['type'])
+                    )
+                except (ValueError, KeyError) as e:
+                    logger.debug(f"Skipping baddy in {level.name}: {e}")
+
+        # Spawn level NPCs that have an image (visible). GS1 inline scripts are
+        # not executed (pygserver uses Python NPC scripting), but the NPC still
+        # appears so the level looks correct.
+        if self.npc_manager:
+            for ndef in level.get_npc_defs():
+                if not ndef.get('image'):
+                    continue
+                npc = self.npc_manager.create_npc(
+                    name="levelnpc", level=level,
+                    x=ndef['x'], y=ndef['y']
+                )
+                npc.image = ndef['image']
 
     async def _handle_connection(self, reader: asyncio.StreamReader,
                                   writer: asyncio.StreamWriter):

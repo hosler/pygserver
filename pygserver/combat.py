@@ -490,8 +490,9 @@ class CombatManager:
         # Grant brief invincibility (1 second)
         self._invincible[player.id] = time.time() + 1.0
 
-        # Send hurt packet to player
-        packet = build_hurt_player(player.id, damage, knockback_x, knockback_y)
+        # Send hurt packet to victim (attacker_id, knockback, power in half-hearts)
+        packet = build_hurt_player(attacker_id or 0, int(knockback_x),
+                                   int(knockback_y), damage)
         await player.send_raw(packet)
 
         # Broadcast to level

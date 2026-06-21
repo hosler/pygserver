@@ -440,7 +440,7 @@ class ServerListClient:
         packet = PacketBuilder()
         packet.write_gchar(SVO.PLYRADD)
         packet.write_gshort(player.id)
-        packet.write_gchar(player.type)
+        packet.write_gchar(player.connection_type)
 
         # Add player properties
         packet.write_gchar(PLPROP.ACCOUNTNAME)
@@ -463,7 +463,7 @@ class ServerListClient:
         packet.write_gchar(int(player.y * 2))
 
         packet.write_gchar(PLPROP.ALIGNMENT)
-        packet.write_gchar(player.ap)
+        packet.write_gchar(getattr(player, 'ap', 0))  # alignment points, default 0
 
         # IP address (don't send actual IP for privacy)
         packet.write_gchar(PLPROP.IPADDR)
@@ -472,9 +472,7 @@ class ServerListClient:
         await self._send_packet(packet.build())
 
         # Notify player that list server is connected
-        notify_packet = PacketBuilder()
-        notify_packet.write_gchar(PLO.SERVERLISTCONNECTED)
-        await player.send_packet(notify_packet.build())
+        await player.send_packet(PLO.SERVERLISTCONNECTED)
 
     async def remove_player(self, player: 'Player'):
         """Remove a player from the list server."""
@@ -500,7 +498,7 @@ class ServerListClient:
         packet.write_gchar(len(password))
         packet.write_bytes(password.encode('latin1'))
         packet.write_gshort(player.id)
-        packet.write_gchar(player.type)
+        packet.write_gchar(player.connection_type)
         packet.write_gshort(len(identity))
         packet.write_bytes(identity.encode('latin1'))
         await self._send_packet(packet.build())

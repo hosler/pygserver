@@ -18,6 +18,7 @@ from .protocol.constants import PLO
 from .protocol.packets import (
     PacketBuilder,
     build_file,
+    build_raw_data_announcement,
     build_file_send_failed,
     build_file_uptodate,
     build_large_file_start,
@@ -189,13 +190,11 @@ class FileSystem:
             with open(file_path, 'rb') as f:
                 data = f.read()
 
-            # Compress if beneficial
-            compressed = zlib.compress(data, 6)
-            if len(compressed) < len(data):
-                data = compressed
-
-            packet = build_file(filename, data)
-            await player.send_raw(packet)
+            # PLO_FILE carries raw bytes (with newlines), so announce its full
+            # length via PLO_RAWDATA first; the codec compresses the stream.
+            file_packet = build_file(filename, data)
+            announcement = build_raw_data_announcement(len(file_packet))
+            await player.send_raw(announcement + file_packet)
 
             logger.debug(f"Sent file {filename} to player {player.id} ({len(data)} bytes)")
 

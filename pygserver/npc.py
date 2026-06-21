@@ -93,10 +93,13 @@ class NPC:
             NPCPROP.IMAGE: self.image,
             NPCPROP.X: self.x,
             NPCPROP.Y: self.y,
-            NPCPROP.DIRECTION: self.direction,
+            # SPRITE carries the facing direction in its low 2 bits.
+            NPCPROP.SPRITE: self.direction & 0x03,
         }
         if self.gani:
-            props[NPCPROP.ANI] = self.gani
+            props[NPCPROP.GANI] = self.gani
+        if self.nickname:
+            props[NPCPROP.NICKNAME] = self.nickname
         return build_npc_props(self.id, props)
 
     async def trigger_event(self, event_name: str, *args):

@@ -436,8 +436,8 @@ class ItemManager:
         # Give item
         await self.give_item_to_player(player, chest.item_type)
 
-        # Send chest open packet
-        packet = build_level_chest(x, y, chest.item_type.value, chest.sign_index)
+        # Send chest open packet (3-byte opened form, no item/sign)
+        packet = build_level_chest(True, x, y)
         await player.send_raw(packet)
 
         logger.info(f"Player {player.id} opened chest at ({x}, {y}), got {chest.item_type.name}")
@@ -544,10 +544,11 @@ class ItemManager:
             packet = build_item_add(item.x, item.y, item.item_type.value)
             await player.send_raw(packet)
 
-        # Send chests (that player hasn't opened)
+        # Announce chests: opened ones as the 3-byte form, unopened with item/sign
         for chest in self.get_chests_on_level(level.name):
-            if player.account_name not in chest.opened_by:
-                packet = build_level_chest(
-                    chest.x, chest.y, chest.item_type.value, chest.sign_index
-                )
-                await player.send_raw(packet)
+            opened = player.account_name in chest.opened_by
+            packet = build_level_chest(
+                opened, chest.x, chest.y,
+                chest.item_type.value, chest.sign_index
+            )
+            await player.send_raw(packet)

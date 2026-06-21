@@ -406,7 +406,8 @@ class AccountManager:
         player.body_image = account.body_image
         player.colors = account.colors.copy()
         player.max_hearts = account.max_hearts
-        player.hearts = account.hearts
+        # Don't let player spawn dead - restore to max hearts if saved with 0
+        player.hearts = account.hearts if account.hearts > 0 else account.max_hearts
         player.rupees = account.rupees
         player.bombs = account.bombs
         player.arrows = account.arrows
