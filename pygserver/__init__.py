@@ -8,9 +8,10 @@ with Python NPC scripting.
 __version__ = "0.1.0"
 
 from .server import GameServer
+from .config import ServerConfig
 from .player import Player
 from .level import Level
 from .npc import NPC
 from .world import World
 
-__all__ = ["GameServer", "Player", "Level", "NPC", "World"]
+__all__ = ["GameServer", "ServerConfig", "Player", "Level", "NPC", "World"]

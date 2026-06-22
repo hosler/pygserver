@@ -38,6 +38,7 @@ python -m pyreborn.example_pygame <username> <password> localhost 14900
 ```
 pygserver/
 ├── __init__.py           # Package exports
+├── __main__.py           # `python -m pygserver` entry point
 ├── server.py             # Main GameServer class (asyncio)
 ├── player.py             # Player connection handling
 ├── level.py              # Level loading and management
@@ -55,7 +56,10 @@ pygserver/
 ├── filesystem.py         # File serving system
 ├── account.py            # Account management and persistence
 └── protocol/
-    └── packets.py        # Packet builders (uses reborn-protocol)
+    ├── packets.py        # Packet builders (uses reborn-protocol)
+    ├── codec.py          # Re-export shim → reborn_protocol.codec
+    ├── constants.py      # Re-export shim → reborn_protocol.constants
+    └── encryption.py     # Re-export shim → reborn_protocol.encryption
 ```
 
 The server uses the shared `reborn-protocol` library for:
