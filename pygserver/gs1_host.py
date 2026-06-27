@@ -587,6 +587,261 @@ def _c_takehorse(self, a, npc, player, ctx):
         _schedule(hm.remove_horse(lvl.name, horse.id))
 
 
+# -- items ------------------------------------------------------------------
+def _spawn_item(self, ctx, code, x, y):
+    im = getattr(self.server, "item_manager", None) if self.server is not None else None
+    lvl = self._level_of(ctx)
+    if im is None or lvl is None or not hasattr(im, "spawn_item"):
+        return
+    try:
+        from .protocol.constants import LevelItemType
+        item_type = LevelItemType(int(to_num(code)))
+    except Exception:
+        return
+    _schedule(im.spawn_item(lvl, to_num(x), to_num(y), item_type))
+
+
+def _c_lay(self, a, npc, player, ctx):
+    # lay itemname — drop an item at the NPC's position
+    if npc is None or not a:
+        return
+    _spawn_item(self, ctx, a[0], getattr(npc, "x", 0), getattr(npc, "y", 0))
+
+
+def _c_lay2(self, a, npc, player, ctx):
+    # lay2 itemname,x,y — drop an item at an exact position
+    if len(a) >= 3:
+        _spawn_item(self, ctx, a[0], a[1], a[2])
+
+
+def _c_take(self, a, npc, player, ctx):
+    # take itemname — remove matching items within ~10 tiles of the NPC
+    im = getattr(self.server, "item_manager", None) if self.server is not None else None
+    lvl = self._level_of(ctx)
+    if im is None or lvl is None or npc is None or not hasattr(im, "get_items_on_level"):
+        return
+    try:
+        from .protocol.constants import LevelItemType
+        want = LevelItemType(int(to_num(a[0]))) if a else None
+    except Exception:
+        return
+    nx, ny = to_num(getattr(npc, "x", 0)), to_num(getattr(npc, "y", 0))
+    for it in im.get_items_on_level(lvl.name):
+        if (want is None or it.item_type == want) and abs(it.x - nx) <= 10 and abs(it.y - ny) <= 10:
+            _schedule(im.remove_item(lvl.name, it.x, it.y))
+
+
+def _c_toweapons(self, a, npc, player, ctx):
+    # toweapons name — turn this NPC into a weapon and give it to the player
+    if player is None or npc is None or not a:
+        return
+    name = to_str(a[0])
+    if hasattr(player, "add_weapon"):
+        player.add_weapon(name)
+    if hasattr(player, "send_raw"):
+        try:
+            from .protocol.packets import build_npc_weapon_add
+            _schedule(player.send_raw(build_npc_weapon_add(
+                name, to_str(getattr(npc, "image", "")), "")))
+        except Exception:
+            logger.debug("toweapons send failed for %s", name, exc_info=True)
+
+
+# -- board ------------------------------------------------------------------
+def _c_updateboard(self, a, npc, player, ctx):
+    # updateboard x,y,width,height — re-broadcast a region of the level board
+    if len(a) < 4 or self.server is None:
+        return
+    lvl = self._level_of(ctx)
+    if lvl is None or not hasattr(lvl, "_tiles"):
+        return
+    x = max(0, int(to_num(a[0])))
+    y = max(0, int(to_num(a[1])))
+    w = max(0, min(64 - x, int(to_num(a[2]))))
+    h = max(0, min(64 - y, int(to_num(a[3]))))
+    if w == 0 or h == 0:
+        return
+    tiles = bytearray()
+    for row in range(y, y + h):
+        start = (row * 64 + x) * 2
+        tiles += bytes(lvl._tiles[start:start + w * 2])
+    try:
+        from .protocol.packets import build_board_modify
+        _schedule(self.server.broadcast_to_level(
+            lvl.name, build_board_modify(x, y, w, h, bytes(tiles))))
+    except Exception:
+        logger.debug("updateboard failed", exc_info=True)
+
+
+# -- player state -----------------------------------------------------------
+def _c_setplayerdir(self, a, npc, player, ctx):
+    if player is None or not a:
+        return
+    d = int(to_num(a[0])) & 3
+    player.direction = d
+    if PLPROP is not None:
+        _queue_player_prop(player, PLPROP.DIRECTION, d)
+
+
+def _c_enableweapons(self, a, npc, player, ctx):
+    if player is not None:
+        try:
+            player.weapons_disabled = False
+        except Exception:
+            pass
+
+
+def _c_disableweapons(self, a, npc, player, ctx):
+    if player is not None:
+        try:
+            player.weapons_disabled = True
+        except Exception:
+            pass
+
+
+def _c_setchargender(self, a, npc, player, ctx):
+    if npc is not None and a:
+        try:
+            npc.gender = int(to_num(a[0]))
+        except Exception:
+            pass
+
+
+# -- carry / push -----------------------------------------------------------
+def _c_carryobject(self, a, npc, player, ctx):
+    if npc is not None:
+        npc.gani = "carrystill"
+        self._dirty(npc)
+
+
+def _c_throwcarry(self, a, npc, player, ctx):
+    if npc is not None and to_str(getattr(npc, "gani", "")).startswith("carry"):
+        npc.gani = "idle"
+        self._dirty(npc)
+
+
+def _make_blockflag_cmd(bit, on):
+    def handler(self, a, npc, player, ctx):
+        if npc is not None:
+            bf = int(getattr(npc, "block_flags", 0) or 0)
+            npc.block_flags = (bf | bit) if on else (bf & ~bit)
+    return handler
+
+
+# NPCBlockFlags: CANBECARRIED=2, CANBEPULLED=4, CANBEPUSHED=8
+_c_canbecarried = _make_blockflag_cmd(0x02, True)
+_c_cannotbecarried = _make_blockflag_cmd(0x02, False)
+_c_canbepulled = _make_blockflag_cmd(0x04, True)
+_c_cannotbepulled = _make_blockflag_cmd(0x04, False)
+_c_canbepushed = _make_blockflag_cmd(0x08, True)
+_c_cannotbepushed = _make_blockflag_cmd(0x08, False)
+
+
+def _c_takeplayercarry(self, a, npc, player, ctx):
+    # force the player to drop a carried object (PLO_THROWCARRIED)
+    if player is None or self.server is None or not hasattr(self.server, "broadcast_to_level"):
+        return
+    lvl = getattr(player, "level", None)
+    if lvl is None:
+        return
+    try:
+        from .protocol.packets import PacketBuilder
+        from .protocol.constants import PLO
+        pkt = (PacketBuilder().write_gchar(PLO.THROWCARRIED)
+               .write_gshort(getattr(player, "id", 0)).write_newline().build())
+        _schedule(self.server.broadcast_to_level(lvl.name, pkt))
+    except Exception:
+        logger.debug("takeplayercarry failed", exc_info=True)
+
+
+# -- combat -----------------------------------------------------------------
+def _c_putbomb(self, a, npc, player, ctx):
+    # putbomb power,x,y
+    if len(a) < 3 or self.server is None:
+        return
+    lvl = self._level_of(ctx)
+    if lvl is None:
+        return
+    try:
+        from .protocol.packets import build_bomb_add
+        pid = getattr(player, "id", 0) if player is not None else 0
+        _schedule(self.server.broadcast_to_level(lvl.name, build_bomb_add(
+            pid, to_num(a[1]), to_num(a[2]), int(to_num(a[0])), 55)))
+    except Exception:
+        logger.debug("putbomb failed", exc_info=True)
+
+
+def _explode(self, ctx, radius, power, x, y):
+    lvl = self._level_of(ctx)
+    if lvl is None or self.server is None:
+        return
+    try:
+        from .protocol.packets import build_explosion
+        _schedule(self.server.broadcast_to_level(
+            lvl.name, build_explosion(x, y, radius, power)))
+    except Exception:
+        logger.debug("explosion broadcast failed", exc_info=True)
+    cm = getattr(self.server, "combat_manager", None)
+    if cm is None or not hasattr(cm, "apply_damage"):
+        return
+    try:
+        from .combat import DamageType
+        dtype = DamageType.BOMB
+    except Exception:
+        dtype = None
+    for p in self._players_on_level(ctx):
+        if abs(to_num(getattr(p, "x", 0)) - x) <= radius and abs(to_num(getattr(p, "y", 0)) - y) <= radius:
+            _schedule(cm.apply_damage(p, power * 2, 0, 0, dtype))
+
+
+def _c_putexplosion(self, a, npc, player, ctx):
+    # putexplosion radius,x,y  (power=1)
+    if len(a) < 3:
+        return
+    _explode(self, ctx, int(to_num(a[0])), 1, to_num(a[1]), to_num(a[2]))
+
+
+def _c_putexplosion2(self, a, npc, player, ctx):
+    # putexplosion2 power,radius,x,y
+    if len(a) < 4:
+        return
+    _explode(self, ctx, int(to_num(a[1])), int(to_num(a[0])), to_num(a[2]), to_num(a[3]))
+
+
+def _c_shootarrow(self, a, npc, player, ctx):
+    # shootarrow dir — fire an arrow from the NPC in a cardinal direction
+    if npc is None or self.server is None:
+        return
+    lvl = self._level_of(ctx)
+    if lvl is None:
+        return
+    try:
+        from .protocol.packets import build_arrow_add
+        d = (int(to_num(a[0])) & 3) if a else 2
+        _schedule(self.server.broadcast_to_level(lvl.name, build_arrow_add(
+            0, to_num(getattr(npc, "x", 0)), to_num(getattr(npc, "y", 0)), d)))
+    except Exception:
+        logger.debug("shootarrow failed", exc_info=True)
+
+
+def _c_hitplayer(self, a, npc, player, ctx):
+    # hitplayer index,halfhearts,fromx,fromy — damage the level player at index
+    if len(a) < 2 or self.server is None:
+        return
+    cm = getattr(self.server, "combat_manager", None)
+    if cm is None or not hasattr(cm, "apply_damage"):
+        return
+    players = self._players_on_level(ctx)
+    idx = int(to_num(a[0]))
+    if 0 <= idx < len(players):
+        try:
+            from .combat import DamageType
+            dtype = DamageType.OTHER
+        except Exception:
+            dtype = None
+        _schedule(cm.apply_damage(players[idx], int(to_num(a[1])), 0, 0, dtype))
+
+
 def _queue_player_prop(player, prop_id, value):
     dirty = getattr(player, "_gs1_dirty_props", None)
     if dirty is None:
@@ -660,6 +915,23 @@ _COMMANDS = {
     "setbeltcolor": _c_setbeltcolor,
     "freezeplayer": _c_freezeplayer, "freezeplayer2": _c_freezeplayer,
     "seticon": _c_noop,
+    # items
+    "lay": _c_lay, "lay2": _c_lay2, "take": _c_take, "toweapons": _c_toweapons,
+    # board
+    "updateboard": _c_updateboard, "updateboard2": _c_updateboard,
+    # player state
+    "setplayerdir": _c_setplayerdir, "setchargender": _c_setchargender,
+    "enableweapons": _c_enableweapons, "disableweapons": _c_disableweapons,
+    # carry / push
+    "carryobject": _c_carryobject, "throwcarry": _c_throwcarry,
+    "takeplayercarry": _c_takeplayercarry,
+    "canbecarried": _c_canbecarried, "cannotbecarried": _c_cannotbecarried,
+    "canbepulled": _c_canbepulled, "cannotbepulled": _c_cannotbepulled,
+    "canbepushed": _c_canbepushed, "cannotbepushed": _c_cannotbepushed,
+    # combat
+    "putbomb": _c_putbomb, "putexplosion": _c_putexplosion,
+    "putexplosion2": _c_putexplosion2, "shootarrow": _c_shootarrow,
+    "hitplayer": _c_hitplayer,
 }
 
 # Client-side visual / sound / timing commands. pygserver runs GS1 server-side
@@ -678,6 +950,13 @@ _NOOP_COMMANDS = (
     "showtext", "showtext2", "showstats", "replaceani",
     "setfocus", "centermap", "putcomp", "putnewcomp", "removecompus",
     "setpause", "dontshowtime", "showbomb", "showbow", "showsword", "showani",
+    "resetfocus",
+    # not implemented in the GServer-v2 C++ oracle either (commented out there),
+    # so faithfully no-ops:
+    "noplayerkilling", "enabledefmovement", "disabledefmovement",
+    "toinventory", "hideplayer", "showplayer",
+    # combat projectiles with no pygserver representation (client-side in Graal)
+    "shootball", "shootfireball", "shootfireblast", "shoot", "hitobjects",
 )
 for _name in _NOOP_COMMANDS:
     _COMMANDS.setdefault(_name, _c_noop)

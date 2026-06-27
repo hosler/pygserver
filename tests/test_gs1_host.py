@@ -393,6 +393,128 @@ def test_destroy_removes_npc():
     asyncio.run(main())
 
 
+# -- items / board / state / carry / combat --------------------------------
+class _FakeItemMgr:
+    def __init__(self):
+        self.spawned = []
+        self.removed = []
+        self._items = []
+
+    async def spawn_item(self, level, x, y, item_type):
+        self.spawned.append((level.name, x, y, item_type))
+
+    def get_items_on_level(self, name):
+        return list(self._items)
+
+    async def remove_item(self, name, x, y):
+        self.removed.append((name, x, y))
+
+
+class _FakeCombatMgr:
+    def __init__(self):
+        self.damaged = []
+
+    async def apply_damage(self, player, dmg, kx, ky, dtype=None, attacker=None):
+        self.damaged.append((player.id, dmg))
+
+
+def test_lay_spawns_item():
+    from pygserver.protocol.constants import LevelItemType
+
+    async def main():
+        class Server:
+            item_manager = _FakeItemMgr()
+            async def broadcast_to_level(self, *a, **k): pass
+        server = Server()
+        level = FakeLevel()
+        npc = make_npc("if (created) { lay 5; }", level)  # 5 = HEART
+        npc.x, npc.y = 12.0, 13.0
+        run_npc_event(npc, "created", server, None)
+        await asyncio.sleep(0)
+        assert server.item_manager.spawned == [("testlevel", 12.0, 13.0, LevelItemType(5))]
+
+    asyncio.run(main())
+
+
+def test_take_removes_nearby_items():
+    from pygserver.protocol.constants import LevelItemType
+    from types import SimpleNamespace
+
+    async def main():
+        im = _FakeItemMgr()
+        im._items = [SimpleNamespace(x=11.0, y=11.0, item_type=LevelItemType(5)),
+                     SimpleNamespace(x=40.0, y=40.0, item_type=LevelItemType(5))]
+
+        class Server:
+            item_manager = im
+            async def broadcast_to_level(self, *a, **k): pass
+        npc = make_npc("if (created) { take 5; }", FakeLevel())
+        npc.x, npc.y = 10.0, 10.0
+        run_npc_event(npc, "created", Server(), None)
+        await asyncio.sleep(0)
+        assert im.removed == [("testlevel", 11.0, 11.0)]  # only the nearby one
+
+    asyncio.run(main())
+
+
+def test_setplayerdir():
+    npc = make_npc("if (playertouchsme) { setplayerdir 3; }")
+    p = FakePlayer()
+    run_npc_event(npc, "playertouchsme", None, p)
+    assert p.direction == 3
+
+
+def test_carry_and_blockflags():
+    npc = make_npc("if (created) { carryobject; canbecarried; canbepushed; }")
+    run_npc_event(npc, "created", None, None)
+    assert npc.gani == "carrystill"
+    assert npc.block_flags == 0x02 | 0x08
+    # throwcarry resets a carry gani
+    npc2 = make_npc("if (created) { throwcarry; }")
+    npc2.gani = "carrypeople"
+    run_npc_event(npc2, "created", None, None)
+    assert npc2.gani == "idle"
+
+
+def test_updateboard_broadcasts_region():
+    async def main():
+        sent = []
+
+        class Server:
+            async def broadcast_to_level(self, name, packet, *a, **k):
+                sent.append(packet)
+        level = FakeLevel()
+        level._tiles = bytearray(8192)
+        npc = make_npc("if (created) { updateboard 0,0,4,4; }", level)
+        run_npc_event(npc, "created", Server(), None)
+        await asyncio.sleep(0)
+        assert len(sent) == 1 and isinstance(sent[0], bytes)
+
+    asyncio.run(main())
+
+
+def test_putexplosion_damages_players_in_radius():
+    async def main():
+        cm = _FakeCombatMgr()
+        near = FakePlayer(pid=1)
+        near.x, near.y = 30.0, 30.0
+        far = FakePlayer(pid=2)
+        far.x, far.y = 50.0, 50.0
+        level = _level_with_players(near, far)
+
+        class Server:
+            combat_manager = cm
+            def get_player(self, pid):
+                return {1: near, 2: far}.get(pid)
+            async def broadcast_to_level(self, *a, **k): pass
+        npc = make_npc("if (created) { putexplosion 3,30,30; }", level)
+        run_npc_event(npc, "created", Server(), None)
+        await asyncio.sleep(0)
+        assert [d[0] for d in cm.damaged] == [1]  # only the near player
+
+    asyncio.run(main())
+
+
 # -- horse commands --------------------------------------------------------
 class HorseServer:
     def __init__(self):
