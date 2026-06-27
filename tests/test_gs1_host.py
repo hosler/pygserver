@@ -321,6 +321,78 @@ def test_getnearestplayers_returns_sorted_ids():
     assert npc.gs1_scopes["this"]["n"] == 2.0
 
 
+# -- color setters + destroy -----------------------------------------------
+def test_color_setters_set_player_slots():
+    from pygserver.protocol.constants import PLPROP
+
+    async def main():
+        sent = []
+
+        class RichPlayer(FakePlayer):
+            async def send_props(self, props):
+                sent.append(props)
+
+        npc = make_npc(
+            "if (playertouchsme) { setskincolor 1; setcoatcolor 2; setsleevecolor 3;"
+            " setshoecolor 4; setbeltcolor 5; }")
+        p = RichPlayer()
+        run_npc_event(npc, "playertouchsme", None, p)
+        await asyncio.sleep(0)
+        assert p.colors == [1, 2, 3, 4, 5]
+        merged = {}
+        for d in sent:
+            merged.update(d)
+        assert merged[PLPROP.COLORS] == [1, 2, 3, 4, 5]
+
+    asyncio.run(main())
+
+
+def test_appearance_setters():
+    from pygserver.protocol.constants import PLPROP
+
+    async def main():
+        sent = []
+
+        class RichPlayer(FakePlayer):
+            async def send_props(self, props):
+                sent.append(props)
+
+        npc = make_npc(
+            "if (playertouchsme) { sethead head9.png; setbody body3.png;"
+            " setsword blade.png,4; setshield guard.png,2; }")
+        p = RichPlayer()
+        run_npc_event(npc, "playertouchsme", None, p)
+        await asyncio.sleep(0)
+        assert p.head_image == "head9.png"
+        assert p.body_image == "body3.png"
+        assert (p.sword_image, p.sword_power) == ("blade.png", 4)
+        assert (p.shield_image, p.shield_power) == ("guard.png", 2)
+        merged = {}
+        for d in sent:
+            merged.update(d)
+        assert merged[PLPROP.HEADIMAGE] == "head9.png"
+        assert merged[PLPROP.SWORDPOWER] == (4, "blade.png")
+
+    asyncio.run(main())
+
+
+def test_destroy_removes_npc():
+    async def main():
+        server = SpawnServer()
+        level = FakeLevel()
+        npc = server.npc_manager.create_npc(level=level, x=5.0, y=5.0)
+        server.npc_manager.attach_gs1(npc, "if (playertouchsme) { destroy; }")
+        assert npc.id in server.npc_manager._npcs
+        p = FakePlayer()
+        p.level = level
+        from pygserver.gs1_host import run_npc_event as rne
+        rne(npc, "playertouchsme", server, p)
+        await asyncio.sleep(0)
+        assert npc.id not in server.npc_manager._npcs
+
+    asyncio.run(main())
+
+
 # -- horse commands --------------------------------------------------------
 class HorseServer:
     def __init__(self):

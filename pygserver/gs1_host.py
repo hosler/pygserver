@@ -480,6 +480,84 @@ def _c_putnpc2(self, a, npc, player, ctx):
     _spawn_npc(self, "", a[2], a[0], a[1], ctx)
 
 
+def _c_sethead(self, a, npc, player, ctx):
+    if player is not None and a:
+        self._set_player_attr(player, "head_image", a[0])  # wired HEADIMAGE
+
+
+def _c_setbody(self, a, npc, player, ctx):
+    if player is not None and a:
+        self._set_player_attr(player, "body_image", a[0])  # wired BODYIMAGE
+
+
+def _c_setsword(self, a, npc, player, ctx):
+    # setsword image,power — acting player's sword image + power
+    if player is None or not a:
+        return
+    img = to_str(a[0])
+    power = int(to_num(a[1])) if len(a) > 1 else int(to_num(getattr(player, "sword_power", 0)))
+    player.sword_image = img
+    player.sword_power = power
+    if PLPROP is not None:
+        _queue_player_prop(player, PLPROP.SWORDPOWER, (power, img))
+
+
+def _c_setshield(self, a, npc, player, ctx):
+    # setshield image,power — acting player's shield image + power
+    if player is None or not a:
+        return
+    img = to_str(a[0])
+    power = int(to_num(a[1])) if len(a) > 1 else int(to_num(getattr(player, "shield_power", 0)))
+    player.shield_image = img
+    player.shield_power = power
+    if PLPROP is not None:
+        _queue_player_prop(player, PLPROP.SHIELDPOWER, (power, img))
+
+
+def _c_setgender(self, a, npc, player, ctx):
+    if player is not None and a:
+        try:
+            player.gender = int(to_num(a[0]))
+        except Exception:
+            pass
+
+
+def _c_destroy(self, a, npc, player, ctx):
+    # destroy — the NPC deletes itself from the level
+    if npc is None or self.server is None:
+        return
+    nm = getattr(self.server, "npc_manager", None)
+    if nm is not None and hasattr(nm, "destroy_npc"):
+        _schedule(nm.destroy_npc(npc))
+
+
+def _set_player_color(player, slot, value):
+    """Set one of the acting player's 5 color slots and queue the COLORS prop."""
+    colors = getattr(player, "colors", None)
+    if not isinstance(colors, list) or not (0 <= slot < len(colors)):
+        return
+    colors[slot] = int(to_num(value)) & 0xFF
+    if PLPROP is not None:
+        _queue_player_prop(player, PLPROP.COLORS, list(colors))
+    if hasattr(player, "mark_dirty"):
+        player.mark_dirty()
+
+
+def _make_color_cmd(slot):
+    def handler(self, a, npc, player, ctx):
+        if player is not None and a:
+            _set_player_color(player, slot, a[0])
+    return handler
+
+
+# set{skin,coat,sleeve,shoe,belt}color color — player color slots 0..4
+_c_setskincolor = _make_color_cmd(0)
+_c_setcoatcolor = _make_color_cmd(1)
+_c_setsleevecolor = _make_color_cmd(2)
+_c_setshoecolor = _make_color_cmd(3)
+_c_setbeltcolor = _make_color_cmd(4)
+
+
 def _c_puthorse(self, a, npc, player, ctx):
     # puthorse imagefile,x,y — drop a horse on the level (bushes=2, dir=0)
     if self.server is None or len(a) < 3:
@@ -574,14 +652,35 @@ _COMMANDS = {
     "addweapon": _c_addweapon, "triggeraction": _c_triggeraction,
     "putnpc": _c_putnpc, "putnpc2": _c_putnpc2,
     "puthorse": _c_puthorse, "takehorse": _c_takehorse,
+    "destroy": _c_destroy,
+    "sethead": _c_sethead, "setbody": _c_setbody, "setsword": _c_setsword,
+    "setshield": _c_setshield, "setgender": _c_setgender,
+    "setskincolor": _c_setskincolor, "setcoatcolor": _c_setcoatcolor,
+    "setsleevecolor": _c_setsleevecolor, "setshoecolor": _c_setshoecolor,
+    "setbeltcolor": _c_setbeltcolor,
     "freezeplayer": _c_freezeplayer, "freezeplayer2": _c_freezeplayer,
-    # known visual/sound commands we intentionally ignore for now
-    "play": _c_noop, "play2": _c_noop, "playlooped": _c_noop,
-    "seteffectmode": _c_noop, "setcoloreffect": _c_noop, "setzoomeffect": _c_noop,
-    "timereverywhere": _c_noop, "showcharacter": _c_noop,
-    "drawunderplayer": _c_noop, "drawoverplayer": _c_noop, "drawaslight": _c_noop,
-    "dontblock": _c_noop, "blockagain": _c_noop,
+    "seticon": _c_noop,
 }
+
+# Client-side visual / sound / timing commands. pygserver runs GS1 server-side
+# and ships only NPC props (not the script) to clients, so these have no
+# server-authoritative effect and are intentionally ignored. sleep is a no-op
+# because events run to completion (no script suspension/resume).
+_NOOP_COMMANDS = (
+    "play", "play2", "playlooped", "playsound", "stopmidi", "stopsound",
+    "seteffectmode", "setcoloreffect", "setzoomeffect", "seteffect",
+    "timereverywhere", "showcharacter", "drawunderplayer", "drawoverplayer",
+    "drawaslight", "drawovertrees", "dontblock", "blockagain",
+    "dontblocklocal", "blockagainlocal", "sleep",
+    "showimg", "hideimg", "showimg2", "changeimgvis", "changeimgpart",
+    "changeimgcolors", "changeimgzoom", "setimgvis", "putleaps",
+    "setbackpal", "setletters", "setshape", "setmap", "setminimap",
+    "showtext", "showtext2", "showstats", "replaceani",
+    "setfocus", "centermap", "putcomp", "putnewcomp", "removecompus",
+    "setpause", "dontshowtime", "showbomb", "showbow", "showsword", "showani",
+)
+for _name in _NOOP_COMMANDS:
+    _COMMANDS.setdefault(_name, _c_noop)
 
 
 # -- script binding / event firing -----------------------------------------
