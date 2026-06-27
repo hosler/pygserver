@@ -21,6 +21,24 @@ from .values import to_num, to_str, to_bool, fmt_num
 
 # commands the interpreter handles itself (manipulate the var store)
 _VAR_COMMANDS = {"set", "unset", "setstring", "addstring", "setarray"}
+# commands whose first argument is a message code used as an assignment target
+# (passed to the host as its raw code string, not its expanded value)
+_MSGCODE_TARGET_COMMANDS = {"setcharprop", "setplayerprop"}
+
+
+def _raw_msgcode(node):
+    """Raw code (e.g. '#1') if node is a message code, else None. A lone M-type
+    argument parses as a MessageCode or a StrConcat wrapping just one."""
+    if isinstance(node, ast.MessageCode):
+        return node.code
+    if isinstance(node, ast.StrConcat):
+        codes = [p for p in node.parts if isinstance(p, ast.MessageCode)]
+        others = [p for p in node.parts
+                  if not isinstance(p, ast.MessageCode)
+                  and not (isinstance(p, ast.Str) and p.value == "")]
+        if len(codes) == 1 and not others:
+            return codes[0].code
+    return None
 _MAX_CALL_DEPTH = 100
 
 
@@ -158,6 +176,15 @@ class Interpreter:
             s = to_str(self.eval(node.args[0])) if node.args else ""
             sep = to_str(self.eval(node.args[1])) if len(node.args) > 1 else " "
             self.ctx.tokenize_tokens = s.split(sep) if sep else list(s)
+            return
+        if name in _MSGCODE_TARGET_COMMANDS and node.args:
+            # setcharprop/setplayerprop take a message code as an assignment
+            # *target* (#1 sword, #3 head, ...), so pass its raw code rather
+            # than the expanded value (mirrors GS1Visitor's prop-ref handling).
+            code = _raw_msgcode(node.args[0])
+            first = code if code is not None else self.eval(node.args[0])
+            args = [first] + [self.eval(a) for a in node.args[1:]]
+            self.ctx.host.call_command(name, args, self.ctx)
             return
         args = [self.eval(a) for a in node.args]
         self.ctx.host.call_command(name, args, self.ctx)

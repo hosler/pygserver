@@ -44,6 +44,9 @@ class NPC:
         self.gani = ""
         self.head_image = ""
         self.body_image = ""
+        self.sword_image = ""
+        self.shield_image = ""
+        self.horse_image = ""
         self.colors = [0, 0, 0, 0, 0]
 
         # Properties
@@ -61,6 +64,10 @@ class NPC:
 
         # Flags (custom state)
         self.flags: Dict[str, str] = {}
+
+        # Gani animation attributes (NPCPROP.GATTRIB1..30), set via GS1
+        # `setcharprop #P1..#P30`. Keyed by wire prop id -> string value.
+        self.gattribs: Dict[int, str] = {}
 
         # Script (Python class-based)
         self.script_class: Optional[type] = None
@@ -119,8 +126,16 @@ class NPC:
             props[NPCPROP.HEADIMAGE] = self.head_image
         if self.body_image:
             props[NPCPROP.BODYIMAGE] = self.body_image
+        if self.sword_image:
+            props[NPCPROP.SWORDIMAGE] = self.sword_image
+        if self.shield_image:
+            props[NPCPROP.SHIELDIMAGE] = self.shield_image
+        if self.horse_image:
+            props[NPCPROP.HORSEIMAGE] = self.horse_image
         if any(self.colors):
             props[NPCPROP.COLORS] = self.colors
+        for prop_id, val in self.gattribs.items():
+            props[prop_id] = val
         return build_npc_props(self.id, props)
 
     async def trigger_event(self, event_name: str, *args):

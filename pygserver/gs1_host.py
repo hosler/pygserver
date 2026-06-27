@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 
 from .gs1.runtime import Host, UNSET, VarStore, Context
@@ -26,7 +27,12 @@ from .gs1.values import to_num, to_str
 logger = logging.getLogger(__name__)
 
 try:
-    from .protocol.constants import PLPROP
+    from .protocol.constants import PLPROP, NPCPROP
+
+    # gani-attribute slot N (1-30) -> wire prop id. Player GATTRIBs are
+    # contiguous (37-74); NPC GATTRIBs follow NPCGaniAttrPackets (sparse).
+    _PLAYER_GATTRIB_PROPS = [getattr(PLPROP, f"GATTRIB{n}") for n in range(1, 31)]
+    _NPC_GATTRIB_PROPS = [getattr(NPCPROP, f"GATTRIB{n}") for n in range(1, 31)]
 
     # player Python attr -> (wire prop id, value encoder) for change propagation
     PLAYER_PROP_WIRE = {
@@ -41,10 +47,15 @@ try:
         "nickname": (PLPROP.NICKNAME, to_str),
         "head_image": (PLPROP.HEADIMAGE, to_str),
         "body_image": (PLPROP.BODYIMAGE, to_str),
+        "gani": (PLPROP.GANI, to_str),
+        "chat": (PLPROP.CURCHAT, to_str),
     }
 except Exception:  # constants unavailable (e.g. isolated unit context)
     PLPROP = None
+    NPCPROP = None
     PLAYER_PROP_WIRE = {}
+    _PLAYER_GATTRIB_PROPS = []
+    _NPC_GATTRIB_PROPS = []
 
 # player-prefixed attribute name -> Python attribute on Player
 PLAYER_ATTR = {
@@ -65,6 +76,39 @@ NPC_ATTR = {
     "hearts": "hearts", "rupees": "rupees", "arrows": "arrows",
     "bombs": "bombs", "image": "image", "ani": "gani",
 }
+
+# setcharprop / setplayerprop message codes -> target. Mirrors the C++
+# GS1MessageCodes GetNPCPropFromIndex / GetPlayerPropFromIndex tables, keyed by
+# the raw codes GS1 actually lexes: #1-8 equipment, #m gani, #n nick, #c chat,
+# #C0-#C7 color slots (indices 20-27), and #P1-#P30 gani-attribute slots
+# (handled dynamically by _charprop_target). A ("color", n) / ("gattrib", n)
+# value targets that slot; otherwise it's a Python attr. NPCs store chat in
+# `message`, players in `chat`. (#9/#10/#20 are not valid GS1 codes.)
+_CHARPROP_CODES = {
+    "#1": "sword_image", "#2": "shield_image", "#3": "head_image",
+    "#5": "horse_image", "#7": "gani", "#8": "body_image",
+    "#m": "gani", "#n": "nickname",
+    **{f"#C{n}": ("color", n) for n in range(8)},
+}
+NPC_CHARPROP = {**_CHARPROP_CODES, "#c": "message"}
+PLAYER_CHARPROP = {**_CHARPROP_CODES, "#c": "chat"}
+
+# #P1..#P30 -> gani attribute slot 1..30 (C++ mc_P: index N uses prop 30+N-1)
+_GANI_ATTR_RE = re.compile(r"#P(\d+)$")
+
+
+def _charprop_target(code, table):
+    """Resolve a setcharprop/setplayerprop message code to its target.
+    Static codes come from `table`; #P<n> maps to ("gattrib", n)."""
+    target = table.get(code)
+    if target is not None:
+        return target
+    m = _GANI_ATTR_RE.match(code)
+    if m:
+        n = int(m.group(1))
+        if 1 <= n <= 30:
+            return ("gattrib", n)
+    return None
 
 
 class GS1Host(Host):
@@ -130,8 +174,19 @@ class GS1Host(Host):
         if name in ("playersays", "playersays2"):
             return self._playersays(args, ctx)
         if name == "hasweapon":
+            player = ctx.player
+            if player is not None and args and hasattr(player, "has_weapon"):
+                return 1.0 if player.has_weapon(to_str(args[0])) else 0.0
             return 0.0
-        # getnpc/getplayer/nearest-player/etc not yet modelled -> 0
+        if name in ("getnearestplayer", "findnearestplayer"):
+            return self._nearest_player(args, ctx, name == "getnearestplayer")
+        if name == "getnearestplayers":
+            return self._nearest_players(args, ctx)
+        # getnpc/getplayer return ScriptObject references that require a
+        # script-object member-access model (obj.x / obj.hearts). Deliberately
+        # unimplemented: zero usage across the 5732-file GS1 corpus, so it isn't
+        # worth the interp rewrite; the nearest-player helpers above cover the
+        # real follow/guard idiom by setting ctx.player. -> 0 (falsey).
         return UNSET
 
     # -- message codes -----------------------------------------------------
@@ -210,6 +265,53 @@ class GS1Host(Host):
             return 0.0
         return 1.0 if to_str(getattr(player, "chat", "")).startswith(to_str(args[0])) else 0.0
 
+    # -- world queries -----------------------------------------------------
+    def _level_of(self, ctx):
+        return getattr(ctx.this_obj, "level", None) or getattr(ctx.player, "level", None)
+
+    def _players_on_level(self, ctx):
+        """All logged-in Player objects on the script's level (nearest-* helpers)."""
+        lvl = self._level_of(ctx)
+        if lvl is None or self.server is None or not hasattr(lvl, "get_player_ids"):
+            return []
+        out = []
+        for pid in lvl.get_player_ids():
+            p = self.server.get_player(pid)
+            if p is not None:
+                out.append(p)
+        return out
+
+    def _sorted_by_distance(self, args, ctx):
+        if len(args) < 2:
+            return []
+        x, y = to_num(args[0]), to_num(args[1])
+        players = self._players_on_level(ctx)
+        players.sort(key=lambda p: (to_num(getattr(p, "x", 0)) - x) ** 2
+                     + (to_num(getattr(p, "y", 0)) - y) ** 2)
+        return players
+
+    def _nearest_player(self, args, ctx, return_id):
+        """findnearestplayer -> found flag; getnearestplayer -> player id.
+
+        Both set ctx.player to the nearest player so a subsequent playerx /
+        playery / hearts etc. refer to that player (the common follow/guard
+        idiom in events that have no triggering player, e.g. timeout).
+        """
+        ranked = self._sorted_by_distance(args, ctx)
+        if not ranked:
+            return 0.0
+        ctx.player = ranked[0]
+        return float(getattr(ranked[0], "id", 0)) if return_id else 1.0
+
+    def _nearest_players(self, args, ctx):
+        """getnearestplayers(x,y) -> player ids sorted nearest-first.
+
+        The C++ optional flag-filter arg is not supported: GS1 lexes that arg
+        as an expression, so the flag *name* isn't recoverable here.
+        """
+        ranked = self._sorted_by_distance(args, ctx)
+        return [float(getattr(p, "id", 0)) for p in ranked]
+
 
 # -- command handlers -------------------------------------------------------
 def _c_setimg(self, a, npc, player, ctx):
@@ -255,29 +357,164 @@ def _c_setnick(self, a, npc, player, ctx):
         self._dirty(npc)
 
 
+def _gattribs_of(obj):
+    ga = getattr(obj, "gattribs", None)
+    if ga is None:
+        ga = {}
+        obj.gattribs = ga
+    return ga
+
+
+def _apply_charprop(obj, code, val, table):
+    """Set the attr / color / gani-attribute an NPC setcharprop code maps to.
+    Returns True if the code was recognized and applied."""
+    target = _charprop_target(code, table)
+    if target is None:
+        return False
+    if isinstance(target, tuple):
+        kind, n = target
+        if kind == "color":
+            colors = getattr(obj, "colors", None)
+            if isinstance(colors, list) and 0 <= n < len(colors):
+                colors[n] = int(to_num(val)) & 0xFF
+        elif kind == "gattrib" and 1 <= n <= len(_NPC_GATTRIB_PROPS):
+            _gattribs_of(obj)[_NPC_GATTRIB_PROPS[n - 1]] = to_str(val)
+        return True
+    setattr(obj, target, to_str(val))
+    return True
+
+
 def _c_setcharprop(self, a, npc, player, ctx):
-    # setcharprop <messagecode>, <value> — map the common chat/nick codes
+    # setcharprop <messagecode>, <value> — set the NPC's appearance/identity
     if npc is None or len(a) < 2:
         return
-    code, val = to_str(a[0]), to_str(a[1])
-    if code == "#c":
-        npc.message = val
-        self._dirty(npc)
-    elif code in ("#n", "#N"):
-        npc.nickname = val
+    if _apply_charprop(npc, to_str(a[0]), a[1], NPC_CHARPROP):
         self._dirty(npc)
 
 
 def _c_setplayerprop(self, a, npc, player, ctx):
     if player is None or len(a) < 2:
         return
-    code, val = to_str(a[0]), to_str(a[1])
-    if code == "#c" and hasattr(player, "chat"):
-        player.chat = val
-    elif code == "#n":
-        player.nickname = val
+    target = _charprop_target(to_str(a[0]), PLAYER_CHARPROP)
+    if target is None:
+        return
+    if isinstance(target, tuple):
+        kind, n = target
+        if kind == "color":  # set slot + queue the full COLORS prop
+            colors = getattr(player, "colors", None)
+            if isinstance(colors, list) and 0 <= n < len(colors):
+                colors[n] = int(to_num(a[1])) & 0xFF
+                if PLPROP is not None:
+                    _queue_player_prop(player, PLPROP.COLORS, list(colors))
+        elif kind == "gattrib" and 1 <= n <= len(_PLAYER_GATTRIB_PROPS):
+            prop_id = _PLAYER_GATTRIB_PROPS[n - 1]
+            _gattribs_of(player)[prop_id] = to_str(a[1])
+            _queue_player_prop(player, prop_id, to_str(a[1]))
+    elif target in PLAYER_PROP_WIRE:
+        self._set_player_attr(player, target, a[1])  # sets + queues wire prop
+    else:
+        setattr(player, target, to_str(a[1]))  # e.g. sword/shield/horse image
     if hasattr(player, "mark_dirty"):
         player.mark_dirty()
+
+
+def _c_addweapon(self, a, npc, player, ctx):
+    # addweapon <name> — give the acting player a weapon and push it to client
+    if player is None or not a:
+        return
+    name = to_str(a[0])
+    if hasattr(player, "add_weapon"):
+        player.add_weapon(name)
+    wm = getattr(self.server, "weapon_manager", None)
+    weapon = wm.get_weapon(name) if wm is not None and hasattr(wm, "get_weapon") else None
+    if weapon is None or not hasattr(player, "send_raw"):
+        return
+    try:
+        from .protocol.packets import build_npc_weapon_add
+        pkt = build_npc_weapon_add(name, getattr(weapon, "image", ""),
+                                   getattr(weapon, "client_script", ""))
+        _schedule(player.send_raw(pkt))
+    except Exception:
+        logger.debug("addweapon send failed for %s", name, exc_info=True)
+
+
+def _c_triggeraction(self, a, npc, player, ctx):
+    # triggeraction x,y,action,params... — dispatch a serverside trigger.
+    # handle_trigger_action reads token[1] as the action, so prefix with "gs1".
+    if player is None or self.server is None or len(a) < 3:
+        return
+    if not hasattr(self.server, "handle_trigger_action"):
+        return
+    x, y = to_num(a[0]), to_num(a[1])
+    parts = ["gs1"] + [to_str(v) for v in a[2:]]
+    _schedule(self.server.handle_trigger_action(player, x, y, ",".join(parts)))
+
+
+def _spawn_npc(self, image, script, x, y, ctx):
+    lvl = self._level_of(ctx)
+    nm = getattr(self.server, "npc_manager", None) if self.server is not None else None
+    if lvl is None or nm is None or not hasattr(nm, "create_npc"):
+        return None
+    npc = nm.create_npc(level=lvl, x=to_num(x), y=to_num(y))
+    if image:
+        npc.image = to_str(image)
+    if script:
+        nm.attach_gs1(npc, to_str(script))
+    self._dirty(npc)
+    if hasattr(self.server, "broadcast_to_level"):
+        _schedule(self.server.broadcast_to_level(lvl.name, npc.build_props_packet()))
+    return npc
+
+
+def _c_putnpc(self, a, npc, player, ctx):
+    # putnpc image,script,x,y — create a level NPC
+    if len(a) < 4:
+        return
+    _spawn_npc(self, a[0], a[1], a[2], a[3], ctx)
+
+
+def _c_putnpc2(self, a, npc, player, ctx):
+    # putnpc2 x,y,script — create a level NPC running the inline script
+    if len(a) < 3:
+        return
+    _spawn_npc(self, "", a[2], a[0], a[1], ctx)
+
+
+def _c_puthorse(self, a, npc, player, ctx):
+    # puthorse imagefile,x,y — drop a horse on the level (bushes=2, dir=0)
+    if self.server is None or len(a) < 3:
+        return
+    hm = getattr(self.server, "horse_manager", None)
+    lvl = self._level_of(ctx)
+    if hm is None or lvl is None or not hasattr(hm, "add_horse"):
+        return
+    _schedule(hm.add_horse(lvl, to_num(a[1]), to_num(a[2]),
+                           direction=0, bushes=2, image=to_str(a[0])))
+
+
+def _c_takehorse(self, a, npc, player, ctx):
+    # takehorse index — mount the level horse at <index> onto this NPC
+    if npc is None or self.server is None or not a:
+        return
+    hm = getattr(self.server, "horse_manager", None)
+    lvl = self._level_of(ctx)
+    if hm is None or lvl is None or not hasattr(hm, "get_horses_on_level"):
+        return
+    horses = hm.get_horses_on_level(lvl.name)
+    idx = int(to_num(a[0]))
+    if 0 <= idx < len(horses):
+        horse = horses[idx]
+        npc.horse_image = getattr(horse, "image", "")
+        self._dirty(npc)
+        _schedule(hm.remove_horse(lvl.name, horse.id))
+
+
+def _queue_player_prop(player, prop_id, value):
+    dirty = getattr(player, "_gs1_dirty_props", None)
+    if dirty is None:
+        dirty = {}
+        player._gs1_dirty_props = dirty
+    dirty[prop_id] = value
 
 
 def _c_freezeplayer(self, a, npc, player, ctx):
@@ -334,6 +571,9 @@ _COMMANDS = {
     "move": _c_move,
     "setlevel2": _c_setlevel2, "setlevel": _c_setlevel, "hurt": _c_hurt,
     "setcharprop": _c_setcharprop, "setplayerprop": _c_setplayerprop,
+    "addweapon": _c_addweapon, "triggeraction": _c_triggeraction,
+    "putnpc": _c_putnpc, "putnpc2": _c_putnpc2,
+    "puthorse": _c_puthorse, "takehorse": _c_takehorse,
     "freezeplayer": _c_freezeplayer, "freezeplayer2": _c_freezeplayer,
     # known visual/sound commands we intentionally ignore for now
     "play": _c_noop, "play2": _c_noop, "playlooped": _c_noop,
