@@ -158,3 +158,34 @@ def test_npcmanager_attach_and_touch_and_chat():
         assert npc.message == "heard hi"
 
     asyncio.run(main())
+
+
+def test_player_prop_propagation_warp_and_hurt():
+    async def main():
+        from pygserver.protocol.constants import PLPROP
+        sent, warps = [], []
+
+        class RichPlayer(FakePlayer):
+            async def send_props(self, props):
+                sent.append(props)
+
+            async def warp(self, lvl, x, y):
+                warps.append((lvl, x, y))
+
+        npc = make_npc("if (playertouchsme) { playerrupees = playerrupees + 50; "
+                       "hurt 1; setlevel2 cave.nw,5,6; }")
+        run_npc_event(npc, "created", None, None)
+        p = RichPlayer()
+        run_npc_event(npc, "playertouchsme", None, p)
+        await asyncio.sleep(0)  # let scheduled send_props / warp tasks run
+
+        assert p.rupees == 55.0
+        assert p.hearts == 2.0
+        merged = {}
+        for d in sent:
+            merged.update(d)
+        assert PLPROP.RUPEESCOUNT in merged
+        assert PLPROP.CURPOWER in merged and merged[PLPROP.CURPOWER] == 4  # 2 hearts*2
+        assert warps == [("cave.nw", 5.0, 6.0)]
+
+    asyncio.run(main())

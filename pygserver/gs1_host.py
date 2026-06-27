@@ -14,6 +14,7 @@ the NPC running the script; player* attributes refer to the acting player.
 """
 from __future__ import annotations
 
+import asyncio
 import logging
 import time
 
@@ -23,6 +24,27 @@ from .gs1.parser import parse
 from .gs1.values import to_num, to_str
 
 logger = logging.getLogger(__name__)
+
+try:
+    from .protocol.constants import PLPROP
+
+    # player Python attr -> (wire prop id, value encoder) for change propagation
+    PLAYER_PROP_WIRE = {
+        "rupees": (PLPROP.RUPEESCOUNT, lambda v: int(to_num(v))),
+        "hearts": (PLPROP.CURPOWER, lambda v: int(to_num(v) * 2)),
+        "max_hearts": (PLPROP.MAXPOWER, lambda v: int(to_num(v) * 2)),
+        "arrows": (PLPROP.ARROWSCOUNT, lambda v: int(to_num(v))),
+        "bombs": (PLPROP.BOMBSCOUNT, lambda v: int(to_num(v))),
+        "glove_power": (PLPROP.GLOVEPOWER, lambda v: int(to_num(v))),
+        "sword_power": (PLPROP.SWORDPOWER, lambda v: int(to_num(v))),
+        "shield_power": (PLPROP.SHIELDPOWER, lambda v: int(to_num(v))),
+        "nickname": (PLPROP.NICKNAME, to_str),
+        "head_image": (PLPROP.HEADIMAGE, to_str),
+        "body_image": (PLPROP.BODYIMAGE, to_str),
+    }
+except Exception:  # constants unavailable (e.g. isolated unit context)
+    PLPROP = None
+    PLAYER_PROP_WIRE = {}
 
 # player-prefixed attribute name -> Python attribute on Player
 PLAYER_ATTR = {
@@ -156,8 +178,16 @@ class GS1Host(Host):
             setattr(player, attr, to_str(value))
         else:
             setattr(player, attr, to_num(value))
-        if hasattr(player, "mark_dirty"):
-            player.mark_dirty()
+        # queue the change for propagation to the client (flushed after the
+        # event in run_npc_event); chat/account are not client props
+        wire = PLAYER_PROP_WIRE.get(attr)
+        if wire is not None:
+            prop_id, enc = wire
+            dirty = getattr(player, "_gs1_dirty_props", None)
+            if dirty is None:
+                dirty = {}
+                player._gs1_dirty_props = dirty
+            dirty[prop_id] = enc(getattr(player, attr))
 
     def _set_timer(self, npc, seconds):
         if hasattr(npc, "set_timer"):
@@ -258,6 +288,38 @@ def _c_freezeplayer(self, a, npc, player, ctx):
             pass
 
 
+def _schedule(coro):
+    try:
+        asyncio.get_running_loop().create_task(coro)
+        return True
+    except RuntimeError:
+        return False
+
+
+def _c_setlevel2(self, a, npc, player, ctx):
+    # warp the acting player to level,x,y (doors/teleports)
+    if player is None or not a or not hasattr(player, "warp"):
+        return
+    lvl = to_str(a[0])
+    x = to_num(a[1]) if len(a) > 1 else getattr(player, "x", 30)
+    y = to_num(a[2]) if len(a) > 2 else getattr(player, "y", 30)
+    _schedule(player.warp(lvl, x, y))
+
+
+def _c_setlevel(self, a, npc, player, ctx):
+    if player is None or not a or not hasattr(player, "warp"):
+        return
+    _schedule(player.warp(to_str(a[0]), getattr(player, "x", 30),
+                          getattr(player, "y", 30)))
+
+
+def _c_hurt(self, a, npc, player, ctx):
+    if player is None or not a:
+        return
+    self._set_player_attr(player, "hearts",
+                          to_num(getattr(player, "hearts", 0)) - to_num(a[0]))
+
+
 def _c_noop(self, a, npc, player, ctx):
     pass
 
@@ -270,6 +332,7 @@ _COMMANDS = {
     "hide": _c_hide, "show": _c_show,
     "hidelocal": _c_hide, "showlocal": _c_show,
     "move": _c_move,
+    "setlevel2": _c_setlevel2, "setlevel": _c_setlevel, "hurt": _c_hurt,
     "setcharprop": _c_setcharprop, "setplayerprop": _c_setplayerprop,
     "freezeplayer": _c_freezeplayer, "freezeplayer2": _c_freezeplayer,
     # known visual/sound commands we intentionally ignore for now
@@ -323,7 +386,25 @@ def run_npc_event(npc, event: str, server=None, player=None):
     except Exception:
         logger.debug("GS1 event %s on NPC %s failed", event,
                      getattr(npc, "id", "?"), exc_info=True)
+    _flush_player_props(player)
     return ctx
+
+
+def _flush_player_props(player):
+    """Send any player stat changes a script made to that player's client."""
+    if player is None:
+        return
+    dirty = getattr(player, "_gs1_dirty_props", None)
+    if not dirty:
+        return
+    player._gs1_dirty_props = {}
+    if not hasattr(player, "send_props"):
+        return
+    try:
+        import asyncio
+        asyncio.get_running_loop().create_task(player.send_props(dirty))
+    except RuntimeError:
+        pass  # no running loop (e.g. unit test) — state is set, just not pushed
 
 
 def _lazy(obj, attr):
