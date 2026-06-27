@@ -113,8 +113,9 @@ class NPC:
             NPCPROP.IMAGE: self.image,
             NPCPROP.X: self.x,
             NPCPROP.Y: self.y,
-            # SPRITE carries the facing direction in its low 2 bits.
-            NPCPROP.SPRITE: self.direction & 0x03,
+            # SPRITE carries the facing direction in its low 2 bits. direction
+            # can arrive as a float (script/default), so coerce before masking.
+            NPCPROP.SPRITE: int(self.direction) & 0x03,
         }
         if self.gani:
             props[NPCPROP.GANI] = self.gani

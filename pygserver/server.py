@@ -169,7 +169,8 @@ class GameServer:
 
         # File system
         from .filesystem import FileSystem
-        base_path = self.config.server_dir if hasattr(self.config, 'server_dir') else "."
+        # from_server_dir sets base_dir (e.g. ../funtimes); fall back to cwd.
+        base_path = getattr(self.config, 'base_dir', None) or "."
         self.filesystem = FileSystem(self, base_path)
 
         # Account system

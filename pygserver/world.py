@@ -85,15 +85,21 @@ class GMap:
                     in_levelnames = True
                     level_index = 0
 
-                elif line == 'LEVELNAMES END':
+                elif line in ('LEVELNAMESEND', 'LEVELNAMES END'):
                     in_levelnames = False
 
                 elif in_levelnames and gmap.width > 0:
-                    # Each line in LEVELNAMES is a level filename
-                    gx = level_index % gmap.width
-                    gy = level_index // gmap.width
-                    gmap.grid[(gx, gy)] = line
-                    level_index += 1
+                    # A LEVELNAMES line holds one or more comma-separated, quoted
+                    # level names, e.g. "chicken4.nw","chicken5.nw","chicken6.nw",
+                    # laid out left-to-right then top-to-bottom across the grid.
+                    for token in line.split(','):
+                        token = token.strip().strip('"').strip()
+                        if not token:
+                            continue
+                        gx = level_index % gmap.width
+                        gy = level_index // gmap.width
+                        gmap.grid[(gx, gy)] = token
+                        level_index += 1
 
             logger.debug(f"Loaded GMAP {gmap.name}: {gmap.width}x{gmap.height}")
 

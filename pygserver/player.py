@@ -552,6 +552,17 @@ class Player:
         if PLPROP.BODYIMAGE in props:
             self.body_image = props[PLPROP.BODYIMAGE]
 
+        # Health: the client is authoritative for its own damage (e.g. baddies it
+        # drives as leader), reporting new hearts via CURPOWER (= hearts * 2). A
+        # transition to <= 0 means the player died, so kick off the death/respawn
+        # flow once (it would otherwise never fire for client-side damage).
+        if PLPROP.CURPOWER in props:
+            new_hearts = props[PLPROP.CURPOWER] / 2.0
+            was_alive = self.hearts > 0
+            self.hearts = new_hearts
+            if new_hearts <= 0 and was_alive and hasattr(self.server, 'combat_manager'):
+                await self.server.combat_manager.handle_player_death(self)
+
         # Broadcast to other players on level
         if self.level:
             broadcast_props = {}
@@ -576,10 +587,26 @@ class Player:
                 await self.server.npc_manager.check_touches(self)
 
     async def _handle_adjacent_level(self, data: bytes):
-        """Handle PLI_ADJACENTLEVEL packet (request for adjacent level data)."""
+        """Handle PLI_ADJACENTLEVEL - client preloading a neighbouring GMAP
+        segment. Send that level's name + board so the client can stitch the
+        world together; no warp and no player-add (the player stays put)."""
         reader = PacketReader(data)
         level_name = reader.remaining().decode('latin-1', errors='replace').strip()
-        # Client requesting adjacent level for preloading - typically ignored
+        if not level_name:
+            return
+        level = self.server.world.get_level(level_name)
+        if not level:
+            logger.debug(f"Adjacent level not found: {level_name}")
+            return
+
+        # Only the board — adjacent segments are for rendering. Their signs/links
+        # belong to that segment and are sent when the player actually warps in;
+        # sending them here leaks e.g. neighbouring signs into the current level.
+        level_name_pkt = build_level_name(level.name)
+        tile_data = level.get_board_packet()
+        board_packet = bytes([PLO.BOARDPACKET + 32]) + tile_data + b'\n'
+        announcement = build_raw_data_announcement(len(board_packet))
+        await self.send_raw(level_name_pkt + announcement + board_packet)
 
     # =========================================================================
     # Combat Handlers
@@ -1228,10 +1255,32 @@ class Player:
 
         # Announce raw data size (1 + 8192 + 1 = 8194)
         announcement = build_raw_data_announcement(len(board_packet))
-        warp_packet = build_warp(self.x, self.y, level.name)
+
+        # In a GMAP, warp via PLO_PLAYERWARP2, which carries LOCAL coords plus the
+        # segment's grid (gmap_x/gmap_y) separately. PLO_PLAYERWARP packs the
+        # position into a single gchar (max ~111 tiles), so world coords for grid
+        # cell 2+ (x >= 128) overflow and the player lands at the wrong spot; the
+        # client recombines local + grid*64 itself.
+        gmap_info = self.server.world.get_gmap_for_level(level.name)
+        if gmap_info:
+            _, gx, gy = gmap_info
+            warp_packet = build_warp2(self.x, self.y, level.name, gx, gy)
+        else:
+            warp_packet = build_warp(self.x, self.y, level.name)
 
         combined = level_name_pkt + announcement + board_packet + warp_packet
         await self.send_raw(combined)
+
+        # If this level is a GMAP segment, announce the .gmap name. That makes the
+        # client request the gmap file (PLI_WANTFILE), build the grid, enter gmap
+        # mode and request adjacent segments — without it the client treats the
+        # segment as a standalone level (no stitching, broken edge warps).
+        if gmap_info:
+            gmap = gmap_info[0]
+            # The client keys gmap handling off the ".gmap" suffix; gmap.name is
+            # the bare stem ("chicken"), so announce the full filename.
+            gmap_file = gmap.name if gmap.name.endswith('.gmap') else gmap.name + '.gmap'
+            await self.send_raw(build_level_name(gmap_file))
 
         # Send signs and links on level
         from .protocol.packets import build_level_sign, build_level_link

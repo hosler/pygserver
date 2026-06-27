@@ -529,9 +529,10 @@ class CombatManager:
                 await killer.send_props({PLPROP.KILLSCOUNT: killer.kills})
                 logger.info(f"  Killed by {killer.nickname}")
 
-        # Trigger NPC death event
-        if hasattr(self.server, 'npc_manager'):
-            await self.server.npc_manager.on_player_dies(player, killer_id)
+        # Trigger NPC death event (optional hook).
+        npc_mgr = getattr(self.server, 'npc_manager', None)
+        if npc_mgr is not None and hasattr(npc_mgr, 'on_player_dies'):
+            await npc_mgr.on_player_dies(player, killer_id)
 
         # Respawn after delay
         asyncio.create_task(self._respawn_player(player))
@@ -548,8 +549,10 @@ class CombatManager:
         if not player.connected:
             return
 
-        # Restore health
+        # Restore health and tell the client (CURPOWER = hearts * 2), so it
+        # leaves the death state instead of staying locked at 0 hearts.
         player.hearts = player.max_hearts
+        await player.send_props({PLPROP.CURPOWER: int(player.hearts * 2)})
 
         # Warp to spawn point
         await player.warp(
