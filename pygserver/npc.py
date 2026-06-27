@@ -62,15 +62,28 @@ class NPC:
         # Flags (custom state)
         self.flags: Dict[str, str] = {}
 
-        # Script
+        # Script (Python class-based)
         self.script_class: Optional[type] = None
         self.script_instance: Optional[Any] = None
+
+        # GS1 script (legacy Graal scripting): parsed program + persistent
+        # NPC-scoped variable dicts (this./thiso./local. survive across events)
+        self.gs1_program: Optional[Any] = None
+        self.gs1_scopes: Dict[str, dict] = {"this": {}, "thiso": {}, "local": {}}
 
         # Timer
         self._timer_end: float = 0.0
 
+        # Dirty flag: set when a visible property changes so the manager
+        # re-broadcasts this NPC's props to players on the next tick.
+        self._dirty = False
+
         # API wrapper for scripts
         self._api: Optional['NPCApi'] = None
+
+    def mark_dirty(self):
+        """Flag this NPC for a props re-broadcast on the next server tick."""
+        self._dirty = True
 
     def set_script(self, script_class: type):
         """Set the script class for this NPC."""
@@ -100,6 +113,14 @@ class NPC:
             props[NPCPROP.GANI] = self.gani
         if self.nickname:
             props[NPCPROP.NICKNAME] = self.nickname
+        if self.message:
+            props[NPCPROP.MESSAGE] = self.message
+        if self.head_image:
+            props[NPCPROP.HEADIMAGE] = self.head_image
+        if self.body_image:
+            props[NPCPROP.BODYIMAGE] = self.body_image
+        if any(self.colors):
+            props[NPCPROP.COLORS] = self.colors
         return build_npc_props(self.id, props)
 
     async def trigger_event(self, event_name: str, *args):
@@ -155,6 +176,7 @@ class NPCApi:
     @x.setter
     def x(self, value: float):
         self._npc.x = value
+        self._npc.mark_dirty()
 
     @property
     def y(self) -> float:
@@ -163,6 +185,7 @@ class NPCApi:
     @y.setter
     def y(self, value: float):
         self._npc.y = value
+        self._npc.mark_dirty()
 
     @property
     def level(self) -> Optional['Level']:
@@ -179,6 +202,7 @@ class NPCApi:
     @image.setter
     def image(self, value: str):
         self._npc.image = value
+        self._npc.mark_dirty()
 
     @property
     def gani(self) -> str:
@@ -187,6 +211,7 @@ class NPCApi:
     @gani.setter
     def gani(self, value: str):
         self._npc.gani = value
+        self._npc.mark_dirty()
 
     @property
     def direction(self) -> int:
@@ -195,6 +220,7 @@ class NPCApi:
     @direction.setter
     def direction(self, value: int):
         self._npc.direction = value
+        self._npc.mark_dirty()
 
     @property
     def message(self) -> str:
@@ -203,6 +229,43 @@ class NPCApi:
     @message.setter
     def message(self, value: str):
         self._npc.message = value
+        self._npc.mark_dirty()
+
+    @property
+    def nickname(self) -> str:
+        return self._npc.nickname
+
+    @nickname.setter
+    def nickname(self, value: str):
+        self._npc.nickname = value
+        self._npc.mark_dirty()
+
+    @property
+    def head_image(self) -> str:
+        return self._npc.head_image
+
+    @head_image.setter
+    def head_image(self, value: str):
+        self._npc.head_image = value
+        self._npc.mark_dirty()
+
+    @property
+    def body_image(self) -> str:
+        return self._npc.body_image
+
+    @body_image.setter
+    def body_image(self, value: str):
+        self._npc.body_image = value
+        self._npc.mark_dirty()
+
+    @property
+    def colors(self) -> List[int]:
+        return self._npc.colors
+
+    @colors.setter
+    def colors(self, value: List[int]):
+        self._npc.colors = list(value)
+        self._npc.mark_dirty()
 
     @property
     def flags(self) -> Dict[str, str]:
@@ -212,6 +275,28 @@ class NPCApi:
         """Move NPC by offset."""
         self._npc.x += dx
         self._npc.y += dy
+        self._npc.mark_dirty()
+
+    def face(self, direction: int):
+        """Set facing direction (0=up, 1=left, 2=down, 3=right)."""
+        self._npc.direction = direction & 0x03
+        self._npc.mark_dirty()
+
+    def set_nickname(self, nickname: str):
+        """Set the NPC's nickname (shown above its head)."""
+        self._npc.nickname = nickname
+        self._npc.mark_dirty()
+
+    def set_character(self, head: str = "", body: str = "",
+                      colors: Optional[List[int]] = None):
+        """Make the NPC look like a player character (head/body/colors)."""
+        if head:
+            self._npc.head_image = head
+        if body:
+            self._npc.body_image = body
+        if colors is not None:
+            self._npc.colors = list(colors)
+        self._npc.mark_dirty()
 
     def warp(self, level_name: str, x: float, y: float):
         """Warp NPC to a location."""
@@ -220,10 +305,12 @@ class NPCApi:
     def set_image(self, image: str):
         """Set NPC image."""
         self._npc.image = image
+        self._npc.mark_dirty()
 
     def set_ani(self, animation: str):
         """Set NPC animation."""
         self._npc.gani = animation
+        self._npc.mark_dirty()
 
     def set_timer(self, seconds: float):
         """Set timer for on_timeout event."""
@@ -232,14 +319,17 @@ class NPCApi:
     def say(self, text: str):
         """Display message above NPC."""
         self._npc.message = text
+        self._npc.mark_dirty()
 
     def hide(self):
         """Hide the NPC."""
         self._npc.visible = False
+        self._npc.mark_dirty()
 
     def show(self):
         """Show the NPC."""
         self._npc.visible = True
+        self._npc.mark_dirty()
 
     def destroy(self):
         """Destroy this NPC."""
@@ -342,6 +432,22 @@ class NPCManager:
         api = npc.get_api(self)
         await npc.trigger_event('on_created', api)
 
+    def attach_gs1(self, npc: NPC, code: str):
+        """Compile a GS1 script onto an NPC and fire its 'created' handler."""
+        from .gs1_host import compile_gs1, run_npc_event
+        prog = compile_gs1(code)
+        if prog is None:
+            return
+        npc.gs1_program = prog
+        run_npc_event(npc, 'created', self.server, None)
+
+    def _fire_gs1(self, npc: NPC, event: str, player: Optional['Player'] = None):
+        """Run a GS1 event handler on an NPC if it has a GS1 program."""
+        if npc.gs1_program is None:
+            return
+        from .gs1_host import run_npc_event
+        run_npc_event(npc, event, self.server, player)
+
     def get_npc(self, npc_id: int) -> Optional[NPC]:
         """Get NPC by ID."""
         return self._npcs.get(npc_id)
@@ -383,23 +489,35 @@ class NPCManager:
             await self.server.broadcast_to_level(new_level.name, packet)
 
     async def tick(self):
-        """Process NPC timers (called every server tick)."""
+        """Process NPC timers and re-broadcast changed NPCs (every server tick)."""
         for npc in list(self._npcs.values()):
             if npc.check_timer():
                 api = npc.get_api(self)
                 await npc.trigger_event('on_timeout', api)
+                self._fire_gs1(npc, 'timeout')
+
+        # Push props for any NPC whose visible state changed this tick so
+        # players see movement, animation, chat, and appearance updates live.
+        for npc in list(self._npcs.values()):
+            if npc._dirty:
+                npc._dirty = False
+                if npc.level:
+                    packet = npc.build_props_packet()
+                    await self.server.broadcast_to_level(npc.level.name, packet)
 
     async def on_player_enters(self, player: 'Player', level: 'Level'):
         """Trigger on_player_enters for NPCs on level."""
         for npc in self.get_npcs_on_level(level):
             api = npc.get_api(self)
             await npc.trigger_event('on_player_enters', api, player)
+            self._fire_gs1(npc, 'playerenters', player)
 
     async def on_player_leaves(self, player: 'Player', level: 'Level'):
         """Trigger on_player_leaves for NPCs on level."""
         for npc in self.get_npcs_on_level(level):
             api = npc.get_api(self)
             await npc.trigger_event('on_player_leaves', api, player)
+            self._fire_gs1(npc, 'playerleaves', player)
 
     async def on_player_chats(self, player: 'Player', message: str):
         """Trigger on_player_chats for NPCs on player's level."""
@@ -409,8 +527,35 @@ class NPCManager:
         for npc in self.get_npcs_on_level(player.level):
             api = npc.get_api(self)
             await npc.trigger_event('on_player_chats', api, player, message)
+            try:
+                player.chat = message  # so #c / playersays() see it
+            except Exception:
+                pass
+            self._fire_gs1(npc, 'playerchats', player)
 
     async def on_player_touches(self, player: 'Player', npc: NPC):
         """Trigger on_player_touches for an NPC."""
         api = npc.get_api(self)
         await npc.trigger_event('on_player_touches', api, player)
+        self._fire_gs1(npc, 'playertouchsme', player)
+
+    async def check_touches(self, player: 'Player'):
+        """Fire playertouchsme when the player newly overlaps an NPC.
+
+        Tracks the set of NPCs currently touched so the event fires on entry
+        rather than every movement packet while standing on the NPC.
+        """
+        if not player.level:
+            return
+        touching = getattr(player, '_touching_npcs', None)
+        if touching is None:
+            touching = set()
+        current = set()
+        for npc in self.get_npcs_on_level(player.level):
+            if not getattr(npc, 'visible', True):
+                continue
+            if abs(npc.x - player.x) < 2.0 and abs(npc.y - player.y) < 2.0:
+                current.add(npc.id)
+                if npc.id not in touching:
+                    await self.on_player_touches(player, npc)
+        player._touching_npcs = current

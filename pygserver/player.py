@@ -256,6 +256,8 @@ class Player:
 
         # Leave current level
         if self.level:
+            if getattr(self.server, 'npc_manager', None):
+                await self.server.npc_manager.on_player_leaves(self, self.level)
             self.level.remove_player(self)
             await self.server.broadcast_to_level(
                 self.level.name, build_player_left(self.id), exclude={self.id}
@@ -568,6 +570,10 @@ class Player:
                 await self.server.broadcast_to_level(
                     self.level.name, packet, exclude={self.id}
                 )
+
+            # Fire GS1 playertouchsme for NPCs the player has walked onto
+            if getattr(self.server, 'npc_manager', None):
+                await self.server.npc_manager.check_touches(self)
 
     async def _handle_adjacent_level(self, data: bytes):
         """Handle PLI_ADJACENTLEVEL packet (request for adjacent level data)."""

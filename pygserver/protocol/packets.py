@@ -557,6 +557,11 @@ def build_npc_props(npc_id: int, props: dict) -> bytes:
         elif prop_id == NPCPROP.HEADIMAGE:  # HEADGIF 100-offset string
             name = str(value).encode('latin-1')
             builder.write_gchar(100 + len(name)).write_bytes(name)
+        elif prop_id == NPCPROP.COLORS:  # 8 colors, each written as a gchar (client reads byte-32)
+            colors = list(value)[:8]
+            colors += [0] * (8 - len(colors))
+            for c in colors:
+                builder.write_gchar(int(c) & 0xFF)
         elif prop_id == NPCPROP.RUPEES:
             builder.write_gint3(int(value))
         else:

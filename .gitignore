@@ -45,3 +45,9 @@ accounts/*.txt
 levels/*.nw
 levels/*.graal
 npcs/*.txt
+
+# GS1 test corpus (Graal Classic 2004, 5732 .nw files) - kept local, not committed
+tests/gs1_corpus/
+
+# runtime player accounts (created at login)
+accounts/*.json

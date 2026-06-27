@@ -57,6 +57,10 @@ class ServerConfig:
     max_players: int = 100
     heartbeat_interval: float = 5.0  # seconds
 
+    # Ambient world population: number of wandering VillagerNPCs to spawn on
+    # the start level at boot (0 disables). See npcs/villager.py.
+    villager_count: int = 8
+
     @classmethod
     def from_server_dir(cls, server_dir: str) -> 'ServerConfig':
         """

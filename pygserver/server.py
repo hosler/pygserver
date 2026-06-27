@@ -7,6 +7,7 @@ levels, NPCs, and game state. Full GServer-v2 compatible implementation.
 
 import asyncio
 import logging
+import math
 import time
 from typing import Dict, Optional, Set, List
 from pathlib import Path
@@ -250,6 +251,37 @@ class GameServer:
             logger.info(f"Loading NPC scripts from {npcs_path}")
             await self.npc_manager.load_scripts(npcs_path)
 
+        # Populate the world with ambient villager NPCs.
+        await self._populate_world()
+
+    async def _populate_world(self):
+        """Spawn ambient villager NPCs on the start level to fill the world."""
+        count = getattr(self.config, 'villager_count', 0)
+        if count <= 0:
+            return
+        if 'VillagerNPC' not in self.npc_manager._script_classes:
+            logger.warning("villager_count set but no VillagerNPC script in npcs/")
+            return
+        level = self.world.get_level(self.config.start_level)
+        if not level:
+            logger.warning(
+                f"Cannot spawn villagers: start level "
+                f"{self.config.start_level} not loaded"
+            )
+            return
+
+        cx, cy = self.config.start_x, self.config.start_y
+        for i in range(count):
+            # Scatter on a ring around the spawn point, clamped to the level.
+            angle = (2 * math.pi * i) / count
+            x = max(2.0, min(61.0, cx + math.cos(angle) * 5.0))
+            y = max(2.0, min(61.0, cy + math.sin(angle) * 5.0))
+            self.npc_manager.create_npc(
+                name=f"villager_{i}", script_name="VillagerNPC",
+                level=level, x=x, y=y,
+            )
+        logger.info(f"Spawned {count} villager NPC(s) on {level.name}")
+
     async def _register_level_features(self, level):
         """Register chests/baddies parsed from a level file into the managers."""
         from .protocol.constants import LevelItemType
@@ -274,18 +306,23 @@ class GameServer:
                 except (ValueError, KeyError) as e:
                     logger.debug(f"Skipping baddy in {level.name}: {e}")
 
-        # Spawn level NPCs that have an image (visible). GS1 inline scripts are
-        # not executed (pygserver uses Python NPC scripting), but the NPC still
-        # appears so the level looks correct.
+        # Spawn level NPCs that have an image (visible) and/or a GS1 script.
+        # Script-only NPCs (no image) are common, so spawn on either, and run
+        # their GS1 via the interpreter.
         if self.npc_manager:
             for ndef in level.get_npc_defs():
-                if not ndef.get('image'):
+                image = ndef.get('image', '') or ''
+                code = ndef.get('code', '') or ''
+                if not image and not code.strip():
                     continue
                 npc = self.npc_manager.create_npc(
                     name="levelnpc", level=level,
                     x=ndef['x'], y=ndef['y']
                 )
-                npc.image = ndef['image']
+                if image and image != '-':
+                    npc.image = image
+                if code.strip():
+                    self.npc_manager.attach_gs1(npc, code)
 
     async def _handle_connection(self, reader: asyncio.StreamReader,
                                   writer: asyncio.StreamWriter):
