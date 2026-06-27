@@ -9,7 +9,7 @@ import os
 
 import pytest
 
-from pygserver.gs1.lexer import tokenize, LexError
+from reborn_protocol.gs1.lexer import tokenize, LexError
 
 CORPUS = os.path.join(os.path.dirname(__file__), "gs1_corpus")
 

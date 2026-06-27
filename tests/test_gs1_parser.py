@@ -8,9 +8,9 @@ import os
 
 import pytest
 
-from pygserver.gs1 import ast
-from pygserver.gs1.parser import parse, Parser
-from pygserver.gs1.lexer import tokenize
+from reborn_protocol.gs1 import ast
+from reborn_protocol.gs1.parser import parse, Parser
+from reborn_protocol.gs1.lexer import tokenize
 
 CORPUS = os.path.join(os.path.dirname(__file__), "gs1_corpus")
 

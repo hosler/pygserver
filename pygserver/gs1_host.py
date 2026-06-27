@@ -19,10 +19,10 @@ import logging
 import re
 import time
 
-from .gs1.runtime import Host, UNSET, VarStore, Context
-from .gs1.interp import Interpreter
-from .gs1.parser import parse
-from .gs1.values import to_num, to_str
+from reborn_protocol.gs1.runtime import Host, UNSET, VarStore, Context
+from reborn_protocol.gs1.interp import Interpreter
+from reborn_protocol.gs1.parser import parse
+from reborn_protocol.gs1.values import to_num, to_str
 
 logger = logging.getLogger(__name__)
 

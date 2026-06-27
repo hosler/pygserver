@@ -4,8 +4,8 @@ Semantics verified against GServer-v2 GS1Functions.cpp / GS1MessageCodes.cpp.
 Note: a function argument's type (P expression / S string / V variable) is fixed
 by the lexer, so e.g. ascii(P) sees an expression while indexof(SS) sees strings.
 """
-from pygserver.gs1.interp import run, Interpreter
-from pygserver.gs1 import parse
+from reborn_protocol.gs1.interp import run, Interpreter
+from reborn_protocol.gs1 import parse
 
 
 def probe(ctx, expr):

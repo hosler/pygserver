@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Generate pygserver/pygserver/gs1/_tables.py from the GServer-v2 ANTLR grammar.
+"""Generate reborn_protocol/gs1/_tables.py from the GServer-v2 ANTLR grammar.
 
 The C++ engine is the spec (see memory: gs1-python-port). Rather than hand-copy
 206 commands / 65 functions and their per-argument lexer-mode strings, we parse
@@ -23,7 +23,8 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 DEFAULT_GRAMMAR = os.path.normpath(os.path.join(
     HERE, "..", "..", "GServer-v2", "server", "src", "scripting", "gs1",
     "grammar", "GS1Lexer.g4"))
-OUT = os.path.normpath(os.path.join(HERE, "..", "pygserver", "gs1", "_tables.py"))
+OUT = os.path.normpath(os.path.join(
+    HERE, "..", "..", "reborn-protocol", "reborn_protocol", "gs1", "_tables.py"))
 
 # CMD_X : 'literal'  [{ pushCommand("ARGS"); }]  -> type(COMMAND);
 CMD_RE = re.compile(

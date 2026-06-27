@@ -7,9 +7,9 @@ import os
 
 import pytest
 
-from pygserver.gs1 import parse
-from pygserver.gs1.interp import Interpreter, run, run_event
-from pygserver.gs1.runtime import Context, MemoryHost
+from reborn_protocol.gs1 import parse
+from reborn_protocol.gs1.interp import Interpreter, run, run_event
+from reborn_protocol.gs1.runtime import Context, MemoryHost
 
 CORPUS = os.path.join(os.path.dirname(__file__), "gs1_corpus")
 
@@ -145,8 +145,8 @@ def test_corpus_execution_robustness():
     import sys
     sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "tools"))
     from gs1_corpus_profile import iter_npc_scripts
-    from pygserver.gs1.parser import Parser
-    from pygserver.gs1.lexer import tokenize
+    from reborn_protocol.gs1.parser import Parser
+    from reborn_protocol.gs1.lexer import tokenize
 
     events = ["created", "playerenters", "playertouchsme", "playerchats"]
     ran = crash = 0
