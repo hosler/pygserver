@@ -10,6 +10,7 @@ import os
 import pytest
 
 from reborn_protocol.gs1.lexer import tokenize, LexError
+from reborn_protocol.gs1.parser import Parser
 
 CORPUS = os.path.join(os.path.dirname(__file__), "gs1_corpus")
 
@@ -58,6 +59,52 @@ def test_message_code_with_computed_param():
     ts = texts("message Hello #v(playerx);")
     assert ("MESSAGECODE", "#v") in ts
     assert ("IDENTIFIER", "playerx") in ts
+
+
+def test_array_literal_comma_inside_nonfinal_command_arg():
+    # Bomber Arena's npc73/npc75 (Draw()) call showani2 (args 'EEEEDS':
+    # index,x,y,z,dir,ganistring) with an '{a,b}' set literal used INSIDE a
+    # non-final argument's expression, e.g. `this.z+(this.z in {.75,1.25})`.
+    # The lexer has no bracket-depth tracking for '{' '}' the way it does for
+    # '(' ')' (brace_count), so the array literal's own internal comma used
+    # to be treated as the comma that advances to the *next command
+    # argument*, desyncing the remaining argument-type queue (and, via a
+    # further leaked brace_count, corrupting a later unrelated #v(...) call
+    # in the same statement). See array_lit_depth in lexer.py.
+    src = "showani2 1,2,3,this.z+(this.z in {.75,1.25}),0,foo;"
+    pr = Parser(tokenize(src))
+    prog = pr.parse_program()
+    assert not pr.errors
+    cmd = prog.body[0]
+    assert cmd.name == "showani2"
+    assert len(cmd.args) == 6           # index,x,y,z,dir,ganistring
+
+
+def test_negative_numbers_in_set_literal_inside_command_arg():
+    # Same corpus files also use `{-2,-3,-4,-5}` sets; verify negatives parse
+    # fine inside a command argument's expression too (not just DEFAULT mode).
+    src = "showpoly this.i,(obj[5] in {-2,-3,-4,-5})*0.75;"
+    pr = Parser(tokenize(src))
+    prog = pr.parse_program()
+    assert not pr.errors
+    assert len(prog.body[0].args) == 2
+
+
+def test_nested_function_call_inside_open_grouping_paren_in_command_arg():
+    # npc73.gs1's showani2 index argument is
+    # `1000+(strtofloat(#p(0))+strtofloat(#p(1))*64)`: nested function/
+    # messagecode calls (strtofloat(...), #p(...)) inside a still-open outer
+    # grouping paren, used as a COMMAND argument. brace_count (which tells a
+    # nested call's own ')' apart from a grouping paren's ')') used to be one
+    # flat counter shared across every pushed command/function state, so the
+    # outer paren (still open) leaked into the inner calls and misdirected
+    # their closing ')'. brace_count is now saved/restored per pushed state
+    # (lexer.py push_command/push_array_access/pop_next_mode).
+    src = "showani2 1000+(strtofloat(#p(0))+strtofloat(#p(1))*64),1,2,3,0,foo;"
+    pr = Parser(tokenize(src))
+    prog = pr.parse_program()
+    assert not pr.errors
+    assert len(prog.body[0].args) == 6
 
 
 def test_control_flow_keywords():

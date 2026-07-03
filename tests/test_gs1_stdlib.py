@@ -77,3 +77,31 @@ def test_tokenize_and_token_code():
 def test_messagecode_string_of_var():
     ctx = run("this.n = 42; setstring this.s,val is #s(this.n) end;")
     assert probe(ctx, "this.s") == "val is 42 end"
+
+
+def test_indexof_and_lindexof_are_case_sensitive():
+    # Unlike strequals/strcontains/startswith (GServer-v2's equalsi/findi,
+    # case-insensitive), fn_indexof uses plain std::string::find and
+    # fn_lindexof compares trimmed items with `==` — both case-sensitive.
+    ctx = run("this.hit=indexof(ELL,hello); this.miss=indexof(ell,hello);")
+    assert probe(ctx, "this.hit") == -1.0     # wrong case never matches
+    assert probe(ctx, "this.miss") == 1.0
+    ctx = run("setstring this.csv,A,b,c; this.hit=lindexof(A,this.csv); "
+              "this.miss=lindexof(a,this.csv);")
+    assert probe(ctx, "this.hit") == 0.0
+    assert probe(ctx, "this.miss") == -1.0
+
+
+def test_sin_clamped_to_zero_pi_range_cos_is_not():
+    # GServer-v2's fn_sin (GS1Functions.cpp) only computes std::sin(value) for
+    # value in [0, pi]; anything outside returns 0 (fn_cos has no such
+    # restriction). Bomber's eye_bomber mallet-UI Draw() folds its phase
+    # into [0,1] before multiplying by pi specifically to stay in this
+    # window, so the corpus relies on the clamp being real.
+    ctx = run("this.a=sin(-0.1); this.b=sin(3.5); this.c=sin(1.5707963267948966);"
+              " this.d=cos(-0.1); this.e=cos(3.5);")
+    assert probe(ctx, "this.a") == 0.0     # negative -> clamped
+    assert probe(ctx, "this.b") == 0.0     # > pi -> clamped
+    assert abs(probe(ctx, "this.c") - 1.0) < 1e-9   # pi/2 in range -> sin(pi/2)=1
+    assert probe(ctx, "this.d") != 0.0      # cos has no range restriction
+    assert probe(ctx, "this.e") != 0.0
