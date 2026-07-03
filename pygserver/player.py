@@ -21,6 +21,7 @@ from .protocol.packets import (
     parse_level_warp,
     parse_trigger_action,
     parse_hurt_player,
+    build_trigger_action,
     parse_npc_props,
     build_player_props,
     build_other_player_props,
@@ -100,6 +101,12 @@ class Player:
         self.sword_image = "sword1.png"
         self.shield_image = "shield1.png"
         self.colors = [0, 0, 0, 0, 0]  # Skin, coat, sleeve, shoe, belt
+
+        # MP/AP (PLPROP_MAGICPOINTS=26 / PLPROP_ALIGNMENT=32). Defaults match
+        # GServer-v2 (server/include/object/Character.h): mp starts at 0,
+        # ap starts at 50 (neutral on the 0-100 good/evil scale).
+        self.mp = 0
+        self.ap = 50
 
         # Animation
         self.gani = "idle"
@@ -439,6 +446,9 @@ class Player:
             PLPROP.HEADIMAGE: self.head_image,
             PLPROP.BODYIMAGE: self.body_image,
             PLPROP.ACCOUNTNAME: self.account_name,
+            PLPROP.COLORS: self.colors,
+            PLPROP.MAGICPOINTS: self.mp,
+            PLPROP.ALIGNMENT: self.ap,
         }
 
         packet = build_player_props(props)
@@ -546,6 +556,14 @@ class Player:
         if PLPROP.GANI in props:
             self.gani = props[PLPROP.GANI]
 
+        # Local level chat (PLPROP_CURCHAT, sent by Client.send_level_chat via
+        # PLI_PLAYERPROPS) fires the GS1 "playerchats" NPC event, e.g. the
+        # qa_tier3.nw fixture's unfreezeplayer-on-chat handler.
+        if PLPROP.CURCHAT in props:
+            self.chat = props[PLPROP.CURCHAT]
+            if self.level and getattr(self.server, 'npc_manager', None):
+                await self.server.npc_manager.on_player_chats(self, self.chat)
+
         # Appearance updates
         if PLPROP.HEADIMAGE in props:
             self.head_image = props[PLPROP.HEADIMAGE]
@@ -637,16 +655,23 @@ class Player:
             await self.server.combat_manager.handle_bomb_del(self, x, y)
 
     async def _handle_arrow_add(self, data: bytes):
-        """Handle PLI_ARROWADD packet."""
+        """Handle PLI_ARROWADD packet.
+
+        Wire format (GServer-v2 msgPLI_ARROWADD, PlayerClientPackets.cpp):
+            {GCHAR x*2}{GCHAR y*2}{GCHAR flags}{GCHAR sprite}{GCHAR power}
+        flags: bit0-1 direction, bit2 reflect, bit3 fromPlayer.
+        """
         if not self.level:
             return
         reader = PacketReader(data)
         x = reader.read_gchar() / 2.0
         y = reader.read_gchar() / 2.0
-        direction = reader.read_gchar() if reader.remaining() else self.direction
+        flags = reader.read_gchar() if reader.remaining() else (self.direction & 0x03)
+        sprite = reader.read_gchar() if reader.remaining() else 0
+        power = reader.read_gchar() if reader.remaining() else 1
 
         if hasattr(self.server, 'combat_manager'):
-            await self.server.combat_manager.handle_arrow_add(self, x, y, direction)
+            await self.server.combat_manager.handle_arrow_add(self, x, y, flags, sprite, power)
 
     async def _handle_fire_spy(self, data: bytes):
         """Handle PLI_FIRESPY packet (fire from wand)."""
@@ -967,8 +992,16 @@ class Player:
     # =========================================================================
 
     async def _handle_trigger_action(self, data: bytes):
-        """Handle PLI_TRIGGERACTION packet."""
+        """Handle PLI_TRIGGERACTION packet.
+
+        Wire format (GServer-v2 msgPLI_TRIGGERACTION, PlayerClientPackets.cpp):
+            {GUINT3 npc_id}{GCHAR x*2}{GCHAR y*2}{action CSV}
+        npc_id is a 3-byte GInt (readGUInt() == readGInt(), 3 bytes on the
+        wire, not 4) - it must be consumed before x/y or every triggeraction
+        parses garbage.
+        """
         reader = PacketReader(data)
+        npc_id = reader.read_gint3()
         x = reader.read_gchar() / 2.0
         y = reader.read_gchar() / 2.0
         action = reader.remaining().decode('latin-1', errors='replace').strip()
@@ -978,6 +1011,13 @@ class Player:
         # Handle serverside triggers
         if action.startswith("serverside"):
             await self.server.handle_trigger_action(self, x, y, action)
+
+        # Relay to other players on the level (GServer-v2 msgPLI_TRIGGERACTION:
+        # sendPacketToOneLevelPart(..., { m_id }) when sendplayertriggers=true,
+        # the default; excludes the sender).
+        if self.level:
+            packet = build_trigger_action(self.id, npc_id, x, y, action)
+            await self.server.broadcast_to_level(self.level.name, packet, exclude={self.id})
 
         # Notify NPC manager
         await self.server.npc_manager.on_trigger_action(self, x, y, action)
@@ -1350,6 +1390,9 @@ class Player:
             PLPROP.HEADIMAGE: self.head_image,
             PLPROP.BODYIMAGE: self.body_image,
             PLPROP.CURLEVEL: self.level.name if self.level else "",
+            PLPROP.COLORS: self.colors,
+            PLPROP.MAGICPOINTS: self.mp,
+            PLPROP.ALIGNMENT: self.ap,
         }
         return build_other_player_props(self.id, props)
 

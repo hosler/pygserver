@@ -321,7 +321,8 @@ class CombatManager:
         logger.debug(f"Bomb detonated at ({bomb.x}, {bomb.y}) with radius {radius}")
 
     async def handle_arrow_add(self, player: 'Player', x: float, y: float,
-                                direction: int) -> Optional[Arrow]:
+                                flags: int, sprite: int = 0,
+                                power: int = 1) -> Optional[Arrow]:
         """
         Handle a player firing an arrow.
 
@@ -329,7 +330,10 @@ class CombatManager:
             player: Player firing the arrow
             x: Starting X position
             y: Starting Y position
-            direction: Direction (0=up, 1=left, 2=down, 3=right)
+            flags: raw PLI_ARROWADD flags byte (bit0-1 direction, bit2
+                reflect, bit3 fromPlayer) - see GServer-v2 msgPLI_ARROWADD.
+            sprite: arrow sprite id, passed through to the relay
+            power: arrow power, passed through to the relay
 
         Returns:
             The created Arrow, or None if failed
@@ -343,6 +347,8 @@ class CombatManager:
 
         # Consume arrow
         player.arrows -= 1
+
+        direction = flags & 0x03
 
         # Create arrow
         arrow_id = self._next_arrow_id
@@ -363,7 +369,7 @@ class CombatManager:
         self._arrows[player.level.name][arrow_id] = arrow
 
         # Broadcast arrow to level
-        packet = build_arrow_add(player.id, x, y, direction)
+        packet = build_arrow_add(player.id, x, y, flags, sprite, power)
         await self.server.broadcast_to_level(player.level.name, packet)
 
         logger.debug(f"Player {player.id} fired arrow at ({x}, {y}) direction {direction}")

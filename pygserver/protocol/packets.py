@@ -284,7 +284,8 @@ def parse_player_props(data: bytes, start_pos: int = 0) -> dict:
         elif prop_id in [PLPROP.MAXPOWER, PLPROP.CURPOWER, PLPROP.ARROWSCOUNT,
                          PLPROP.BOMBSCOUNT, PLPROP.GLOVEPOWER, PLPROP.BOMBPOWER,
                          PLPROP.SPRITE, PLPROP.X, PLPROP.Y, PLPROP.DIRECTION,
-                         PLPROP.STATUS, PLPROP.CARRYSPRITE]:
+                         PLPROP.STATUS, PLPROP.CARRYSPRITE,
+                         PLPROP.MAGICPOINTS, PLPROP.ALIGNMENT]:
             if pos < len(data):
                 props[prop_id] = data[pos] - 32
                 pos += 1
@@ -407,10 +408,22 @@ def build_raw_data_announcement(size: int) -> bytes:
 
 
 def build_player_props(props: dict) -> bytes:
-    """Build PLO_PLAYERPROPS packet with given properties."""
+    """Build PLO_PLAYERPROPS packet with given properties.
+
+    GServer-v2 always emits PlayerProp ids in strictly ascending numeric
+    order (server/include/object/Player.h's PLAYERPROP_LIST X-macro is walked
+    in enum-value order by getPropsPacketFromList()/getModifiedPropsPacket(),
+    server/src/player/PlayerProps.cpp). pyReborn's parser relies on that
+    invariant as a self-correcting signal for PLPROP_COLORS' ambiguous wire
+    width (see reborn-protocol-docs "PLPROP_COLORS Width" /
+    _parse_with_colors_retry): the first out-of-order id it sees ends the
+    parse early. Sorting here means callers can build the `props` dict in
+    whatever order is convenient without silently corrupting every later
+    prop on the wire.
+    """
     builder = PacketBuilder().write_gchar(PLO.PLAYERPROPS)
 
-    for prop_id, value in props.items():
+    for prop_id, value in sorted(props.items()):
         _write_player_prop(builder, prop_id, value)
 
     builder.write_byte(ord('\n'))
@@ -457,7 +470,8 @@ def _write_player_prop(builder: 'PacketBuilder', prop_id: int, value) -> None:
     # Single byte
     elif prop_id in (PLPROP.MAXPOWER, PLPROP.CURPOWER, PLPROP.ARROWSCOUNT,
                      PLPROP.BOMBSCOUNT, PLPROP.GLOVEPOWER, PLPROP.BOMBPOWER,
-                     PLPROP.SPRITE, PLPROP.DIRECTION, PLPROP.STATUS):
+                     PLPROP.SPRITE, PLPROP.DIRECTION, PLPROP.STATUS,
+                     PLPROP.MAGICPOINTS, PLPROP.ALIGNMENT):
         builder.write_gchar(prop_id)
         builder.write_gchar(int(value))
 
@@ -516,10 +530,14 @@ def _write_sword_prop(builder: 'PacketBuilder', value, threshold: int) -> None:
 
 
 def build_other_player_props(player_id: int, props: dict) -> bytes:
-    """Build PLO_OTHERPLPROPS packet for another player."""
+    """Build PLO_OTHERPLPROPS packet for another player.
+
+    See build_player_props() for why props must be emitted in ascending
+    PlayerProp-id order (GServer-v2 convention the client's parser relies on).
+    """
     builder = PacketBuilder().write_gchar(PLO.OTHERPLPROPS).write_gshort(player_id)
 
-    for prop_id, value in props.items():
+    for prop_id, value in sorted(props.items()):
         _write_player_prop(builder, prop_id, value)
 
     builder.write_byte(ord('\n'))
@@ -701,13 +719,27 @@ def build_bomb_del(x: float, y: float) -> bytes:
     return builder.build()
 
 
-def build_arrow_add(player_id: int, x: float, y: float, direction: int) -> bytes:
-    """Build PLO_ARROWADD packet."""
+def build_arrow_add(player_id: int, x: float, y: float, flags: int,
+                     sprite: int = 0, power: int = 1) -> bytes:
+    """Build PLO_ARROWADD packet.
+
+    Wire format (GServer-v2 PlayerClientPackets.cpp msgPLI_ARROWADD, which
+    rebroadcasts the client's own payload verbatim after prefixing the
+    sender's id):
+        {GSHORT owner_id}{GCHAR x*2}{GCHAR y*2}{GCHAR flags}{GCHAR sprite}{GCHAR power}
+    flags: bit0-1 direction, bit2 reflect, bit3 fromPlayer (see the same
+    function's read side: dir = flags & 0b11, reflect = flags & 0b100,
+    fromPlayer = flags & 0b1000). Previously this only wrote a bare
+    direction and dropped sprite/power, corrupting the relay payload the
+    client's parse_arrow_add() expects.
+    """
     builder = PacketBuilder().write_gchar(PLO.ARROWADD)
     builder.write_gshort(player_id)
     builder.write_gchar(int(x * 2))
     builder.write_gchar(int(y * 2))
-    builder.write_gchar(direction)
+    builder.write_gchar(flags & 0xFF)
+    builder.write_gchar(sprite)
+    builder.write_gchar(power)
     builder.write_newline()
     return builder.build()
 
@@ -1002,9 +1034,21 @@ def build_say2(text: str) -> bytes:
     return builder.build()
 
 
-def build_trigger_action(x: float, y: float, action: str) -> bytes:
-    """Build PLO_TRIGGERACTION packet."""
+def build_trigger_action(player_id: int, npc_id: int, x: float, y: float,
+                          action: str) -> bytes:
+    """Build PLO_TRIGGERACTION packet.
+
+    Wire format (GServer-v2 PlayerClientPackets.cpp msgPLI_TRIGGERACTION,
+    both the player->player relay - which prepends the sender's gshort id to
+    its own raw payload starting with the gint3 npc id - and the
+    server/NPC-originated variants in Server.cpp/TriggerCommandHandlers.cpp):
+        {GSHORT player_id}{GINT3 npc_id}{GCHAR x*2}{GCHAR y*2}{action CSV}
+    player_id/npc_id are mutually exclusive in practice (0 for whichever
+    didn't originate the trigger).
+    """
     builder = PacketBuilder().write_gchar(PLO.TRIGGERACTION)
+    builder.write_gshort(player_id)
+    builder.write_gint3(npc_id)
     builder.write_gchar(int(x * 2))
     builder.write_gchar(int(y * 2))
     builder.write_string(action)
@@ -1580,20 +1624,27 @@ def parse_board_modify(data: bytes) -> Tuple[int, int, int, int, bytes]:
     return x, y, width, height, tiles
 
 
-def parse_trigger_action(data: bytes) -> Tuple[float, float, str, List[str]]:
+def parse_trigger_action(data: bytes) -> Tuple[int, float, float, str, List[str]]:
     """Parse PLI_TRIGGERACTION packet.
 
+    Wire format (GServer-v2 msgPLI_TRIGGERACTION, PlayerClientPackets.cpp):
+        {GUINT3 npc_id}{GCHAR x*2}{GCHAR y*2}{action CSV}
+    npc_id is a 3-byte GInt (readGUInt() == readGInt(), NOT a 4-byte GInt4) -
+    reading only 4 bytes here (or skipping it) shifts x/y/action by one and
+    silently corrupts every triggeraction.
+
     Returns:
-        Tuple of (x, y, action, params)
+        Tuple of (npc_id, x, y, action, params)
     """
     reader = PacketReader(data)
+    npc_id = reader.read_gint3()
     x = reader.read_gchar() / 2.0
     y = reader.read_gchar() / 2.0
     action_str = reader.remaining().decode('latin-1', errors='replace').strip()
     parts = action_str.split(',')
     action = parts[0] if parts else ''
     params = parts[1:] if len(parts) > 1 else []
-    return x, y, action, params
+    return npc_id, x, y, action, params
 
 
 def parse_bomb_add(data: bytes) -> Tuple[float, float, int]:

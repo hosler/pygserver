@@ -851,11 +851,44 @@ def _queue_player_prop(player, prop_id, value):
 
 
 def _c_freezeplayer(self, a, npc, player, ctx):
-    if player is not None:
-        try:
-            player.is_frozen = True
-        except Exception:
-            pass
+    # freezeplayer/freezeplayer2 - GServer-v2 PlayerClient::freezePlayer()
+    # sends a bare PLO_FREEZEPLAYER2 packet (PlayerClient.cpp:1700-1703).
+    if player is None:
+        return
+    try:
+        player.is_frozen = True
+    except Exception:
+        pass
+    if hasattr(player, "send_raw"):
+        from .protocol.packets import build_freeze_player
+        _schedule(player.send_raw(build_freeze_player()))
+
+
+def _c_unfreezeplayer(self, a, npc, player, ctx):
+    # unfreezeplayer/unfreezeplayer2 - GServer-v2 PlayerClient::unfreezePlayer()
+    # sends a bare PLO_UNFREEZEPLAYER packet (PlayerClient.cpp:1705-1708).
+    if player is None:
+        return
+    try:
+        player.is_frozen = False
+    except Exception:
+        pass
+    if hasattr(player, "send_raw"):
+        from .protocol.packets import build_unfreeze_player
+        _schedule(player.send_raw(build_unfreeze_player()))
+
+
+def _c_say2(self, a, npc, player, ctx):
+    # say2 <raw text> - GServer-v2 PlayerClient::sendSignMessage() sends
+    # PLO_SAY2 with the translated text (PlayerClient.cpp:1717-1721). This is
+    # the RPG-style textbox/sign message sent directly to the triggering
+    # player, distinct from `message`/`say` which just set the NPC's chat
+    # bubble (NPCPROP #c) for everyone on the level to see.
+    if player is None or not hasattr(player, "send_raw"):
+        return
+    text = to_str(a[0]) if a else ""
+    from .protocol.packets import build_say2
+    _schedule(player.send_raw(build_say2(text)))
 
 
 def _schedule(coro):
@@ -898,7 +931,7 @@ _COMMANDS = {
     "setimg": _c_setimg, "setgif": _c_setimg, "seticon": _c_noop,
     "setimgpart": _c_setimg,
     "setani": _c_setani, "setcharani": _c_setani,
-    "message": _c_message, "say2": _c_message, "say": _c_message,
+    "message": _c_message, "say2": _c_say2, "say": _c_message,
     "hide": _c_hide, "show": _c_show,
     "hidelocal": _c_hide, "showlocal": _c_show,
     "move": _c_move,
@@ -914,6 +947,7 @@ _COMMANDS = {
     "setsleevecolor": _c_setsleevecolor, "setshoecolor": _c_setshoecolor,
     "setbeltcolor": _c_setbeltcolor,
     "freezeplayer": _c_freezeplayer, "freezeplayer2": _c_freezeplayer,
+    "unfreezeplayer": _c_unfreezeplayer,
     "seticon": _c_noop,
     # items
     "lay": _c_lay, "lay2": _c_lay2, "take": _c_take, "toweapons": _c_toweapons,

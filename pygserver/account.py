@@ -55,10 +55,15 @@ class Account:
     hearts: float = 3.0
     rupees: int = 0
     bombs: int = 0
-    arrows: int = 0
+    # GServer-v2 default new-character stat (server/include/object/Character.h:
+    # "uint8_t arrows = 5;"). Fresh accounts with 0 starting arrows can never
+    # fire PLI_ARROWADD, which silently no-ops the whole arrow-relay path.
+    arrows: int = 5
     glove_power: int = 0
     sword_power: int = 1
     shield_power: int = 1
+    mp: int = 0        # PLPROP_MAGICPOINTS
+    ap: int = 50       # PLPROP_ALIGNMENT (GServer default 50)
 
     # Position
     level_name: str = ""
@@ -123,6 +128,8 @@ class Account:
             'glove_power': self.glove_power,
             'sword_power': self.sword_power,
             'shield_power': self.shield_power,
+            'mp': self.mp,
+            'ap': self.ap,
             'level_name': self.level_name,
             'x': self.x,
             'y': self.y,
@@ -156,10 +163,14 @@ class Account:
         account.hearts = data.get('hearts', 3.0)
         account.rupees = data.get('rupees', 0)
         account.bombs = data.get('bombs', 0)
-        account.arrows = data.get('arrows', 0)
+        # arrows default must match the dataclass/GServer default of 5; a 0
+        # here silently disables the whole arrow-relay path for the account.
+        account.arrows = data.get('arrows', 5)
         account.glove_power = data.get('glove_power', 0)
         account.sword_power = data.get('sword_power', 1)
         account.shield_power = data.get('shield_power', 1)
+        account.mp = data.get('mp', 0)
+        account.ap = data.get('ap', 50)
         account.level_name = data.get('level_name', '')
         account.x = data.get('x', 30.0)
         account.y = data.get('y', 30.0)
@@ -414,6 +425,8 @@ class AccountManager:
         player.glove_power = account.glove_power
         player.sword_power = account.sword_power
         player.shield_power = account.shield_power
+        player.mp = account.mp
+        player.ap = account.ap
         player.flags = account.flags.copy()
         player.gattribs = {i: v for i, v in enumerate(account.gattribs) if v}
 
@@ -443,6 +456,8 @@ class AccountManager:
         account.glove_power = player.glove_power
         account.sword_power = player.sword_power
         account.shield_power = player.shield_power
+        account.mp = player.mp
+        account.ap = player.ap
         account.flags = player.flags.copy()
 
         # Save gattribs
