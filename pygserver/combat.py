@@ -535,6 +535,15 @@ class CombatManager:
                                    int(knockback_y), damage)
         await player.send_raw(packet)
 
+        # Tell the victim their new heart total. PLO_HURTPLAYER only carries
+        # knockback, not the resulting hearts, and pygserver is authoritative
+        # for hearts here (we decremented player.hearts above) — without this
+        # the client's health bar stays frozen at its old value until a
+        # respawn/pickup happens to resend CURPOWER, so a hit "does nothing"
+        # visibly even though damage landed. (This is what the old "PvP damage
+        # not applied" report actually was; a playtester surfaced it again.)
+        await player.send_props({PLPROP.CURPOWER: int(player.hearts * 2)})
+
         # Check for death
         if player.hearts <= 0:
             await self.handle_player_death(player, attacker_id, damage_type)
