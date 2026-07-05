@@ -16,6 +16,7 @@ Or:
 
 import asyncio
 import logging
+import os
 import sys
 from pathlib import Path
 
@@ -53,10 +54,13 @@ async def main():
         config.name = "pygserver Development"
         config.verify_login = False
 
-    # Enable list server for testing
-    config.enable_listserver = True
-    config.listip = "listserver.graal.in"
-    config.listport = 14900
+    # Enable list server for testing. Skipped under the pytest QA harness
+    # (pyReborn/conftest.py sets PYGSERVER_QA), which spins up a throwaway
+    # server dir and must stay fully offline.
+    if not os.environ.get("PYGSERVER_QA"):
+        config.enable_listserver = True
+        config.listip = "listserver.graal.in"
+        config.listport = 14900
 
     # Ensure directories exist
     for dir_name in [config.levels_dir, config.npcs_dir, config.accounts_dir]:
