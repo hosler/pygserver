@@ -180,12 +180,12 @@ def test_player_prop_propagation_warp_and_hurt():
         await asyncio.sleep(0)  # let scheduled send_props / warp tasks run
 
         assert p.rupees == 55.0
-        assert p.hearts == 2.0
+        assert p.hearts == 2.5   # hurt 1 = 1 HALF-heart (C++ fn_hurt)
         merged = {}
         for d in sent:
             merged.update(d)
         assert PLPROP.RUPEESCOUNT in merged
-        assert PLPROP.CURPOWER in merged and merged[PLPROP.CURPOWER] == 4  # 2 hearts*2
+        assert PLPROP.CURPOWER in merged and merged[PLPROP.CURPOWER] == 5  # 2.5 hearts*2
         assert warps == [("cave.nw", 5.0, 6.0)]
 
     asyncio.run(main())

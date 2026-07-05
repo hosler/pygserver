@@ -100,6 +100,142 @@ def test_setcharprop_colors():
     assert npc.colors[1] == 0   # "9" is not a colour name -> 0
 
 
+# -- #C0-#C7 READ side (GS1MessageCodes.cpp handleCharacterBasedMessageCode +
+#    mc_C: the value of a #C code is the classic colour NAME of the slot) ----
+def test_color_read_bare_copy_idiom_is_npc_self_roundtrip():
+    # the real-corpus idiom `setcharprop #C0,#C0`: setcharprop pushes the NPC
+    # as the current source BEFORE its value args are evaluated
+    # (processBuiltInCommand, GS1Commands.cpp:430), so bare #C0 reads the
+    # NPC's OWN slot as its colour name and the write round-trips — it must
+    # NOT read the player's slot, and must not zero the slot ("" -> 0/white
+    # was the old bug). Verified live vs gs2emu (game_tester --gs1).
+    npc = make_npc("if (playertouchsme) { setplayerprop #C0,green;"
+                   " setcharprop #C0,brown; setcharprop #C0,#C0; }")
+    p = FakePlayer()
+    run_npc_event(npc, "playertouchsme", None, p)
+    assert p.colors[0] == 7       # green written to the player
+    assert npc.colors[0] == 12    # brown preserved (not 7, not 0)
+
+
+def test_color_read_bare_in_setplayerprop_reads_player():
+    # symmetric push: setplayerprop pushes the acting player, so bare #C1 in
+    # its value arg reads the PLAYER's slot
+    npc = make_npc("if (playertouchsme) {"
+                   " setplayerprop #C1,darkred; setplayerprop #C3,#C1; }")
+    p = FakePlayer()
+    run_npc_event(npc, "playertouchsme", None, p)
+    assert p.colors[1] == 5
+    assert p.colors[3] == 5
+
+
+def test_color_read_bare_outside_charprop_reads_initiating_player():
+    # outside setcharprop/setplayerprop the source stack is empty, so bare
+    # #C0 resolves to the initiating player (getCurrentSource(true))
+    npc = make_npc("if (playertouchsme) { message #C0; }")
+    p = FakePlayer()
+    p.colors = [13, 0, 0, 0, 0]
+    run_npc_event(npc, "playertouchsme", None, p)
+    assert npc.message == "cynober"
+
+
+def test_color_read_bare_falls_back_to_npc_without_player():
+    # no acting player -> the NPC itself (both via the setcharprop push and
+    # the original-source fallback)
+    npc = make_npc("if (created) { setcharprop #C2,blue; setcharprop #c,#C2; }")
+    run_npc_event(npc, "created", None, None)
+    assert npc.colors[2] == 10
+    assert npc.message == "blue"
+
+
+def test_color_read_index_minus1_is_source_npc():
+    npc = make_npc("if (playertouchsme) {"
+                   " setcharprop #C0,pink; setcharprop #c,#C0(-1); }")
+    p = FakePlayer()
+    p.colors = [4, 0, 0, 0, 0]   # player slot 0 is red; must NOT be read
+    run_npc_event(npc, "playertouchsme", None, p)
+    assert npc.message == "pink"
+
+
+def test_color_read_index_zero_is_acting_player():
+    npc = make_npc("if (playertouchsme) {"
+                   " setplayerprop #C1,red; setcharprop #c,#C1(0); }")
+    p = FakePlayer()
+    run_npc_event(npc, "playertouchsme", None, p)
+    assert npc.message == "red"
+
+
+def test_color_read_out_of_enum_value_is_empty():
+    # getClassicColorName returns "" for values outside the classic enum.
+    # (bare #C0 inside setcharprop reads the NPC's own slot, so poison that.)
+    npc = make_npc("if (playertouchsme) { setcharprop #c,X#C0Y; }")
+    npc.colors[0] = 25           # 20+ = HTML colours, no classic name
+    p = FakePlayer()
+    run_npc_event(npc, "playertouchsme", None, p)
+    assert npc.message == "XY"
+
+
+# -- hurt (argument is HALF-hearts: GS1Commands.cpp fn_hurt) -----------------
+def test_hurt_subtracts_halfhearts():
+    npc = make_npc("if (playertouchsme) { hurt 1; }")
+    p = FakePlayer()
+    p.hearts = 3.0
+    run_npc_event(npc, "playertouchsme", None, p)
+    assert p.hearts == 2.5
+
+
+def test_hurt_floors_argument():
+    # DoubleAsIntegralFloor: hurt 1.9 == hurt 1 == half a heart
+    npc = make_npc("if (playertouchsme) { hurt 1.9; }")
+    p = FakePlayer()
+    p.hearts = 3.0
+    run_npc_event(npc, "playertouchsme", None, p)
+    assert p.hearts == 2.5
+
+
+def test_hurt_clamps_at_zero_instead_of_going_negative():
+    # A `hurt` for more halfhearts than the player has left must not drive
+    # hearts negative (previously `hurt 20` on 3 hearts left player.hearts
+    # at -7.0). No server/combat_manager here, so death-handling is simply
+    # skipped, but the clamp itself must not depend on it.
+    npc = make_npc("if (playertouchsme) { hurt 20; }")
+    p = FakePlayer()
+    p.hearts = 3.0
+    run_npc_event(npc, "playertouchsme", None, p)
+    assert p.hearts == 0.0
+
+
+def test_hurt_clamps_and_triggers_death():
+    from pygserver.combat import DamageType
+    from pygserver.protocol.constants import PLPROP
+
+    async def main():
+        sent = []
+
+        class RichPlayer(FakePlayer):
+            async def send_props(self, props):
+                sent.append(props)
+
+        cm = _FakeCombatMgr()
+
+        class Server:
+            combat_manager = cm
+
+        npc = make_npc("if (playertouchsme) { hurt 20; }")
+        p = RichPlayer()
+        p.hearts = 3.0
+        run_npc_event(npc, "playertouchsme", Server(), p)
+        await asyncio.sleep(0)  # let the scheduled send_props/death run
+
+        assert p.hearts == 0.0
+        merged = {}
+        for d in sent:
+            merged.update(d)
+        assert merged[PLPROP.CURPOWER] == 0  # never negative
+        assert cm.died == [(p.id, None, DamageType.OTHER)]
+
+    asyncio.run(main())
+
+
 def test_setcharprop_gani_attributes():
     from pygserver.protocol.constants import NPCPROP
 
@@ -418,9 +554,13 @@ class _FakeItemMgr:
 class _FakeCombatMgr:
     def __init__(self):
         self.damaged = []
+        self.died = []
 
     async def apply_damage(self, player, dmg, kx, ky, dtype=None, attacker=None):
         self.damaged.append((player.id, dmg))
+
+    async def handle_player_death(self, player, killer_id=None, damage_type=None):
+        self.died.append((player.id, killer_id, damage_type))
 
 
 def test_lay_spawns_item():

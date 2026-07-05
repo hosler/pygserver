@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import re
 import time
 
@@ -51,7 +52,7 @@ try:
     PLAYER_PROP_WIRE = {
         "rupees": (PLPROP.RUPEESCOUNT, lambda v: int(to_num(v))),
         "hearts": (PLPROP.CURPOWER, lambda v: int(to_num(v) * 2)),
-        "max_hearts": (PLPROP.MAXPOWER, lambda v: int(to_num(v) * 2)),
+        "max_hearts": (PLPROP.MAXPOWER, lambda v: int(to_num(v))),
         "arrows": (PLPROP.ARROWSCOUNT, lambda v: int(to_num(v))),
         "bombs": (PLPROP.BOMBSCOUNT, lambda v: int(to_num(v))),
         "glove_power": (PLPROP.GLOVEPOWER, lambda v: int(to_num(v))),
@@ -108,6 +109,8 @@ PLAYER_CHARPROP = {**_CHARPROP_CODES, "#c": "chat"}
 
 # #P1..#P30 -> gani attribute slot 1..30 (C++ mc_P: index N uses prop 30+N-1)
 _GANI_ATTR_RE = re.compile(r"#P(\d+)$")
+# #C0..#C7 colour slots as READ values (write side is _CHARPROP_CODES)
+_COLOR_CODE_RE = re.compile(r"#C([0-7])$")
 
 
 def _charprop_target(code, table):
@@ -215,6 +218,9 @@ class GS1Host(Host):
     def message_code(self, code, args, ctx) -> str:
         player = ctx.player
         npc = ctx.this_obj
+        m = _COLOR_CODE_RE.match(code)
+        if m:
+            return self._read_color_code(int(m.group(1)), args, ctx)
         if player is not None:
             if code == "#a":
                 return to_str(getattr(player, "account_name", ""))
@@ -227,6 +233,59 @@ class GS1Host(Host):
         if code == "#f" and npc is not None:
             return to_str(getattr(npc, "image", ""))
         return ""
+
+    def _color_code_character(self, args, ctx):
+        """Which character a #C<n> READ refers to — mirrors the C++
+        handleCharacterBasedMessageCode (GS1MessageCodes.cpp:347):
+          * #Cn(-1)  -> the source NPC
+          * #Cn(0)   -> the acting player itself
+          * #Cn(k>0) -> the k-th player on the level (falls back to the
+                        acting player when out of range, exactly like
+                        getPlayerFromSource's bounds check)
+          * bare #Cn -> the CURRENT SOURCE (getCurrentSource(true)). Inside a
+                        setcharprop/setplayerprop value argument that is the
+                        command's own pushed target (the NPC / the player —
+                        processBuiltInCommand pushSource, GS1Commands.cpp:430;
+                        verified live vs gs2emu: the copy idiom
+                        `setcharprop #C0,#C0` round-trips the NPC's OWN slot,
+                        not the player's). Elsewhere the source stack is
+                        empty, so it falls back to the initiating player,
+                        else the NPC itself.
+        """
+        if args:
+            idx = int(math.floor(to_num(args[0])))
+            if idx == -1:
+                return ctx.this_obj
+            if idx >= 0:
+                if ctx.player is None:
+                    return None
+                if idx >= 1:
+                    players = self._players_on_level(ctx)
+                    if idx < len(players):
+                        return players[idx]
+                return ctx.player
+            # other negative indices fall through to the bare-code path
+            # (the C++ if/else-if chain only special-cases exactly -1 / >=0)
+        src = getattr(ctx, "charprop_source", None)
+        if src == "npc" and ctx.this_obj is not None:
+            return ctx.this_obj
+        if src == "player" and ctx.player is not None:
+            return ctx.player
+        return ctx.player if ctx.player is not None else ctx.this_obj
+
+    def _read_color_code(self, slot, args, ctx) -> str:
+        """#C<slot> as a VALUE resolves to the classic colour NAME of that
+        slot (mc_C -> getClassicColorName, Character.h:104), NOT the raw
+        index and NOT "". This is what makes the real-corpus copy idiom
+        `setcharprop #C0,#C0` round-trip through the name-based write side
+        (_resolve_color) instead of zeroing the slot."""
+        character = self._color_code_character(args, ctx)
+        colors = getattr(character, "colors", None) if character is not None else None
+        if not isinstance(colors, list) or not (0 <= slot < len(colors)):
+            return ""
+        idx = int(to_num(colors[slot]))
+        # out-of-enum values (HTML colours, 20+) have no classic name -> ""
+        return _CLASSIC_COLORS[idx] if 0 <= idx < len(_CLASSIC_COLORS) else ""
 
     # -- helpers -----------------------------------------------------------
     @staticmethod
@@ -1011,10 +1070,27 @@ def _c_setlevel(self, a, npc, player, ctx):
 
 
 def _c_hurt(self, a, npc, player, ctx):
+    # hurt <halfhearts> — C++ fn_hurt (GS1Commands.cpp:1346) floors the
+    # argument to an int and hits the acting player for that many
+    # HALF-hearts (hitPlayer power), so `hurt 1` removes 0.5 hearts.
+    #
+    # Clamp at 0 and hand off to the death path, matching combat.py's
+    # apply_damage (combat.py:522/548-549) — a GS1 hurt must not be able to
+    # drive hearts negative or push a garbage negative CURPOWER prop.
     if player is None or not a:
         return
-    self._set_player_attr(player, "hearts",
-                          to_num(getattr(player, "hearts", 0)) - to_num(a[0]))
+    halfhearts = math.floor(to_num(a[0]))
+    new_hearts = max(0.0, to_num(getattr(player, "hearts", 0)) - halfhearts / 2.0)
+    self._set_player_attr(player, "hearts", new_hearts)
+    if new_hearts <= 0:
+        cm = getattr(self.server, "combat_manager", None) if self.server is not None else None
+        if cm is not None and hasattr(cm, "handle_player_death"):
+            try:
+                from .combat import DamageType
+                dtype = DamageType.OTHER
+            except Exception:
+                dtype = None
+            _schedule(cm.handle_player_death(player, None, dtype))
 
 
 def _c_noop(self, a, npc, player, ctx):
