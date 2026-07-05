@@ -405,7 +405,7 @@ class GameServer:
     async def _send_heartbeat(self):
         """Send world time heartbeat to all connected players."""
         packet = build_world_time()
-        for player in self.players.values():
+        for player in list(self.players.values()):
             if player.logged_in:
                 await player.send_raw(packet)
 
@@ -420,7 +420,8 @@ class GameServer:
             exclude: Set of player IDs to exclude
         """
         exclude = exclude or set()
-        for player in self.players.values():
+        # snapshot: send_raw awaits, during which a disconnect can mutate players
+        for player in list(self.players.values()):
             if player.logged_in and player.level and player.level.name == level_name:
                 if player.id not in exclude:
                     await player.send_raw(packet)
@@ -428,7 +429,7 @@ class GameServer:
     async def broadcast_to_all(self, packet: bytes, exclude: Optional[Set[int]] = None):
         """Broadcast packet to all logged-in players."""
         exclude = exclude or set()
-        for player in self.players.values():
+        for player in list(self.players.values()):
             if player.logged_in and player.id not in exclude:
                 await player.send_raw(packet)
 

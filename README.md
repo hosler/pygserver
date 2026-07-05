@@ -8,7 +8,7 @@ A Python implementation of the Reborn game server, supporting v6.037 protocol wi
 - **Python NPC Scripting**: Write NPC behaviors in Python
 - **Asyncio-based**: Efficient async networking
 - **Compatible with pyReborn**: Connect with the pyReborn pygame client
-- **List Server Integration**: Optional registration with Graal list server for:
+- **List Server Integration**: Optional registration with Reborn list server for:
   - Server discovery and player browsing
   - Account verification (when enabled)
   - Cross-server messaging

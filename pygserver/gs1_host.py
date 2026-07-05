@@ -26,6 +26,19 @@ from reborn_protocol.gs1.values import to_num, to_str
 
 logger = logging.getLogger(__name__)
 
+# Surface GS1 script/command failures (they used to be swallowed at DEBUG,
+# invisible by default) without spamming: dedup per (site, exception type,
+# message) signature, mirroring pyreborn.gs1_client's _report_gs1_error.
+_GS1_ERR_SEEN: set = set()
+
+
+def _report_gs1_error(site: str, exc: Exception) -> None:
+    sig = (site, type(exc).__name__, str(exc)[:160])
+    if sig in _GS1_ERR_SEEN:
+        return
+    _GS1_ERR_SEEN.add(sig)
+    logger.warning("GS1 %s: %s: %s", site, type(exc).__name__, exc, exc_info=True)
+
 try:
     from .protocol.constants import PLPROP, NPCPROP
 
@@ -119,6 +132,10 @@ class GS1Host(Host):
     def get_builtin(self, name, indices, ctx):
         player = ctx.player
         npc = ctx.this_obj
+        if name == "tokenscount":   # number of tokens from the last `tokenize`
+            # (GS1Commands.cpp:3138 sets this on tokenize; mirrors the
+            # client host's implementation in pyreborn.gs1_client)
+            return float(len(getattr(ctx, "tokenize_tokens", []) or []))
         if name in PLAYER_ATTR and player is not None:
             return self._coerce(getattr(player, PLAYER_ATTR[name], 0))
         if name == "playerlevel" and player is not None:
@@ -162,17 +179,22 @@ class GS1Host(Host):
             handler = _COMMANDS.get(name)
             if handler is not None:
                 handler(self, args, npc, player, ctx)
-        except Exception:  # a bad command must never kill the script/server
-            logger.debug("gs1 command %s failed", name, exc_info=True)
+        except Exception as e:  # a bad command must never kill the script/server
+            _report_gs1_error(f"command {name} on npc {getattr(npc, 'id', '?')}", e)
 
     # -- functions ---------------------------------------------------------
     def call_function(self, name, args, ctx):
+        # `timevar` (server clock, GServer-v2 Server::calculateNWTime) is a
+        # known missing builtin server-side: falls through to UNSET below,
+        # unlike the client host (pyreborn.gs1_client) which computes it.
         if name in ("onwall", "onwall2"):
             return self._onwall(args, ctx)
         if name in ("onwater", "onwater2"):
-            return 0.0
-        if name in ("playersays", "playersays2"):
-            return self._playersays(args, ctx)
+            return 0.0  # known stub: real level water-tile detection isn't wired server-side
+        if name == "playersays":
+            return self._playersays(args, ctx, contains=False)
+        if name == "playersays2":
+            return self._playersays(args, ctx, contains=True)
         if name == "hasweapon":
             player = ctx.player
             if player is not None and args and hasattr(player, "has_weapon"):
@@ -259,11 +281,29 @@ class GS1Host(Host):
         except Exception:
             return 0.0
 
-    def _playersays(self, args, ctx):
-        player = ctx.player
-        if player is None or not args:
+    def _playersays(self, args, ctx, contains):
+        # playersays(text) / playersays(index,text) — GS1Functions.cpp:963.
+        # playersays: case-insensitive EXACT match (string::equalsi).
+        # playersays2: case-insensitive CONTAINS (string::findi). An optional
+        # leading index selects a level player by position instead of the
+        # acting player.
+        if not args:
             return 0.0
-        return 1.0 if to_str(getattr(player, "chat", "")).startswith(to_str(args[0])) else 0.0
+        if len(args) >= 2:
+            idx = int(to_num(args[0]))
+            text = to_str(args[1])
+            players = self._players_on_level(ctx)
+            player = players[idx] if 0 <= idx < len(players) else None
+        else:
+            text = to_str(args[0])
+            player = ctx.player
+        if player is None:
+            return 0.0
+        chat = to_str(getattr(player, "chat", "")).lower()
+        text = text.lower()
+        if contains:
+            return 1.0 if text in chat else 0.0
+        return 1.0 if chat == text else 0.0
 
     # -- world queries -----------------------------------------------------
     def _level_of(self, ctx):
@@ -320,6 +360,19 @@ def _c_setimg(self, a, npc, player, ctx):
         self._dirty(npc)
 
 
+def _c_setimgpart(self, a, npc, player, ctx):
+    # setimgpart filename,x,y,width,height — show only a sub-rect of the
+    # sheet (GS1Commands.cpp:2228 fn_setimgpart sets NPCProp::IMAGE +
+    # NPCProp::IMAGEPART). The rect flows to clients via
+    # NPC.build_props_packet() -> build_npc_props() NPCPROP.IMAGEPART.
+    if npc is None or len(a) < 5:
+        return
+    npc.image = to_str(a[0])
+    npc.imagepart = (int(to_num(a[1])), int(to_num(a[2])),
+                      int(to_num(a[3])), int(to_num(a[4])))
+    self._dirty(npc)
+
+
 def _c_setani(self, a, npc, player, ctx):
     if npc is not None and a:
         npc.gani = to_str(a[0])
@@ -355,6 +408,23 @@ def _c_setnick(self, a, npc, player, ctx):
     if npc is not None and a:
         npc.nickname = to_str(a[0])
         self._dirty(npc)
+
+
+def _c_setshape(self, a, npc, player, ctx):
+    # setshape type,width,height — type 1 is a fully-solid box; other type
+    # values are unimplemented in the GServer-v2 C++ oracle too
+    # (GS1Commands.cpp:2384 fn_setshape returns early unless type == 1).
+    # width/height are stored in tiles, matching the client host's
+    # setshape/setshape2 (gs1_client.py). Not a wire prop (no NPCPROP for a
+    # shape rect) — this is server-side collision geometry; note for the
+    # touch-handling owner: nothing in gs1_host.py currently *reads*
+    # npc.shape for collision, so a touch-handler change elsewhere would be
+    # needed to make setshape blocking actually take effect.
+    if npc is None or len(a) < 3:
+        return
+    if int(to_num(a[0])) != 1:
+        return
+    npc.shape = (int(to_num(a[1])), int(to_num(a[2])))
 
 
 def _gattribs_of(obj):
@@ -929,7 +999,7 @@ def _c_noop(self, a, npc, player, ctx):
 
 _COMMANDS = {
     "setimg": _c_setimg, "setgif": _c_setimg, "seticon": _c_noop,
-    "setimgpart": _c_setimg,
+    "setimgpart": _c_setimgpart,
     "setani": _c_setani, "setcharani": _c_setani,
     "message": _c_message, "say2": _c_say2, "say": _c_message,
     "hide": _c_hide, "show": _c_show,
@@ -948,7 +1018,6 @@ _COMMANDS = {
     "setbeltcolor": _c_setbeltcolor,
     "freezeplayer": _c_freezeplayer, "freezeplayer2": _c_freezeplayer,
     "unfreezeplayer": _c_unfreezeplayer,
-    "seticon": _c_noop,
     # items
     "lay": _c_lay, "lay2": _c_lay2, "take": _c_take, "toweapons": _c_toweapons,
     # board
@@ -966,6 +1035,7 @@ _COMMANDS = {
     "putbomb": _c_putbomb, "putexplosion": _c_putexplosion,
     "putexplosion2": _c_putexplosion2, "shootarrow": _c_shootarrow,
     "hitplayer": _c_hitplayer,
+    "setshape": _c_setshape,
 }
 
 # Client-side visual / sound / timing commands. pygserver runs GS1 server-side
@@ -980,7 +1050,7 @@ _NOOP_COMMANDS = (
     "dontblocklocal", "blockagainlocal", "sleep",
     "showimg", "hideimg", "showimg2", "changeimgvis", "changeimgpart",
     "changeimgcolors", "changeimgzoom", "setimgvis", "putleaps",
-    "setbackpal", "setletters", "setshape", "setmap", "setminimap",
+    "setbackpal", "setletters", "setmap", "setminimap",
     "showtext", "showtext2", "showstats", "replaceani",
     "setfocus", "centermap", "putcomp", "putnewcomp", "removecompus",
     "setpause", "dontshowtime", "showbomb", "showbow", "showsword", "showani",
@@ -989,7 +1059,7 @@ _NOOP_COMMANDS = (
     # so faithfully no-ops:
     "noplayerkilling", "enabledefmovement", "disabledefmovement",
     "toinventory", "hideplayer", "showplayer",
-    # combat projectiles with no pygserver representation (client-side in Graal)
+    # combat projectiles with no pygserver representation (client-side in Reborn)
     "shootball", "shootfireball", "shootfireblast", "shoot", "hitobjects",
 )
 for _name in _NOOP_COMMANDS:
@@ -1035,9 +1105,8 @@ def run_npc_event(npc, event: str, server=None, player=None):
     ctx = Context(host, vs, this_obj=npc, player=player)
     try:
         Interpreter(ctx).run_event(prog, event)
-    except Exception:
-        logger.debug("GS1 event %s on NPC %s failed", event,
-                     getattr(npc, "id", "?"), exc_info=True)
+    except Exception as e:
+        _report_gs1_error(f"event {event} on npc {getattr(npc, 'id', '?')}", e)
     _flush_player_props(player)
     return ctx
 

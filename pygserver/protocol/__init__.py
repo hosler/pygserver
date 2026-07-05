@@ -17,7 +17,6 @@ from .packets import (
     parse_player_props,
     parse_level_warp,
     parse_trigger_action,
-    parse_hurt_player,
     parse_npc_props,
     # Building functions
     build_player_props,
@@ -80,7 +79,6 @@ __all__ = [
     "parse_player_props",
     "parse_level_warp",
     "parse_trigger_action",
-    "parse_hurt_player",
     "parse_npc_props",
     # Packet building
     "build_player_props",

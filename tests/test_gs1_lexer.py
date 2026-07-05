@@ -2,7 +2,7 @@
 
 Golden token-stream checks for the context-sensitive mode machinery, plus a
 corpus parse-rate guard so later phases don't regress tokenization. The corpus
-(tests/gs1_corpus/, ~29.8k NPC scripts from Graal Classic 2004) is gitignored;
+(tests/gs1_corpus/, ~29.8k NPC scripts from Reborn Classic 2004) is gitignored;
 the corpus test self-skips when it isn't present.
 """
 import os

@@ -7,6 +7,7 @@ Based on GServer-v2 combat implementation.
 
 import asyncio
 import logging
+import math
 import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, List, Dict, Tuple, Set
@@ -21,6 +22,7 @@ from .protocol.packets import (
     build_hurt_player,
     build_fire_spy,
     build_push_away,
+    build_throw_carried,
 )
 
 if TYPE_CHECKING:
@@ -219,8 +221,10 @@ class CombatManager:
         if player.bombs <= 0:
             return None
 
-        # Consume bomb
+        # Consume bomb; push the new count so the client's inventory tracks
+        # (the headless client doesn't self-decrement)
         player.bombs -= 1
+        await player.send_props({PLPROP.BOMBSCOUNT: player.bombs})
 
         # Create bomb
         bomb_id = self._next_bomb_id
@@ -271,6 +275,7 @@ class CombatManager:
                 if bomb.player_id == player.id:
                     del self._bombs[level_name][bomb_id]
                     player.bombs += 1
+                    await player.send_props({PLPROP.BOMBSCOUNT: player.bombs})
                     logger.debug(f"Player {player.id} picked up bomb at ({x}, {y})")
                 break
 
@@ -345,8 +350,9 @@ class CombatManager:
         if player.arrows <= 0:
             return None
 
-        # Consume arrow
+        # Consume arrow; push the new count so the client's inventory tracks
         player.arrows -= 1
+        await player.send_props({PLPROP.ARROWSCOUNT: player.arrows})
 
         direction = flags & 0x03
 
@@ -379,6 +385,12 @@ class CombatManager:
         """
         Update arrow position and check for collisions.
 
+        Note: pygserver deliberately keeps this server-side flight/damage
+        simulation rather than trusting client-reported hits like GServer-v2
+        does - the server is authoritative here by design, and our QA client
+        (game_tester) depends on server-driven arrow damage. Don't remove it
+        to "match" upstream.
+
         Args:
             arrow: The arrow to update
             level: The level the arrow is in
@@ -397,10 +409,14 @@ class CombatManager:
         arrow.x += dx * move_speed
         arrow.y += dy * move_speed
 
-        # Check wall collision
-        tile_x = int(arrow.x)
-        tile_y = int(arrow.y)
-        if tile_x < 0 or tile_x >= 64 or tile_y < 0 or tile_y >= 64:
+        # Check wall collision. Use the level's own bounds instead of a bare
+        # 64 (Level.WIDTH/HEIGHT today, but this is the source of truth) and
+        # math.floor instead of int(), which truncates towards zero and would
+        # let e.g. x=-0.5 pass through as tile 0 rather than going out of
+        # bounds.
+        tile_x = math.floor(arrow.x)
+        tile_y = math.floor(arrow.y)
+        if tile_x < 0 or tile_x >= level.WIDTH or tile_y < 0 or tile_y >= level.HEIGHT:
             # Out of bounds - remove arrow
             if arrow.level_name in self._arrows:
                 self._arrows[arrow.level_name].pop(arrow.id, None)
@@ -462,6 +478,15 @@ class CombatManager:
         if attacker.level != target.level:
             return
 
+        # Sanity range check. GServer-v2 relays PLI_HURTPLAYER blindly
+        # (damage is client-authoritative in classic), but that lets a
+        # modified client hurt anyone anywhere on the level; 6 tiles is
+        # generous for sword reach + movement latency.
+        if abs(attacker.x - target.x) > 6.0 or abs(attacker.y - target.y) > 6.0:
+            logger.debug(f"Rejecting hurt from {attacker.id} on {target_id}: "
+                         f"out of range")
+            return
+
         await self.apply_damage(
             target, power, from_x, from_y,
             DamageType.SWORD, attacker.id
@@ -496,16 +521,14 @@ class CombatManager:
         # Grant brief invincibility (1 second)
         self._invincible[player.id] = time.time() + 1.0
 
-        # Send hurt packet to victim (attacker_id, knockback, power in half-hearts)
+        # Send hurt packet to the victim ONLY (GServer-v2 msgPLI_HURTPLAYER,
+        # PlayerClientPackets.cpp:811-829, calls victim->sendPacket(...)
+        # directly - there's no level broadcast). PLO_HURTPLAYER carries no
+        # victim id, so broadcasting it made every bystander's client think
+        # *they* were the one hurt.
         packet = build_hurt_player(attacker_id or 0, int(knockback_x),
                                    int(knockback_y), damage)
         await player.send_raw(packet)
-
-        # Broadcast to level
-        if player.level:
-            await self.server.broadcast_to_level(
-                player.level.name, packet, exclude={player.id}
-            )
 
         # Check for death
         if player.hearts <= 0:
@@ -617,8 +640,19 @@ class CombatManager:
         if not player.level:
             return
 
-        # Broadcast throw
-        # Damage calculation depends on carried_type
+        # Relay the throw to other players on the level (GServer-v2
+        # msgPLI_THROWCARRIED, PlayerClientPackets.cpp:332-336:
+        # sendPacketToOneLevelPart(PLO_THROWCARRIED >> id, ..., { m_id })).
+        # This was never sent before, so other clients never saw the object
+        # leave the thrower's hands.
+        packet = build_throw_carried(player.id)
+        await self.server.broadcast_to_level(
+            player.level.name, packet, exclude={player.id}
+        )
+
+        # Damage calculation depends on carried_type. Kept server-authoritative
+        # (pygserver computes hit damage itself rather than trusting the
+        # client) same as the rest of this module's combat handling.
         damage = 1 if carried_type > 0 else 0
 
         # Check for player hits at target

@@ -198,7 +198,11 @@ class World:
         """
         for gmap in self._gmaps.values():
             pos = gmap.find_level(level_name)
-            if pos:
+            # pos is a (grid_x, grid_y) tuple; `if pos:` is falsy for the
+            # (0, 0) cell, silently dropping the .gmap announcement (and
+            # PLO_PLAYERWARP2 gx/gy) for anyone warping into the top-left
+            # segment. Compare against None instead.
+            if pos is not None:
                 return (gmap, pos[0], pos[1])
         return None
 

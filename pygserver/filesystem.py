@@ -187,8 +187,11 @@ class FileSystem:
             file_path: Path to file
         """
         try:
-            with open(file_path, 'rb') as f:
-                data = f.read()
+            # Blocking disk I/O off the event loop (run_in_executor rather than
+            # asyncio.to_thread since this project targets Python 3.8+, which
+            # predates to_thread).
+            loop = asyncio.get_event_loop()
+            data = await loop.run_in_executor(None, file_path.read_bytes)
 
             # PLO_FILE carries raw bytes (with newlines), so announce its full
             # length via PLO_RAWDATA first; the codec compresses the stream.
@@ -230,10 +233,17 @@ class FileSystem:
                 player_id=player.id
             )
 
-            # Send file in chunks
-            with open(file_path, 'rb') as f:
+            # Send file in chunks, with the blocking open()/read() calls each
+            # pushed to a worker thread (run_in_executor, not asyncio.to_thread
+            # - this project targets Python 3.8+) so a large file transfer
+            # doesn't stall the event loop for every other connection. The
+            # await player.send_raw() calls between chunks already yield, so
+            # this keeps that chunk-at-a-time behavior.
+            loop = asyncio.get_event_loop()
+            f = await loop.run_in_executor(None, open, file_path, 'rb')
+            try:
                 while True:
-                    chunk = f.read(self.chunk_size)
+                    chunk = await loop.run_in_executor(None, f.read, self.chunk_size)
                     if not chunk:
                         break
 
@@ -246,6 +256,8 @@ class FileSystem:
                     await player.send_raw(chunk)
 
                     self._downloads[player.id].sent_bytes += len(chunk)
+            finally:
+                await loop.run_in_executor(None, f.close)
 
             # Send end packet
             packet = build_large_file_end()

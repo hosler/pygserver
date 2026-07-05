@@ -73,7 +73,7 @@ class NPC:
         self.script_class: Optional[type] = None
         self.script_instance: Optional[Any] = None
 
-        # GS1 script (legacy Graal scripting): parsed program + persistent
+        # GS1 script (legacy Reborn scripting): parsed program + persistent
         # NPC-scoped variable dicts (this./thiso./local. survive across events)
         self.gs1_program: Optional[Any] = None
         self.gs1_scopes: Dict[str, dict] = {"this": {}, "thiso": {}, "local": {}}
@@ -133,6 +133,8 @@ class NPC:
             props[NPCPROP.SHIELDIMAGE] = self.shield_image
         if self.horse_image:
             props[NPCPROP.HORSEIMAGE] = self.horse_image
+        if getattr(self, 'imagepart', None):
+            props[NPCPROP.IMAGEPART] = self.imagepart
         if any(self.colors):
             props[NPCPROP.COLORS] = self.colors
         for prop_id, val in self.gattribs.items():
@@ -469,7 +471,18 @@ class NPCManager:
         return self._npcs.get(npc_id)
 
     def get_npcs_on_level(self, level: 'Level') -> List[NPC]:
-        """Get all NPCs on a level."""
+        """Get all NPCs on a level.
+
+        Uses Level's own per-level NPC dict instead of scanning every NPC on
+        the server - this is called on essentially every player movement
+        packet (check_touches) and every chat/enter/leave event, so a
+        server-wide scan doesn't scale past a handful of levels. Falls back
+        to the old server-wide scan for level-like objects that don't expose
+        get_npcs() (e.g. test doubles).
+        """
+        get_npcs = getattr(level, 'get_npcs', None)
+        if get_npcs is not None:
+            return get_npcs()
         return [npc for npc in self._npcs.values() if npc.level == level]
 
     async def destroy_npc(self, npc: NPC):
