@@ -274,9 +274,11 @@ class GameServer:
         cx, cy = self.config.start_x, self.config.start_y
         for i in range(count):
             # Scatter on a ring around the spawn point, clamped to the level.
+            # Radius 9 (was 5): villager sprites are ~3 tiles tall, so a
+            # tighter ring packed them into a visual clump around the player.
             angle = (2 * math.pi * i) / count
-            x = max(2.0, min(61.0, cx + math.cos(angle) * 5.0))
-            y = max(2.0, min(61.0, cy + math.sin(angle) * 5.0))
+            x = max(2.0, min(61.0, cx + math.cos(angle) * 9.0))
+            y = max(2.0, min(61.0, cy + math.sin(angle) * 9.0))
             self.npc_manager.create_npc(
                 name=f"villager_{i}", script_name="VillagerNPC",
                 level=level, x=x, y=y,

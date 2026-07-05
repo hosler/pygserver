@@ -1393,8 +1393,27 @@ class Player:
                 await self._send_level(self.level)
             return
 
-        # Handle horse across levels
         old_level = self.level
+
+        # Update level membership FIRST and synchronously - no `await` between
+        # detaching from the old level and attaching to the new one. NPC/chest
+        # broadcasts are scoped by reading player.level live (see
+        # broadcast_to_level/get_players_on_level), so if self.level only
+        # flipped after the awaited leave-notification/broadcast below, a
+        # concurrently-scheduled coroutine (an NPC's dirty-tick push, another
+        # player's packet handler) could still see this player attached to
+        # the old level during that gap and send it the old level's NPC/chest
+        # props. The client, having already optimistically switched its own
+        # current-level tracking the moment it sent PLI_LEVELWARP, then tags
+        # those late old-level packets as belonging to the new level - the
+        # start level's villagers/chests bleeding into whatever the player
+        # warped to.
+        if old_level:
+            old_level.remove_player(self)
+        self.x = x
+        self.y = y
+        self.level = level
+        level.add_player(self)
 
         # Leave current level. GS1's "playerleaves" event previously only
         # fired on disconnect (_cleanup), never on a normal warp to another
@@ -1402,16 +1421,9 @@ class Player:
         if old_level:
             if getattr(self.server, 'npc_manager', None):
                 await self.server.npc_manager.on_player_leaves(self, old_level)
-            old_level.remove_player(self)
             await self.server.broadcast_to_level(
                 old_level.name, build_player_left(self.id), exclude={self.id}
             )
-
-        # Update position
-        self.x = x
-        self.y = y
-        self.level = level
-        level.add_player(self)
 
         # Handle horse warp
         if hasattr(self.server, 'horse_manager'):
