@@ -1,0 +1,29 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  schedule:
+    - cron: "17 5 * * *" # nightly: catches reborn-protocol-only pushes
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.11", "3.13"]
+    steps:
+      - uses: actions/checkout@v4
+      # reborn-protocol is not on PyPI; install the sibling repo by path
+      - uses: actions/checkout@v4
+        with:
+          repository: hosler/reborn-protocol
+          path: reborn-protocol
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+          cache: pip
+      - run: pip install -e ./reborn-protocol -e ".[dev]"
+      - run: pytest -q
