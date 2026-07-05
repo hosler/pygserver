@@ -43,6 +43,17 @@ class PacketReader:
         """Read a GCHAR (byte - 32)."""
         return max(0, self.read_byte() - 32)
 
+    def read_gchar_signed(self) -> int:
+        """Read a signed GCHAR (byte - 32, not clamped to >=0).
+
+        GServer-v2's CString::readGChar() (dependencies/gs2lib/src/CString.cpp)
+        is just `byte - 32` with no floor at zero; unlike read_gchar() above,
+        this is for fields that carry a genuine signed value, e.g. hurt
+        knockback dx/dy (msgPLI_HURTPLAYER, PlayerClientPackets.cpp:811-815).
+        Using read_gchar() there clamps all left/up knockback to 0.
+        """
+        return self.read_byte() - 32
+
     def read_gshort(self) -> int:
         """Read a 2-byte GSHORT."""
         if self.pos + 1 >= len(self.data):
@@ -136,6 +147,16 @@ class PacketBuilder:
         """Write a GCHAR (value + 32)."""
         self.data.append((value + 32) & 0xFF)
         return self
+
+    def write_gchar_signed(self, value: int) -> 'PacketBuilder':
+        """Write a signed GCHAR (value + 32).
+
+        Same wire encoding as write_gchar() (which already round-trips
+        negative values correctly since it never clamps) - this alias exists
+        so signed-value call sites like hurt knockback dx/dy read as
+        intentional, matching read_gchar_signed().
+        """
+        return self.write_gchar(value)
 
     def write_gshort(self, value: int) -> 'PacketBuilder':
         """Write a 2-byte GSHORT."""
@@ -443,10 +464,13 @@ def _write_player_prop(builder: 'PacketBuilder', prop_id: int, value) -> None:
     Unknown props are skipped WITHOUT writing the prop id, since a bare id with
     no payload desyncs every following prop in the packet.
     """
-    # String properties
+    # String properties. HORSEGIF (21) is a plain PropertyString (GServer-v2
+    # server/include/object/Player.h PLAYERPROP_LIST + PropertySerializers.h
+    # PropertyString::serialize - length-prefixed, unlike the HEADGIF
+    # 100-offset form), so it belongs here rather than needing special-casing.
     if prop_id in (PLPROP.NICKNAME, PLPROP.GANI,
                    PLPROP.CURCHAT, PLPROP.CURLEVEL, PLPROP.BODYIMAGE,
-                   PLPROP.ACCOUNTNAME):
+                   PLPROP.ACCOUNTNAME, PLPROP.HORSEGIF):
         builder.write_gchar(prop_id)
         builder.write_gstring(str(value))
 
@@ -467,11 +491,13 @@ def _write_player_prop(builder: 'PacketBuilder', prop_id: int, value) -> None:
         builder.write_gchar(prop_id)
         builder.write_gstring(str(value))
 
-    # Single byte
+    # Single byte. HORSEBUSHES (22) is GServer-v2's PropertyNumeric<GBYTE1>
+    # (server/include/object/Player.h) - a plain gchar, independent of the
+    # direction-packed byte used on the wire in the PLI/PLO_HORSEADD packet.
     elif prop_id in (PLPROP.MAXPOWER, PLPROP.CURPOWER, PLPROP.ARROWSCOUNT,
                      PLPROP.BOMBSCOUNT, PLPROP.GLOVEPOWER, PLPROP.BOMBPOWER,
                      PLPROP.SPRITE, PLPROP.DIRECTION, PLPROP.STATUS,
-                     PLPROP.MAGICPOINTS, PLPROP.ALIGNMENT):
+                     PLPROP.MAGICPOINTS, PLPROP.ALIGNMENT, PLPROP.HORSEBUSHES):
         builder.write_gchar(prop_id)
         builder.write_gchar(int(value))
 
@@ -509,6 +535,13 @@ def _write_player_prop(builder: 'PacketBuilder', prop_id: int, value) -> None:
 
     # Rupees (gInt3)
     elif prop_id == PLPROP.RUPEESCOUNT:
+        builder.write_gchar(prop_id)
+        builder.write_gint3(int(value))
+
+    # Kills/deaths (GBYTE3 = gInt3, GServer-v2 server/include/object/Player.h
+    # PLAYERPROP_LIST); previously unhandled, so death/kill counters were
+    # silently dropped instead of reaching the client.
+    elif prop_id in (PLPROP.KILLSCOUNT, PLPROP.DEATHSCOUNT):
         builder.write_gchar(prop_id)
         builder.write_gint3(int(value))
 
@@ -582,6 +615,12 @@ def build_npc_props(npc_id: int, props: dict) -> bytes:
                 builder.write_gchar(int(c) & 0xFF)
         elif prop_id == NPCPROP.RUPEES:
             builder.write_gint3(int(value))
+        elif prop_id == NPCPROP.IMAGEPART:
+            # PropertyImagePart: gushort x, gushort y, gchar w, gchar h -
+            # sub-rect of the NPC image sheet (GS1 setimgpart)
+            px, py, pw, ph = (int(v) for v in value)
+            builder.write_gshort(px).write_gshort(py)
+            builder.write_gchar(pw).write_gchar(ph)
         else:
             builder.write_gchar(int(value) if isinstance(value, (int, float)) else 0)
 
@@ -655,7 +694,7 @@ def build_npc_del(npc_id: int) -> bytes:
     return PacketBuilder().write_gchar(PLO.NPCDEL).write_gint3(npc_id).write_byte(ord('\n')).build()
 
 
-# Graal sign-text alphabet (GServer-v2 LevelSign.cpp `signText`). Each plain
+# Reborn sign-text alphabet (GServer-v2 LevelSign.cpp `signText`). Each plain
 # character maps to its index in this string, written as a GChar (index + 32).
 _SIGN_ALPHABET = (
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
@@ -664,7 +703,7 @@ _SIGN_ALPHABET = (
 
 
 def encode_sign_text(text: str) -> bytes:
-    """Encode plain sign text into the Graal sign-code byte stream.
+    """Encode plain sign text into the Reborn sign-code byte stream.
 
     Mirrors GServer-v2 encodeSign/encodeSignCode for the common (non-symbol)
     case: each line is encoded char-by-char against the sign alphabet and
@@ -698,14 +737,18 @@ def build_level_sign(x: int, y: int, text: str) -> bytes:
 # Combat Packets
 # =============================================================================
 
-def build_bomb_add(player_id: int, x: float, y: float, power: int, time_left: int) -> bytes:
-    """Build PLO_BOMBADD packet."""
+def build_bomb_add(player_id: int, x: float, y: float, power: int, time_left: float) -> bytes:
+    """Build PLO_BOMBADD packet.
+
+    Format: {GSHORT owner_id}{GCHAR x*2}{GCHAR y*2}{GCHAR power}{GCHAR timer}
+    timer is 50ms increments (+50ms base); time_left is seconds.
+    """
     builder = PacketBuilder().write_gchar(PLO.BOMBADD)
     builder.write_gshort(player_id)
     builder.write_gchar(int(x * 2))
     builder.write_gchar(int(y * 2))
-    builder.write_gchar(power)
-    builder.write_gchar(time_left)
+    builder.write_gchar(int(power) & 0x03)
+    builder.write_gchar(max(0, int(time_left / 0.05) - 1))
     builder.write_newline()
     return builder.build()
 
@@ -749,8 +792,8 @@ def build_explosion(x: float, y: float, radius: int, power: int) -> bytes:
     builder = PacketBuilder().write_gchar(PLO.EXPLOSION)
     builder.write_gchar(int(x * 2))
     builder.write_gchar(int(y * 2))
-    builder.write_gchar(radius)
-    builder.write_gchar(power)
+    builder.write_gchar(int(radius))
+    builder.write_gchar(int(power))
     builder.write_newline()
     return builder.build()
 
@@ -759,15 +802,16 @@ def build_hurt_player(attacker_id: int, hurt_dx: int, hurt_dy: int,
                       power: int, npc_id: int = 0) -> bytes:
     """Build PLO_HURTPLAYER packet.
 
-    Format (GServer-v2 msgPLI_HURTPLAYER relay):
+    Format (GServer-v2 msgPLI_HURTPLAYER relay, PlayerClientPackets.cpp:811-829):
         [gshort attacker_id][gchar hurtdx][gchar hurtdy][gchar power][gint3 npc]
     `power` is the damage in half-hearts. attacker_id is the player dealing the
-    damage (0 = environment).
+    damage (0 = environment). hurtdx/hurtdy are signed (readGChar() on the
+    client), so left/up knockback must round-trip through write_gchar_signed.
     """
     builder = PacketBuilder().write_gchar(PLO.HURTPLAYER)
     builder.write_gshort(attacker_id)
-    builder.write_gchar(int(hurt_dx))
-    builder.write_gchar(int(hurt_dy))
+    builder.write_gchar_signed(int(hurt_dx))
+    builder.write_gchar_signed(int(hurt_dy))
     builder.write_gchar(int(power))
     builder.write_gint3(npc_id)
     builder.write_newline()
@@ -784,13 +828,18 @@ def build_fire_spy(player_id: int, x: float, y: float) -> bytes:
     return builder.build()
 
 
-def build_throw_carried(player_id: int, x: float, y: float, direction: int) -> bytes:
-    """Build PLO_THROWCARRIED packet."""
+def build_throw_carried(player_id: int) -> bytes:
+    """Build PLO_THROWCARRIED packet.
+
+    Format (GServer-v2 msgPLI_THROWCARRIED, PlayerClientPackets.cpp:332-336):
+        [gshort player_id] - no other payload; the client already knows what
+    it was carrying and infers the throw. Confirmed against pyReborn's
+    parse_throwcarried (pyReborn/pyreborn/packets.py), which reads only the
+    owner id. Previously this also wrote x/y/direction, which would have
+    desynced the client's parser had this ever been called.
+    """
     builder = PacketBuilder().write_gchar(PLO.THROWCARRIED)
     builder.write_gshort(player_id)
-    builder.write_gchar(int(x * 2))
-    builder.write_gchar(int(y * 2))
-    builder.write_gchar(direction)
     builder.write_newline()
     return builder.build()
 
@@ -858,13 +907,22 @@ def build_level_chest(opened: bool, x: int, y: int,
 # =============================================================================
 
 def build_horse_add(x: float, y: float, direction: int, bushes: int, image: str) -> bytes:
-    """Build PLO_HORSEADD packet."""
+    """Build PLO_HORSEADD packet.
+
+    Wire format (GServer-v2 msgPLI_HORSEADD relay, PlayerClientPackets.cpp:
+    256-269): {GCHAR x*2}{GCHAR y*2}{GCHAR dir_bushes}{RAW image}. dir_bushes
+    packs direction in bits 0-1 and bush count in the rest of the byte
+    (dir | bushes << 2); image is a raw trailing string with NO length
+    prefix (pPacket.readString("")), so this packet must be last in its
+    frame. Previously this wrote direction/bushes as two separate gchars and
+    length-prefixed the image, desyncing every client that parses the real
+    wire format.
+    """
     builder = PacketBuilder().write_gchar(PLO.HORSEADD)
     builder.write_gchar(int(x * 2))
     builder.write_gchar(int(y * 2))
-    builder.write_gchar(direction)
-    builder.write_gchar(bushes)
-    builder.write_gstring(image)
+    builder.write_gchar((int(direction) & 0x03) | ((int(bushes) & 0x3F) << 2))
+    builder.write_string(image)
     builder.write_newline()
     return builder.build()
 
@@ -1647,47 +1705,6 @@ def parse_trigger_action(data: bytes) -> Tuple[int, float, float, str, List[str]
     return npc_id, x, y, action, params
 
 
-def parse_bomb_add(data: bytes) -> Tuple[float, float, int]:
-    """Parse PLI_BOMBADD packet.
-
-    Returns:
-        Tuple of (x, y, power)
-    """
-    reader = PacketReader(data)
-    x = reader.read_gchar() / 2.0
-    y = reader.read_gchar() / 2.0
-    power = reader.read_gchar()
-    return x, y, power
-
-
-def parse_arrow_add(data: bytes) -> Tuple[float, float, int]:
-    """Parse PLI_ARROWADD packet.
-
-    Returns:
-        Tuple of (x, y, direction)
-    """
-    reader = PacketReader(data)
-    x = reader.read_gchar() / 2.0
-    y = reader.read_gchar() / 2.0
-    direction = reader.read_gchar()
-    return x, y, direction
-
-
-def parse_horse_add(data: bytes) -> Tuple[float, float, int, int, str]:
-    """Parse PLI_HORSEADD packet.
-
-    Returns:
-        Tuple of (x, y, direction, bushes, image)
-    """
-    reader = PacketReader(data)
-    x = reader.read_gchar() / 2.0
-    y = reader.read_gchar() / 2.0
-    direction = reader.read_gchar()
-    bushes = reader.read_gchar()
-    image = reader.read_gstring()
-    return x, y, direction, bushes, image
-
-
 def parse_item_take(data: bytes) -> Tuple[float, float]:
     """Parse PLI_ITEMTAKE packet.
 
@@ -1698,20 +1715,6 @@ def parse_item_take(data: bytes) -> Tuple[float, float]:
     x = reader.read_gchar() / 2.0
     y = reader.read_gchar() / 2.0
     return x, y
-
-
-def parse_hurt_player(data: bytes) -> Tuple[int, int, float, float]:
-    """Parse PLI_HURTPLAYER packet.
-
-    Returns:
-        Tuple of (target_id, power, from_x, from_y)
-    """
-    reader = PacketReader(data)
-    target_id = reader.read_gshort()
-    power = reader.read_gchar()
-    from_x = reader.read_gchar() / 2.0
-    from_y = reader.read_gchar() / 2.0
-    return target_id, power, from_x, from_y
 
 
 def parse_baddy_hurt(data: bytes) -> Tuple[int, int, float, float]:
@@ -1726,31 +1729,6 @@ def parse_baddy_hurt(data: bytes) -> Tuple[int, int, float, float]:
     from_x = reader.read_gchar() / 2.0
     from_y = reader.read_gchar() / 2.0
     return baddy_id, power, from_x, from_y
-
-
-def parse_open_chest(data: bytes) -> Tuple[float, float]:
-    """Parse PLI_OPENCHEST packet.
-
-    Returns:
-        Tuple of (x, y)
-    """
-    reader = PacketReader(data)
-    x = reader.read_gchar() / 2.0
-    y = reader.read_gchar() / 2.0
-    return x, y
-
-
-def parse_private_message(data: bytes) -> Tuple[str, str]:
-    """Parse PLI_PRIVATEMESSAGE packet.
-
-    Returns:
-        Tuple of (target_account, message)
-    """
-    reader = PacketReader(data)
-    target_len = reader.read_gshort()
-    target = reader.read_string(target_len)
-    message = reader.remaining().decode('latin-1', errors='replace').strip()
-    return target, message
 
 
 def parse_flag_set(data: bytes) -> Tuple[str, str]:
@@ -1834,27 +1812,46 @@ def parse_npc_props(data: bytes) -> Tuple[int, dict]:
 # Profile Parser
 # =============================================================================
 
+# The 9 free-text webpage-profile fields, in wire order (Player.cpp
+# msgPLI_PROFILESET / ServerList.cpp msgSVI_PROFILE). Kept in sync with
+# account.PROFILE_FIELDS.
+PROFILE_FIELDS = ('name', 'age', 'gender', 'country', 'messenger',
+                  'email', 'website', 'hangout', 'quote')
+
+
 def parse_profile(data: bytes) -> dict:
-    """Parse profile data.
+    """Parse PLI_PROFILESET (81) payload.
+
+    Format (Player.cpp msgPLI_PROFILESET): {GCHAR len}{account} then
+    9 x {GCHAR len}{field}: name, age, gender, country, messenger, email,
+    website, hangout, quote. The account name is a self-check - GServer
+    rejects the whole packet if it doesn't match the sender's own account.
 
     Returns:
-        Dict with profile fields
+        Dict with 'account' plus any of PROFILE_FIELDS present in the packet.
     """
     reader = PacketReader(data)
-    profile = {}
-    fields = ['age', 'gender', 'country', 'messenger', 'email', 'website', 'hangout', 'quote']
-    for field in fields:
+    profile = {'account': reader.read_gstring()}
+    for field in PROFILE_FIELDS:
         if reader.has_data():
             profile[field] = reader.read_gstring()
     return profile
 
 
-def build_profile(profile: dict) -> bytes:
-    """Build PLO_PROFILE packet."""
+def build_profile(account: str, profile: dict, online_time: str = '') -> bytes:
+    """Build PLO_PROFILE (75) packet - reply to PLI_PROFILEGET.
+
+    Format (ServerList.cpp msgSVI_PROFILE, modern client >= 2.1):
+        {GSTRING account}{9 x GSTRING fields: name/age/gender/country/
+        messenger/email/website/hangout/quote}{GSTRING online_time}
+    The pre-2.1 kills/deaths/rating/alignment/rupees fallback format isn't
+    implemented - this server targets modern (6.037) clients.
+    """
     builder = PacketBuilder().write_gchar(PLO.PROFILE)
-    fields = ['age', 'gender', 'country', 'messenger', 'email', 'website', 'hangout', 'quote']
-    for field in fields:
+    builder.write_gstring(account)
+    for field in PROFILE_FIELDS:
         builder.write_gstring(profile.get(field, ''))
+    builder.write_gstring(online_time)
     builder.write_newline()
     return builder.build()
 

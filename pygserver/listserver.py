@@ -1,7 +1,7 @@
 """
 pygserver.listserver - List server client
 
-Manages connection to the Graal list server for:
+Manages connection to the Reborn list server for:
 - Server registration and discovery
 - Account verification
 - Player list synchronization
@@ -345,6 +345,8 @@ class ServerListClient:
                     await self._handle_verify_account(reader)
                 elif packet_id == SVI.SENDTEXT:
                     await self._handle_send_text(reader)
+                elif packet_id == SVI.SERVERINFO:
+                    await self._handle_server_info(reader)
                 elif packet_id == SVI.VERSIONOLD:
                     logger.warning("List server reports this server version is old")
                 elif packet_id == SVI.VERSIONCURRENT:
@@ -416,6 +418,37 @@ class ServerListClient:
                 logger.info(f"List server identified remote IP as: {remote_ip}")
                 # Store for future use
                 self.server.remote_ip = remote_ip
+
+    async def _handle_server_info(self, reader: PacketReader):
+        """Handle SVI_SERVERINFO - reply to our SVO_SERVERINFO serverwarp query.
+
+        Format (ServerList.cpp msgSVI_SERVERINFO): {GUSHORT player id}{raw
+        serverpacket}. Relayed to the requesting player verbatim as
+        PLO_SERVERWARP - we don't parse serverpacket ourselves, same as
+        GServer-v2.
+        """
+        player_id = reader.read_gshort()
+        serverpacket = reader.remaining()
+
+        player = self.server.players.get(player_id)
+        if not player:
+            return
+
+        packet = PacketBuilder().write_gchar(PLO.SERVERWARP).write_bytes(serverpacket)
+        await player.send_raw(packet.build())
+
+    async def request_server_info(self, player_id: int, server_name: str):
+        """Send SVO_SERVERINFO - forward a PLI_SERVERWARP request.
+
+        Format (PlayerClientPackets.cpp msgPLI_SERVERWARP): {GUSHORT player
+        id}{raw server name}. The list server answers (if at all) with
+        SVI_SERVERINFO, handled above.
+        """
+        packet = PacketBuilder()
+        packet.write_gchar(SVO.SERVERINFO)
+        packet.write_gshort(player_id)
+        packet.write_bytes(server_name.encode('latin-1', errors='replace'))
+        await self._send_packet(packet.build())
 
     async def send_players(self):
         """Send current player list to list server."""

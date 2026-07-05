@@ -314,11 +314,24 @@ class RCManager:
         )
 
     async def _handle_ap_increment_set(self, session: RCSession, data: bytes):
-        """Handle RC_APINCREMENTSET - Set AP increment."""
+        """Handle RC_APINCREMENTSET - Set AP (alignment) increment.
+
+        GServer-v2 (PlayerRCPackets.cpp msgPLI_RC_APINCREMENTSET) marks this
+        "Deprecated" and returns without even reading pPacket - same as its
+        RESPAWNSET/HORSELIFESET/BADDYRESPAWNSET siblings, which pygserver
+        otherwise reimplements as real local settings (combat_manager /
+        horse_manager / baddy_manager respawn times). Unlike those, there's
+        no local alignment-increment-per-kill system anywhere in pygserver
+        for this to configure (account.ap is a static persisted stat, never
+        auto-adjusted), so there's nothing sensible to wire it into. Parse
+        and log for observability, but this stays a genuine no-op.
+        """
         if not session.has_right(PLPERM.SETATTRIBUTES):
             return
-        # AP (Alignment Points) not commonly used
-        logger.debug("AP increment set (not implemented)")
+
+        reader = PacketReader(data)
+        ap_increment = reader.read_gchar()
+        logger.debug(f"AP increment set to {ap_increment} (no local effect - see docstring)")
 
     async def _handle_baddy_respawn_set(self, session: RCSession, data: bytes):
         """Handle RC_BADDYRESPAWNSET - Set baddy respawn time."""

@@ -10,6 +10,7 @@ import logging
 import hashlib
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, List, Dict, Any
@@ -54,10 +55,11 @@ class Account:
     max_hearts: float = 3.0
     hearts: float = 3.0
     rupees: int = 0
-    bombs: int = 0
-    # GServer-v2 default new-character stat (server/include/object/Character.h:
-    # "uint8_t arrows = 5;"). Fresh accounts with 0 starting arrows can never
-    # fire PLI_ARROWADD, which silently no-ops the whole arrow-relay path.
+    # GServer-v2 default new-character stats (server/include/object/Character.h:
+    # "uint8_t bombs = 10; uint8_t arrows = 5;"). Fresh accounts with 0 starting
+    # bombs/arrows can never fire PLI_BOMBADD/PLI_ARROWADD, which silently
+    # no-ops the whole bomb/arrow path.
+    bombs: int = 10
     arrows: int = 5
     glove_power: int = 0
     sword_power: int = 1
@@ -88,6 +90,21 @@ class Account:
     # Guild
     guild_name: str = ""
     guild_nickname: str = ""
+
+    # Webpage profile (PLI_PROFILEGET/PROFILESET, PLO_PROFILE). GServer-v2
+    # itself only transports these as an opaque blob forwarded to/from the
+    # list server's SVO_GETPROF/SVO_SETPROF (ServerList.cpp msgSVI_PROFILE);
+    # pygserver has no such external profile service, so these are stored
+    # locally per-account instead (see ProfileManager below).
+    profile_name: str = ""
+    profile_age: str = ""
+    profile_gender: str = ""
+    profile_country: str = ""
+    profile_messenger: str = ""
+    profile_email: str = ""
+    profile_website: str = ""
+    profile_hangout: str = ""
+    profile_quote: str = ""
 
     def set_password(self, password: str):
         """Set password (stores hash)."""
@@ -140,6 +157,15 @@ class Account:
             'comments': self.comments,
             'guild_name': self.guild_name,
             'guild_nickname': self.guild_nickname,
+            'profile_name': self.profile_name,
+            'profile_age': self.profile_age,
+            'profile_gender': self.profile_gender,
+            'profile_country': self.profile_country,
+            'profile_messenger': self.profile_messenger,
+            'profile_email': self.profile_email,
+            'profile_website': self.profile_website,
+            'profile_hangout': self.profile_hangout,
+            'profile_quote': self.profile_quote,
         }
 
     @classmethod
@@ -181,6 +207,15 @@ class Account:
         account.comments = data.get('comments', '')
         account.guild_name = data.get('guild_name', '')
         account.guild_nickname = data.get('guild_nickname', '')
+        account.profile_name = data.get('profile_name', '')
+        account.profile_age = data.get('profile_age', '')
+        account.profile_gender = data.get('profile_gender', '')
+        account.profile_country = data.get('profile_country', '')
+        account.profile_messenger = data.get('profile_messenger', '')
+        account.profile_email = data.get('profile_email', '')
+        account.profile_website = data.get('profile_website', '')
+        account.profile_hangout = data.get('profile_hangout', '')
+        account.profile_quote = data.get('profile_quote', '')
         return account
 
 
@@ -210,6 +245,12 @@ class AccountManager:
         self._auto_save_task: Optional[asyncio.Task] = None
         self._running = False
 
+        # Single-thread writer: serializes all account writes (a disconnect
+        # save racing the auto-save sweep or an RC edit must never overlap
+        # writes to the same file) and gives stop() something to drain.
+        self._save_executor = ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="account-save")
+
         # Create accounts directory
         self.accounts_dir.mkdir(parents=True, exist_ok=True)
 
@@ -229,8 +270,12 @@ class AccountManager:
             except asyncio.CancelledError:
                 pass
 
-        # Save all accounts
+        # Save all accounts, then drain the writer thread so the final saves
+        # are actually on disk before shutdown proceeds (asyncio.run() on 3.8
+        # doesn't wait for executor threads).
         await self.save_all_accounts()
+        await asyncio.get_running_loop().run_in_executor(
+            None, self._save_executor.shutdown)
         logger.info("Account manager stopped")
 
     async def _auto_save_loop(self):
@@ -494,14 +539,36 @@ class AccountManager:
             return None
 
     def _save_account(self, account: Account):
-        """Save account to disk."""
+        """Save account to disk.
+
+        Callers are a mix of sync and async methods (create_account,
+        save_account, save_player_to_account, save_all_accounts), so this
+        stays a sync method; the blocking write goes to the dedicated
+        single-thread executor so it doesn't stall the event loop. One
+        writer thread means saves for the same account can never overlap
+        (a disconnect save racing the auto-save sweep used to interleave
+        two json.dump()s into one corrupt file), and the temp-file +
+        os.replace makes each write atomic, so a crash mid-write leaves
+        the previous good file rather than a truncated one.
+        """
         account_file = self.accounts_dir / f"{account.account_name}.json"
+        data = account.to_dict()
+
+        def _write():
+            tmp_file = account_file.with_suffix('.json.tmp')
+            try:
+                with open(tmp_file, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2)
+                os.replace(tmp_file, account_file)
+            except Exception as e:
+                logger.error(f"Error saving account {account.account_name}: {e}")
 
         try:
-            with open(account_file, 'w', encoding='utf-8') as f:
-                json.dump(account.to_dict(), f, indent=2)
-        except Exception as e:
-            logger.error(f"Error saving account {account.account_name}: {e}")
+            self._save_executor.submit(_write)
+        except RuntimeError:
+            # Executor already shut down (late save during teardown) -
+            # write inline rather than dropping the save.
+            _write()
 
     def _account_file_exists(self, account_name: str) -> bool:
         """Check if account file exists."""
@@ -509,11 +576,23 @@ class AccountManager:
         return account_file.exists()
 
 
+# The 9 free-text webpage-profile fields (Player.cpp msgPLI_PROFILESET /
+# ServerList.cpp msgSVI_PROFILE order). Shared by ProfileManager and the
+# PLI_PROFILEGET/PROFILESET wire codec in protocol/packets.py.
+PROFILE_FIELDS = ('name', 'age', 'gender', 'country', 'messenger',
+                  'email', 'website', 'hangout', 'quote')
+
+
 class ProfileManager:
     """
-    Manages player profiles for display.
+    Manages player webpage profiles (PLI_PROFILEGET/PROFILESET, PLO_PROFILE).
 
-    Profiles are public-facing data shown to other players.
+    On GServer-v2, these packets are opaque blobs relayed through the list
+    server's SVO_GETPROF/SVO_SETPROF (ServerList.cpp msgSVI_PROFILE) to an
+    external profile/webpage service - the game server itself never parses
+    the 9 free-text fields, only adds the account name and online time.
+    pygserver has no such external service, so the fields are persisted
+    locally on the account instead (see Account.profile_* in this module).
     """
 
     def __init__(self, server: 'GameServer'):
@@ -527,7 +606,9 @@ class ProfileManager:
             account_name: Account name
 
         Returns:
-            Profile data dictionary
+            Profile dict with 'account', the 9 PROFILE_FIELDS, and
+            'online_time' (formatted "H hrs M mins S secs", matching
+            ServerList.cpp msgSVI_PROFILE). Empty dict if unknown account.
         """
         if not hasattr(self.server, 'account_manager'):
             return {}
@@ -536,27 +617,30 @@ class ProfileManager:
         if not account:
             return {}
 
-        # Build profile
-        return {
-            'account': account.account_name,
-            'nickname': account.guild_nickname or account.account_name,
-            'guild': account.guild_name,
-            'head': account.head_image,
-            'body': account.body_image,
-            'colors': account.colors,
-            'kills': account.kills,
-            'deaths': account.deaths,
-            'online_time': account.online_time,
-            'max_hearts': account.max_hearts,
-        }
+        profile = {'account': account.account_name}
+        for name in PROFILE_FIELDS:
+            profile[name] = getattr(account, f'profile_{name}', '')
+        profile['online_time'] = self._format_online_time(account.online_time)
+        return profile
+
+    @staticmethod
+    def _format_online_time(seconds: int) -> str:
+        """Format seconds as "H hrs M mins S secs" (ServerList.cpp msgSVI_PROFILE)."""
+        seconds = int(seconds)
+        hours, remainder = divmod(seconds, 3600)
+        minutes, secs = divmod(remainder, 60)
+        return f"{hours} hrs {minutes} mins {secs} secs"
 
     def set_profile(self, player: 'Player', profile_data: Dict[str, Any]):
         """
-        Set player's profile data.
+        Set player's own profile data.
 
         Args:
-            player: Player updating profile
-            profile_data: Profile data to set
+            player: Player updating their profile (only their own account
+                is ever updated - callers must already have checked
+                profile_data['account'] == player.account_name, matching
+                the self-check in Player.cpp msgPLI_PROFILESET)
+            profile_data: dict with any of PROFILE_FIELDS to update
         """
         if not hasattr(self.server, 'account_manager'):
             return
@@ -565,10 +649,8 @@ class ProfileManager:
         if not account:
             return
 
-        # Update allowed fields
-        if 'nickname' in profile_data:
-            account.guild_nickname = profile_data['nickname']
-        if 'guild' in profile_data:
-            account.guild_name = profile_data['guild']
+        for name in PROFILE_FIELDS:
+            if name in profile_data:
+                setattr(account, f'profile_{name}', profile_data[name])
 
         self.server.account_manager.save_account(account)
