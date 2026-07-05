@@ -89,10 +89,15 @@ def test_setcharprop_equipment_codes():
 
 
 def test_setcharprop_colors():
-    npc = make_npc("if (created) { setcharprop #C0,3; setcharprop #C4,7; }")
+    # #C0-#C7 take classic colour NAMES, not raw indices (matches the C++
+    # engine, verified by game_tester --gs1): "red" -> 4, "green" -> 7, and a
+    # value that isn't a colour name resolves to 0.
+    npc = make_npc("if (created) { setcharprop #C0,red; setcharprop #C4,green;"
+                   " setcharprop #C1,9; }")
     run_npc_event(npc, "created", None, None)
-    assert npc.colors[0] == 3
-    assert npc.colors[4] == 7
+    assert npc.colors[0] == 4   # red
+    assert npc.colors[4] == 7   # green
+    assert npc.colors[1] == 0   # "9" is not a colour name -> 0
 
 
 def test_setcharprop_gani_attributes():
@@ -149,7 +154,7 @@ def test_setplayerprop_codes_and_propagation():
         npc = make_npc(
             "if (playertouchsme) {"
             " setplayerprop #n,NewNick; setplayerprop #c,hi there;"
-            " setplayerprop #7,dance; setplayerprop #C1,4; }")
+            " setplayerprop #7,dance; setplayerprop #C1,red; }")  # red = index 4
         p = RichPlayer()
         run_npc_event(npc, "playertouchsme", None, p)
         await asyncio.sleep(0)  # let the scheduled send_props run

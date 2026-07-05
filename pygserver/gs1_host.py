@@ -435,6 +435,30 @@ def _gattribs_of(obj):
     return ga
 
 
+# Classic colour names, index = ClassicColors enum value (GServer-v2
+# Character.h / ScriptEngineGS1.h colorNames). The #C0-#C7 message codes read
+# and write colour slots by NAME, not raw index.
+_CLASSIC_COLORS = (
+    "white", "yellow", "orange", "pink", "red",
+    "darkred", "lightgreen", "green", "darkgreen", "lightblue",
+    "blue", "darkblue", "brown", "cynober", "purple",
+    "darkpurple", "lightgray", "gray", "black", "transparent",
+)
+_CLASSIC_COLOR_INDEX = {name: i for i, name in enumerate(_CLASSIC_COLORS)}
+
+
+def _resolve_color(val):
+    """Colour value for a #C0-#C7 slot, matching the C++ engine
+    (GS1MessageCodes.cpp COLORS write + GS1Visitor::getColorValueFromString):
+    a STRING is looked up as a classic-colour name (unknown name -> 0, white),
+    a genuine NUMBER is used as a raw palette index. GS1 passes bare tokens as
+    strings, so `setplayerprop #C0,red` -> 4 but `setplayerprop #C0,9` -> 0
+    ("9" is not a colour name), where treating it as a raw index would give 9."""
+    if isinstance(val, str):
+        return _CLASSIC_COLOR_INDEX.get(val, 0)
+    return int(to_num(val)) & 0xFF
+
+
 def _apply_charprop(obj, code, val, table):
     """Set the attr / color / gani-attribute an NPC setcharprop code maps to.
     Returns True if the code was recognized and applied."""
@@ -446,7 +470,7 @@ def _apply_charprop(obj, code, val, table):
         if kind == "color":
             colors = getattr(obj, "colors", None)
             if isinstance(colors, list) and 0 <= n < len(colors):
-                colors[n] = int(to_num(val)) & 0xFF
+                colors[n] = _resolve_color(val)
         elif kind == "gattrib" and 1 <= n <= len(_NPC_GATTRIB_PROPS):
             _gattribs_of(obj)[_NPC_GATTRIB_PROPS[n - 1]] = to_str(val)
         return True
@@ -473,7 +497,7 @@ def _c_setplayerprop(self, a, npc, player, ctx):
         if kind == "color":  # set slot + queue the full COLORS prop
             colors = getattr(player, "colors", None)
             if isinstance(colors, list) and 0 <= n < len(colors):
-                colors[n] = int(to_num(a[1])) & 0xFF
+                colors[n] = _resolve_color(a[1])
                 if PLPROP is not None:
                     _queue_player_prop(player, PLPROP.COLORS, list(colors))
         elif kind == "gattrib" and 1 <= n <= len(_PLAYER_GATTRIB_PROPS):
