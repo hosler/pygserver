@@ -434,7 +434,11 @@ class Player:
         # Add PLO_PLAYERPROPS with initial state
         props = {
             PLPROP.NICKNAME: self.nickname,
-            PLPROP.MAXPOWER: int(self.max_hearts * 2),
+            # MAXPOWER is FULL hearts on the wire (GServer-v2
+            # PlayerProps.cpp:171-186, LevelItem.cpp:148-151); only CURPOWER
+            # is in halves. Sending halves here doubled max hearts once the
+            # client decoded it reference-correctly.
+            PLPROP.MAXPOWER: int(self.max_hearts),
             PLPROP.CURPOWER: int(self.hearts * 2),
             PLPROP.RUPEESCOUNT: self.rupees,
             PLPROP.ARROWSCOUNT: self.arrows,

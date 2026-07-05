@@ -430,7 +430,9 @@ class RCManager:
             PLPROP.X2: player.x,
             PLPROP.Y2: player.y,
             PLPROP.CURPOWER: int(player.hearts * 2),
-            PLPROP.MAXPOWER: int(player.max_hearts * 2),
+            # MAXPOWER is FULL hearts on the wire (unlike CURPOWER's halves)
+            # - GServer-v2 PlayerProps.cpp:171-186.
+            PLPROP.MAXPOWER: int(player.max_hearts),
             PLPROP.RUPEESCOUNT: player.rupees,
             PLPROP.BOMBSCOUNT: player.bombs,
             PLPROP.ARROWSCOUNT: player.arrows,

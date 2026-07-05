@@ -324,7 +324,10 @@ class ItemManager:
         elif attr == 'max_hearts':
             player.max_hearts = min(player.max_hearts + value, 20)
             player.hearts = player.max_hearts  # Full heal on heart container
-            props_to_send[PLPROP.MAXPOWER] = int(player.max_hearts * 2)
+            # MAXPOWER is FULL hearts on the wire (GServer-v2
+            # LevelItem.cpp:148-151: `>> MAXPOWER >> heartMax`); CURPOWER
+            # below is the halves one.
+            props_to_send[PLPROP.MAXPOWER] = int(player.max_hearts)
             props_to_send[PLPROP.CURPOWER] = int(player.hearts * 2)
         elif attr == 'spin_attack':
             if hasattr(player, 'has_spin_attack'):
