@@ -1,0 +1,2 @@
+# level files are byte-exact fixtures; never normalize line endings
+*.nw -text

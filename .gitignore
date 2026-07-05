@@ -43,6 +43,12 @@ Thumbs.db
 # Server data (keep structure, ignore contents)
 accounts/*.txt
 levels/*.nw
+# QA fixture world (pyReborn's conftest server fixture copies these):
+# qa_* are ours; onlinestartlocal.nw is byte-identical to the level the
+# open-source GServer-v2 repo ships in bin/servers/default/world/.
+!levels/onlinestartlocal.nw
+!levels/qa_testlevel.nw
+!levels/qa_tier3.nw
 levels/*.graal
 npcs/*.txt
 
