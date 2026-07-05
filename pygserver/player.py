@@ -987,7 +987,13 @@ class Player:
     async def _handle_chat(self, data: bytes):
         """Handle PLI_TOALL chat packet."""
         reader = PacketReader(data)
-        message = reader.remaining().decode('latin-1', errors='replace').strip()
+        # PLI_TOALL is gchar-length-prefixed then the raw message (client's
+        # build_chat matches GServer-v2 Player::msgPLI_TOALL readString(
+        # readGUChar())). Reading remaining() instead kept the length byte as
+        # the message's first char — every relayed line gained a leading
+        # chr(len+32) garbage character. (The QA chat test used a substring
+        # match, so it never caught this; a playtester saw it immediately.)
+        message = reader.read_gstring().strip()
 
         if not message or self.is_muted:
             return

@@ -425,6 +425,17 @@ class ItemManager:
         if not chest:
             return False
 
+        # Proximity check: a chest is a 2x2 object opened from right next to it.
+        # Without this, a modified client can open (and loot) every chest on the
+        # level from spawn — a playtester grabbed chests 16 tiles away. The
+        # player pos is the sprite's top-left; allow a couple tiles of slack for
+        # sprite size + movement latency, same spirit as combat's range cap.
+        if abs(player.x - x) > 3.0 or abs(player.y - y) > 3.0:
+            logger.debug(f"Rejecting chest open from {player.id} at "
+                         f"({player.x:.1f},{player.y:.1f}) on chest ({x},{y}): "
+                         f"out of range")
+            return False
+
         # Check if player already opened this chest
         if player.account_name in chest.opened_by:
             logger.debug(f"Player {player.id} already opened chest at ({x}, {y})")

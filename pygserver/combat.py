@@ -470,6 +470,11 @@ class CombatManager:
             from_x: X knockback direction
             from_y: Y knockback direction
         """
+        # You can't sword yourself — a playtester hurt itself with
+        # attack&pid=<own id>. Real damage always comes from another player.
+        if target_id == attacker.id:
+            return
+
         target = self.server.get_player(target_id)
         if not target or not target.level:
             return
