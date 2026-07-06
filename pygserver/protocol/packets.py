@@ -605,6 +605,8 @@ def build_npc_props(npc_id: int, props: dict) -> bytes:
             builder.write_gshort(len(encoded)).write_bytes(encoded)
         elif prop_id in (NPCPROP.X, NPCPROP.Y):
             builder.write_gchar(int(value * 2))
+        elif prop_id in (NPCPROP.X2, NPCPROP.Y2):  # high-precision position (gshort, pixels/16)
+            builder.write_position2(float(value))
         elif prop_id == NPCPROP.HEADIMAGE:  # HEADGIF 100-offset string
             name = str(value).encode('latin-1')
             builder.write_gchar(100 + len(name)).write_bytes(name)

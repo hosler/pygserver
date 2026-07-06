@@ -7,6 +7,7 @@ Handles NPC state, events, and Python-based scripting.
 import asyncio
 import importlib.util
 import logging
+import math
 import time
 from typing import TYPE_CHECKING, Optional, Dict, Any, List, Callable
 from pathlib import Path
@@ -78,6 +79,11 @@ class NPC:
         self.gs1_program: Optional[Any] = None
         self.gs1_scopes: Dict[str, dict] = {"this": {}, "thiso": {}, "local": {}}
 
+        # Movement (smooth, per-tick): target tile the NPC is walking toward,
+        # advanced by NPCManager.tick() using real elapsed time.
+        self._move_target: Optional[tuple] = None
+        self._move_speed = 0.0
+
         # Timer
         self._timer_end: float = 0.0
 
@@ -113,6 +119,12 @@ class NPC:
             NPCPROP.IMAGE: self.image,
             NPCPROP.X: self.x,
             NPCPROP.Y: self.y,
+            # High-precision position (pixel-accurate), sent alongside X/Y for
+            # compat. Dict order matters here: the client parses props
+            # sequentially and applies each as it's read, so X2/Y2 must come
+            # after X/Y for the high-precision value to win.
+            NPCPROP.X2: self.x,
+            NPCPROP.Y2: self.y,
             # SPRITE carries the facing direction in its low 2 bits. direction
             # can arrive as a float (script/default), so coerce before masking.
             NPCPROP.SPRITE: int(self.direction) & 0x03,
@@ -165,6 +177,46 @@ class NPC:
         if self._timer_end > 0 and time.time() >= self._timer_end:
             self._timer_end = 0
             return True
+        return False
+
+    def start_move(self, x: float, y: float, speed: float):
+        """Begin smoothly walking toward (x, y) at `speed` tiles/sec.
+
+        Advanced every server tick by NPCManager.tick() via advance_movement().
+        """
+        self._move_target = (float(x), float(y))
+        self._move_speed = max(float(speed), 0.1)
+
+    @property
+    def is_moving(self) -> bool:
+        """True while a start_move() target is still in progress."""
+        return self._move_target is not None
+
+    def advance_movement(self, dt: float) -> bool:
+        """Step toward the current move target by `_move_speed * dt`.
+
+        Snaps to the target and clears it once within range. Returns True if
+        the NPC arrived at its target on this call.
+        """
+        if self._move_target is None:
+            return False
+
+        tx, ty = self._move_target
+        dx = tx - self.x
+        dy = ty - self.y
+        dist = math.hypot(dx, dy)
+        step = self._move_speed * dt
+
+        if dist <= step:
+            self.x = tx
+            self.y = ty
+            self._move_target = None
+            self.mark_dirty()
+            return True
+
+        self.x += dx / dist * step
+        self.y += dy / dist * step
+        self.mark_dirty()
         return False
 
 
@@ -300,6 +352,15 @@ class NPCApi:
         self._npc.direction = direction & 0x03
         self._npc.mark_dirty()
 
+    def move_to(self, x: float, y: float, speed: float = 3.0):
+        """Smoothly walk to (x, y) at `speed` tiles/sec, advanced every tick."""
+        self._npc.start_move(x, y, speed)
+
+    @property
+    def is_moving(self) -> bool:
+        """True while a move_to() is still in progress."""
+        return self._npc.is_moving
+
     def set_nickname(self, nickname: str):
         """Set the NPC's nickname (shown above its head)."""
         self._npc.nickname = nickname
@@ -378,6 +439,10 @@ class NPCManager:
 
         # Script classes by name
         self._script_classes: Dict[str, type] = {}
+
+        # Last tick() timestamp, used to compute real elapsed time for
+        # smooth (per-tick) NPC movement. None until the first tick.
+        self._last_move_tick: Optional[float] = None
 
     async def load_scripts(self, scripts_path: Path):
         """
@@ -519,6 +584,21 @@ class NPCManager:
 
     async def tick(self):
         """Process NPC timers and re-broadcast changed NPCs (every server tick)."""
+        # Advance smooth movement using real elapsed time (the tick loop's
+        # sleep isn't exact), clamped so a stall/debugger pause can't produce
+        # a huge catch-up step.
+        now = time.monotonic()
+        if self._last_move_tick is None:
+            dt = 0.0
+        else:
+            dt = max(0.0, min(now - self._last_move_tick, 0.25))
+        self._last_move_tick = now
+
+        for npc in list(self._npcs.values()):
+            if npc.is_moving and npc.advance_movement(dt):
+                api = npc.get_api(self)
+                await npc.trigger_event('on_move_done', api)
+
         for npc in list(self._npcs.values()):
             if npc.check_timer():
                 api = npc.get_api(self)
