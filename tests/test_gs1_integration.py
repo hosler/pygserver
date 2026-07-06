@@ -52,6 +52,27 @@ def test_created_initialises_npc_state():
     assert npc._dirty is True
 
 
+def test_showcharacter_fills_defaults_and_clears_image():
+    # showcharacter was a no-op; classic NPC scripts (e.g. chicken_house1.nw)
+    # rely on it to switch the NPC from a raw image sheet to a
+    # player-style body/gani character.
+    npc = make_npc("if (created) { setimg statue.png; showcharacter; }")
+    run_npc_event(npc, "created", None, None)
+    assert npc.image == ""
+    assert npc.body_image == "body.png"
+    assert npc.gani == "idle"
+    assert npc._dirty is True
+
+
+def test_showcharacter_does_not_clobber_existing_body_and_gani():
+    npc = make_npc("if (created) { setani custom; showcharacter; }")
+    npc.body_image = "custombody.png"  # e.g. already set by an account/script
+    run_npc_event(npc, "created", None, None)
+    assert npc.body_image == "custombody.png"
+    assert npc.gani == "custom"
+    assert npc.image == ""
+
+
 def test_touch_mutates_npc_and_player():
     npc = make_npc(
         "if (playertouchsme) { this.hits += 1; setimg hit.png; "

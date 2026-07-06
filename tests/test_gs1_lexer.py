@@ -129,6 +129,39 @@ def test_non_ascii_in_code_raises_clean_lexerror():
         tokenize("x = \xe1bc;")  # accented letter is invalid in code
 
 
+def test_quoted_string_literal_in_assignment():
+    # `this.chat = "Welcome!";` from chicken_house1.nw: a double-quoted
+    # literal on an expression's RHS (DEFAULT mode) used to raise LexError.
+    assert texts('this.chat = "Welcome!";') == [
+        ("IDENTIFIER", "this"), ("TOKEN_PERIOD", "."), ("IDENTIFIER", "chat"),
+        ("OP_ASSIGN", "="), ("STRING", "Welcome!"), ("END", ";")]
+
+
+def test_quoted_string_literal_in_if_condition():
+    # from ball_lobby.nw: quoted literal inside an `if (...)` comparison
+    # (still DEFAULT mode — 'if' doesn't push a command arg-type state).
+    ts = texts('if (player.chat == "/start game"){ x=1; }')
+    assert ("STRING", "/start game") in ts
+
+
+def test_quoted_string_literal_as_command_call_arg():
+    # from chicken_house1.nw: `setcharani("sit","");` — quotes used
+    # function-call-style around a command's arguments.
+    ts = texts('setcharani("sit","");')
+    assert ("STRING", "sit") in ts
+
+
+def test_quoted_string_doubled_quote_is_literal_quote():
+    assert texts('x = "a""b";') == [
+        ("IDENTIFIER", "x"), ("OP_ASSIGN", "="), ("STRING", 'a"b'), ("END", ";")]
+
+
+def test_unterminated_quoted_string_runs_to_eof():
+    # no closing quote: don't raise, just take the rest of the source
+    assert texts('x = "abc') == [
+        ("IDENTIFIER", "x"), ("OP_ASSIGN", "="), ("STRING", "abc")]
+
+
 @pytest.mark.skipif(not os.path.isdir(CORPUS), reason="gs1_corpus not present")
 def test_corpus_parse_rate():
     import sys

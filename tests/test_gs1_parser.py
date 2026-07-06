@@ -22,6 +22,22 @@ def test_assignment():
     assert isinstance(prog.body[0].value, ast.Num)
 
 
+def test_quoted_string_assignment_produces_strconcat():
+    # `this.chat = "Welcome!";` (chicken_house1.nw) — quoted literal RHS.
+    prog = parse('this.chat = "Welcome!";')
+    node = prog.body[0]
+    assert isinstance(node, ast.Assign)
+    assert isinstance(node.value, ast.StrConcat)
+    assert node.value.parts == [ast.Str("Welcome!")]
+
+
+def test_quoted_string_in_if_condition():
+    prog = parse('if (player.chat == "/start game") { setlevel2("x.nw",1,1); }')
+    cond = prog.body[0].cond
+    assert isinstance(cond, ast.BinOp)
+    assert cond.right == ast.StrConcat(parts=[ast.Str("/start game")])
+
+
 def test_if_else():
     prog = parse("if (a) { x=1; } else { x=2; }")
     node = prog.body[0]

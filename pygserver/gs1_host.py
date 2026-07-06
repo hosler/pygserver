@@ -675,6 +675,25 @@ def _c_setgender(self, a, npc, player, ctx):
             pass
 
 
+def _c_showcharacter(self, a, npc, player, ctx):
+    # showcharacter — NPC displays as a player-style character (body/head/
+    # gani sprite) instead of a raw image sheet. Previously a no-op, which
+    # left the NPC with no image and no body/gani, so it rendered as
+    # nothing. Fill in classic defaults so any client can show *something*
+    # even without client-side inference: default body/gani only if the
+    # script hasn't already set its own (setbody/setani may run before or
+    # after showcharacter in real scripts), and clear image so clients
+    # that key off body_image/gani rather than a raw sheet pick it up.
+    if npc is None:
+        return
+    if not npc.body_image:
+        npc.body_image = "body.png"
+    if not npc.gani:
+        npc.gani = "idle"
+    npc.image = ""
+    self._dirty(npc)
+
+
 def _c_destroy(self, a, npc, player, ctx):
     # destroy — the NPC deletes itself from the level
     if npc is None or self.server is None:
@@ -1113,6 +1132,7 @@ _COMMANDS = {
     "destroy": _c_destroy,
     "sethead": _c_sethead, "setbody": _c_setbody, "setsword": _c_setsword,
     "setshield": _c_setshield, "setgender": _c_setgender,
+    "showcharacter": _c_showcharacter,
     "setskincolor": _c_setskincolor, "setcoatcolor": _c_setcoatcolor,
     "setsleevecolor": _c_setsleevecolor, "setshoecolor": _c_setshoecolor,
     "setbeltcolor": _c_setbeltcolor,
@@ -1145,7 +1165,7 @@ _COMMANDS = {
 _NOOP_COMMANDS = (
     "play", "play2", "playlooped", "playsound", "stopmidi", "stopsound",
     "seteffectmode", "setcoloreffect", "setzoomeffect", "seteffect",
-    "timereverywhere", "showcharacter", "drawunderplayer", "drawoverplayer",
+    "timereverywhere", "drawunderplayer", "drawoverplayer",
     "drawaslight", "drawovertrees", "dontblock", "blockagain",
     "dontblocklocal", "blockagainlocal", "sleep",
     "showimg", "hideimg", "showimg2", "changeimgvis", "changeimgpart",
