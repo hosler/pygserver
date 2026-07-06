@@ -45,24 +45,40 @@ class BaddyType(IntEnum):
     PIMPLETHING = 15
 
 
-# Baddy stats by type: (health, damage, speed, detection_range)
+# Baddy stats by type: (health, damage, speed, detection_range).
+# Health for types 0-9 (the ones level files can actually spawn — see
+# level.BADDY_NAME_TO_TYPE) is GServer-v2's LevelBaddy.cpp baddyPower table
+# (2,3,4,3,2,1,1,6,12,8), not the ad-hoc values this previously had; those
+# baddyPower values are also broadcast as the POWERIMAGE prop's power byte.
 BADDY_STATS = {
     BaddyType.GRAYBALL: (2, 1, 2.0, 5.0),
     BaddyType.REDBALL: (3, 2, 2.5, 6.0),
     BaddyType.BLUEOCTOPUS: (4, 1, 1.5, 7.0),
-    BaddyType.REDOCTOPUS: (5, 2, 2.0, 7.0),
-    BaddyType.GOLDOCTOPUS: (6, 3, 2.5, 8.0),
-    BaddyType.SPIDER: (3, 1, 3.0, 6.0),
-    BaddyType.GRAYSNAKE: (2, 1, 2.5, 5.0),
-    BaddyType.REDSNAKE: (3, 2, 3.0, 6.0),
-    BaddyType.LIZARDMAN: (8, 2, 2.0, 8.0),
-    BaddyType.DRAGONLIZARD: (10, 3, 2.5, 10.0),
+    BaddyType.REDOCTOPUS: (3, 2, 2.0, 7.0),
+    BaddyType.GOLDOCTOPUS: (2, 3, 2.5, 8.0),
+    BaddyType.SPIDER: (1, 1, 3.0, 6.0),
+    BaddyType.GRAYSNAKE: (1, 1, 2.5, 5.0),
+    BaddyType.REDSNAKE: (6, 2, 3.0, 6.0),
+    BaddyType.LIZARDMAN: (12, 2, 2.0, 8.0),
+    BaddyType.DRAGONLIZARD: (8, 3, 2.5, 10.0),
     BaddyType.SPIDER2: (5, 2, 3.5, 7.0),
     BaddyType.FIREFLY: (2, 1, 4.0, 8.0),
     BaddyType.WOLF: (4, 2, 4.0, 10.0),
     BaddyType.OGRE: (12, 3, 1.5, 6.0),
     BaddyType.SWAMP_MONSTER: (8, 2, 1.0, 5.0),
     BaddyType.PIMPLETHING: (6, 2, 2.0, 6.0),
+}
+
+# Default sprite sheet by type, for types 0-9 — GServer-v2's LevelBaddy.cpp
+# baddyImages table. Level-file baddies (BADDY_NAME_TO_TYPE in level.py) only
+# ever produce types in this range; anything outside it (the extra
+# pygserver-only types above) falls back to the classic gray-ball image, same
+# as GServer's own out-of-range clamp to BaddyType::GRAYSOLDIER.
+BADDY_DEFAULT_IMAGE = {
+    0: "baddygray.png", 1: "baddyblue.png", 2: "baddyred.png",
+    3: "baddyblue.png", 4: "baddygray.png", 5: "baddyhare.png",
+    6: "baddyoctopus.png", 7: "baddygold.png", 8: "baddylizardon.png",
+    9: "baddydragon.png",
 }
 
 # Drop tables by baddy type
@@ -99,11 +115,17 @@ class Baddy:
     attack_cooldown: float = 0.0
     hurt_timer: float = 0.0
 
-    # Animation
-    ani: str = ""
+    # Animation frame (BDPROP.ANI): toggles 0/1 while walking/hunting so
+    # clients can animate the walk cycle (see _toggle_ani in BaddyManager).
+    ani: int = 0
 
     # Baddy image (sent with POWERIMAGE prop)
     image: str = ""
+
+    # Verse strings parsed from the level file's BADDY block (up to 3 lines:
+    # sight/hurt/attack — see level._parse_features). Sent once, in the
+    # initial props broadcast (spawn / a joining player's first sighting).
+    verses: List[str] = field(default_factory=list)
 
     # Respawn settings
     respawn_time: float = 60.0
@@ -120,9 +142,19 @@ class Baddy:
             self.damage = stats[1]
             self.speed = stats[2]
             self.detection_range = stats[3]
+        if not self.image:
+            self.image = BADDY_DEFAULT_IMAGE.get(int(self.baddy_type), "baddygray.png")
 
-    def build_props_packet(self) -> bytes:
-        """Build PLO_BADDYPROPS packet for this baddy."""
+    def _verse(self, index: int) -> str:
+        return self.verses[index] if index < len(self.verses) else ""
+
+    def build_props_packet(self, include_verses: bool = False) -> bytes:
+        """Build PLO_BADDYPROPS packet for this baddy.
+
+        include_verses sends VERSESIGHT/VERSEHURT too — only needed once,
+        the first time a client learns about this baddy (spawn / a joining
+        player's initial level baddy list), not on every AI tick broadcast.
+        """
         props = {
             BDPROP.ID: self.id,
             BDPROP.X: self.x,
@@ -130,10 +162,12 @@ class Baddy:
             BDPROP.TYPE: self.baddy_type,
             BDPROP.POWERIMAGE: (self.health, self.image),
             BDPROP.MODE: self.mode,
+            BDPROP.ANI: self.ani,
             BDPROP.DIR: self.direction,
         }
-        if self.ani:
-            props[BDPROP.ANI] = self.ani
+        if include_verses:
+            props[BDPROP.VERSESIGHT] = self._verse(0)
+            props[BDPROP.VERSEHURT] = self._verse(1)
         return build_baddy_props(self.id, props)
 
 
@@ -314,7 +348,18 @@ class BaddyManager:
 
         # Broadcast if moved significantly
         if abs(baddy.x - old_x) > 0.01 or abs(baddy.y - old_y) > 0.01:
+            self._toggle_ani(baddy)
             await self._broadcast_baddy_props(baddy)
+
+    @staticmethod
+    def _toggle_ani(baddy: Baddy):
+        """Flip the walk animation frame (0/1) for the next props broadcast.
+
+        Cheap walk-cycle animation: only advances when a moving-mode AI tick
+        actually broadcasts (no extra packets), toggled here rather than
+        every tick.
+        """
+        baddy.ani = 0 if baddy.ani else 1
 
     async def _wander(self, baddy: Baddy, delta_time: float):
         """Make baddy wander randomly."""
@@ -338,6 +383,7 @@ class BaddyManager:
         baddy.x = max(0, min(63, baddy.x))
         baddy.y = max(0, min(63, baddy.y))
 
+        self._toggle_ani(baddy)
         await self._broadcast_baddy_props(baddy)
 
     async def _attack_player(self, baddy: Baddy, player: 'Player'):
@@ -361,13 +407,14 @@ class BaddyManager:
 
         logger.debug(f"Baddy {baddy.id} attacked player {player.id}")
 
-    async def _broadcast_baddy_props(self, baddy: Baddy):
+    async def _broadcast_baddy_props(self, baddy: Baddy, include_verses: bool = False):
         """Broadcast baddy properties to level."""
-        packet = baddy.build_props_packet()
+        packet = baddy.build_props_packet(include_verses=include_verses)
         await self.server.broadcast_to_level(baddy.level_name, packet)
 
     async def add_baddy(self, level: 'Level', x: float, y: float,
-                        baddy_type: BaddyType) -> Baddy:
+                        baddy_type: BaddyType,
+                        verses: Optional[List[str]] = None) -> Baddy:
         """
         Add a baddy to a level.
 
@@ -376,6 +423,8 @@ class BaddyManager:
             x: X position
             y: Y position
             baddy_type: Type of baddy
+            verses: Optional sight/hurt/attack verse strings parsed from the
+                level file's BADDY block (level.get_baddy_defs()['verses'])
 
         Returns:
             The created baddy
@@ -389,15 +438,16 @@ class BaddyManager:
             baddy_type=baddy_type,
             x=x,
             y=y,
-            respawn_time=self.default_respawn_time
+            respawn_time=self.default_respawn_time,
+            verses=list(verses) if verses else [],
         )
 
         if level.name not in self._baddies:
             self._baddies[level.name] = {}
         self._baddies[level.name][baddy_id] = baddy
 
-        # Broadcast to level
-        await self._broadcast_baddy_props(baddy)
+        # Broadcast to level (initial sighting: include verses)
+        await self._broadcast_baddy_props(baddy, include_verses=True)
 
         logger.debug(f"Added baddy {baddy_id} ({baddy_type.name}) at ({x}, {y}) on {level.name}")
         return baddy
@@ -611,4 +661,5 @@ class BaddyManager:
         """
         for baddy in self.get_baddies_on_level(level.name):
             if not baddy.dead:
-                await player.send_raw(baddy.build_props_packet())
+                # First sighting for this player: include verses too.
+                await player.send_raw(baddy.build_props_packet(include_verses=True))

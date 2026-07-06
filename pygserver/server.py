@@ -304,7 +304,8 @@ class GameServer:
             for baddy in level.get_baddy_defs():
                 try:
                     await self.baddy_manager.add_baddy(
-                        level, baddy['x'], baddy['y'], BaddyType(baddy['type'])
+                        level, baddy['x'], baddy['y'], BaddyType(baddy['type']),
+                        verses=baddy.get('verses'),
                     )
                 except (ValueError, KeyError) as e:
                     logger.debug(f"Skipping baddy in {level.name}: {e}")
