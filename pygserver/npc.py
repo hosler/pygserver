@@ -75,9 +75,12 @@ class NPC:
         self.script_instance: Optional[Any] = None
 
         # GS1 script (legacy Reborn scripting): parsed program + persistent
-        # NPC-scoped variable dicts (this./thiso./local. survive across events)
+        # NPC-scoped variable dicts. Only this./thiso. survive across events;
+        # local. is TEMPORARY (like temp.) and gets a fresh dict per script
+        # execution in gs1_host.run_npc_event, so it is deliberately NOT
+        # given a slot here (see memory: gs1-python-port, upstream d6c78ef3).
         self.gs1_program: Optional[Any] = None
-        self.gs1_scopes: Dict[str, dict] = {"this": {}, "thiso": {}, "local": {}}
+        self.gs1_scopes: Dict[str, dict] = {"this": {}, "thiso": {}}
 
         # Movement (smooth, per-tick): target tile the NPC is walking toward,
         # advanced by NPCManager.tick() using real elapsed time.
@@ -524,12 +527,39 @@ class NPCManager:
         npc.gs1_program = prog
         run_npc_event(npc, 'created', self.server, None)
 
-    def _fire_gs1(self, npc: NPC, event: str, player: Optional['Player'] = None):
-        """Run a GS1 event handler on an NPC if it has a GS1 program."""
+    def _fire_gs1(self, npc: NPC, event: str, player: Optional['Player'] = None,
+                  source: Optional[str] = None):
+        """Run a GS1 event handler on an NPC if it has a GS1 program.
+
+        `source` is who/what initiated the hit for events that expose it as
+        a flag (wasshot's shotbyplayer/shotbybaddy/shotbynpc, GS1Flags.cpp) -
+        one of "player"/"baddy"/"npc", or None for events with no such flags.
+        """
         if npc.gs1_program is None:
             return
         from .gs1_host import run_npc_event
-        run_npc_event(npc, event, self.server, player)
+        run_npc_event(npc, event, self.server, player, source=source)
+
+    async def on_npc_washit(self, npc: NPC, player: Optional['Player'] = None):
+        """Fire `washit` on an NPC hit by hitnpc/hitobjects or a player's
+        sword swing (see gs1_host._c_hitnpc, combat.handle_hit_objects)."""
+        self._fire_gs1(npc, 'washit', player)
+
+    async def on_npc_wasshot(self, npc: NPC, source: str,
+                              player: Optional['Player'] = None):
+        """Fire `wasshot` on an NPC hit by an arrow. `source` is
+        "player"/"baddy"/"npc" (see _fire_gs1)."""
+        self._fire_gs1(npc, 'wasshot', player, source=source)
+
+    async def on_npc_exploded(self, npc: NPC, player: Optional['Player'] = None):
+        """Fire `exploded` on an NPC caught in a bomb explosion radius."""
+        self._fire_gs1(npc, 'exploded', player)
+
+    async def on_baddies_cleared(self, level: 'Level'):
+        """Fire `compusdied` on every NPC on a level once its last living
+        baddy has died (scripting-gs1-events.md compusdied)."""
+        for npc in self.get_npcs_on_level(level):
+            self._fire_gs1(npc, 'compusdied')
 
     def get_npc(self, npc_id: int) -> Optional[NPC]:
         """Get NPC by ID."""

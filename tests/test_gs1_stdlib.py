@@ -30,7 +30,7 @@ def test_vec_and_dir():
 
 def test_string_functions():
     ctx = run("this.i=indexof(ell,hello); this.eq=strequals(foo,foo); "
-              "this.sw=startswith(hello,he); this.len=strlen(hello);")
+              "this.sw=startswith(he,hello); this.len=strlen(hello);")
     assert probe(ctx, "this.i") == 1.0     # indexof(substring, str)
     assert probe(ctx, "this.eq") == 1.0
     assert probe(ctx, "this.sw") == 1.0

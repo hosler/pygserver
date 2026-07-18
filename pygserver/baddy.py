@@ -549,6 +549,15 @@ class BaddyManager:
 
         logger.info(f"Baddy {baddy.id} died, killed by player {killer.id if killer else 'unknown'}")
 
+        # `compusdied` (scripting-gs1-events.md: "Triggers when all of the
+        # baddies in the level have died") - check after this baddy's own
+        # death is recorded above, so a level with exactly one baddy fires
+        # it on that baddy's own death.
+        if level is not None and not any(not b.dead for b in self.get_baddies_on_level(baddy.level_name)):
+            npc_mgr = getattr(self.server, 'npc_manager', None)
+            if npc_mgr is not None and hasattr(npc_mgr, 'on_baddies_cleared'):
+                await npc_mgr.on_baddies_cleared(level)
+
     async def _respawn_baddy(self, baddy: Baddy):
         """Respawn a dead baddy."""
         baddy.dead = False

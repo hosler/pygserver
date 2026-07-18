@@ -22,11 +22,14 @@ ITEM_NAME_TO_ID: Dict[str, int] = {
     t.name.lower(): int(t) for t in _LevelItemType if int(t) >= 0
 }
 
-# Baddy name -> type id, mirrors GServer-v2 LevelBaddy::BaddyNames.
+# Baddy name -> type id, mirrors GServer-v2 LevelBaddy::BaddyNames. "spider"
+# is a name-only alias for octopus (upstream 580c4888: BaddyType has no
+# separate SPIDER value, "if using, spider needs to be manually mapped to
+# octopus" - LevelBaddy.h), not a new baddy type.
 BADDY_NAME_TO_TYPE: Dict[str, int] = {
     "graysoldier": 0, "bluesoldier": 1, "redsoldier": 2, "shootingsoldier": 3,
     "swampsoldier": 4, "frog": 5, "octopus": 6, "goldenwarrior": 7,
-    "lizardon": 8, "dragon": 9,
+    "lizardon": 8, "dragon": 9, "spider": 6,
 }
 
 

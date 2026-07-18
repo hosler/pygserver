@@ -30,7 +30,7 @@ def test_operator_precedence():
 
 
 def test_while_with_break():
-    ctx = run("this.i=0; while (1) { this.i++; if (this.i >= 3) break; }")
+    ctx = run("this.i=0; while (1==1) { this.i++; if (this.i >= 3) break; }")
     assert probe(ctx, "this.i") == 3.0
 
 
@@ -137,7 +137,7 @@ def test_infinite_loop_is_guarded():
     ctx = Context(MemoryHost())
     ctx.max_steps = 5000
     with pytest.raises(RuntimeError):
-        Interpreter(ctx).run(parse("while (1) { this.x++; }"))
+        Interpreter(ctx).run(parse("while (1==1) { this.x++; }"))
 
 
 @pytest.mark.skipif(not os.path.isdir(CORPUS), reason="gs1_corpus not present")

@@ -431,7 +431,7 @@ def test_getnearestplayer_sets_context_player():
     level = _level_with_players(far, near)
     server = NearestServer([far, near])
     npc = make_npc(
-        "if (timeout) { if (getnearestplayer(10,10)) { message saw #n; } }", level)
+        "if (timeout) { if (getnearestplayer(10,10) > 0) { message saw #n; } }", level)
     run_npc_event(npc, "timeout", server, None)
     # nearest is pid 2; ctx.player got set so #n resolves to that player
     assert npc.message == "saw Hos"

@@ -112,6 +112,47 @@ _GANI_ATTR_RE = re.compile(r"#P(\d+)$")
 # #C0..#C7 colour slots as READ values (write side is _CHARPROP_CODES)
 _COLOR_CODE_RE = re.compile(r"#C([0-7])$")
 
+# nw* clock variables (GServer-v2 Server.cpp:178-185, epoch/formula fixed
+# upstream in ac3adf01). This is a synthetic in-game clock derived from real
+# time, not wall-clock minutes: despite the inline C++ comments calling the
+# base unit "minutes", the actual tick is (unix_time - _NW_EPOCH) // 5 -
+# nwtime/nwmin/nwhour/nwday/nwweekday/nwweek/nwmonth/nwyear are all just that
+# single counter divided/wrapped at different scales (60/1440/10080/40320/
+# 403200 ticks respectively). day/weekday/week/month are 1-indexed; year
+# starts at 1000. Distinct from `timevar`, which stays an unimplemented
+# builtin here (see the comment on call_function).
+_NW_EPOCH = 981048814.0  # Thu Feb 01 2001 17:33:34 GMT
+_NW_CLOCK_FIELDS = (
+    "nwtime", "nwmin", "nwhour", "nwday", "nwweekday", "nwweek",
+    "nwmonth", "nwyear",
+)
+
+
+def _nw_clock_value(name):
+    ticks = int((time.time() - _NW_EPOCH) / 5)
+    if name == "nwtime":
+        return float(ticks % 1440)
+    if name == "nwmin":
+        return float(ticks % 60)
+    if name == "nwhour":
+        return float((ticks // 60) % 24)
+    if name == "nwday":
+        return float((ticks // 1440) % 28 + 1)
+    if name == "nwweekday":
+        return float((ticks // 1440) % 7 + 1)
+    if name == "nwweek":
+        return float((ticks // 10080) % 40 + 1)
+    if name == "nwmonth":
+        return float((ticks // 40320) % 10 + 1)
+    return float((ticks // 403200) + 1000)  # nwyear
+
+
+# wasshot's initiator-source flags (GS1Flags.cpp:136-138) -> the `source`
+# string run_npc_event/_fire_gs1 stash as ctx.hit_source.
+_SHOTBY_SOURCE = {
+    "shotbyplayer": "player", "shotbybaddy": "baddy", "shotbynpc": "npc",
+}
+
 
 def _charprop_target(code, table):
     """Resolve a setcharprop/setplayerprop message code to its target.
@@ -153,6 +194,49 @@ class GS1Host(Host):
         if name == "timeout" and npc is not None:
             end = getattr(npc, "_timer_end", 0.0)
             return max(0.0, end - time.time()) if end else 0.0
+        # -- nw* clock variables (Server.cpp:178-185, upstream ac3adf01) --
+        if name in _NW_CLOCK_FIELDS:
+            return _nw_clock_value(name)
+        # -- hit-source flags: WASSHOT only (GS1Flags.cpp:136-138); washit
+        # has no equivalent source flags upstream.
+        if name in _SHOTBY_SOURCE:
+            if ctx.active_event != "wasshot":
+                return 0.0
+            return 1.0 if getattr(ctx, "hit_source", None) == _SHOTBY_SOURCE[name] else 0.0
+        # -- player flags with real pygserver-side backing state
+        # (GS1Flags.cpp setPlayerFlags). Flags with no backing state here
+        # (carrying*/isweapon/playerswimming/mouse*/music* etc.) are
+        # deliberately skipped - see the comment block above _COMMANDS for
+        # the equivalent "no server state to read" reasoning on the command
+        # side; pygserver never tracks PLPROP.CARRYSPRITE/CARRYNPC server-
+        # side (client-authoritative, never parsed off incoming props), and
+        # weapon scripts (Weapon.server_script) are parsed but never
+        # executed, so there is no "this script is running as a weapon"
+        # context to test either.
+        if name == "weaponsenabled" and player is not None:
+            return 0.0 if getattr(player, "weapons_disabled", False) else 1.0
+        if name == "playeronhorse" and player is not None:
+            hm = getattr(self.server, "horse_manager", None) if self.server is not None else None
+            pid = getattr(player, "id", None)
+            return 1.0 if hm is not None and pid is not None and hm.is_mounted(pid) else 0.0
+        if name in ("playerismale", "playerisfemale") and player is not None:
+            # player.gender only ever exists if a GS1 script set it
+            # (_c_setgender/_c_setchargender) - pygserver has no other
+            # gender source. 0 = male by the same raw-int convention those
+            # commands already use (classic GraalScript "sex" 0/1); unset
+            # defaults to male, matching upstream's PLSTATUS_MALE-set default.
+            is_male = int(to_num(getattr(player, "gender", 0))) == 0
+            return 1.0 if is_male == (name == "playerismale") else 0.0
+        if name == "isleader" and player is not None:
+            leader = self._leader_player(ctx)
+            return 1.0 if leader is not None and leader is player else 0.0
+        # -- NPC/level flags (GS1Flags.cpp setNPCFlags/setLevelFlags) --
+        if name == "visible" and npc is not None:
+            return 1.0 if getattr(npc, "visible", True) else 0.0
+        if name == "isonmap":
+            return 1.0 if self._gmap_info(ctx) is not None else 0.0
+        if name == "compsdead":
+            return 1.0 if self._all_baddies_dead(ctx) else 0.0
         return UNSET
 
     def set_builtin(self, name, value, indices, ctx) -> bool:
@@ -201,12 +285,14 @@ class GS1Host(Host):
         if name == "hasweapon":
             player = ctx.player
             if player is not None and args and hasattr(player, "has_weapon"):
-                return 1.0 if player.has_weapon(to_str(args[0])) else 0.0
-            return 0.0
+                return bool(player.has_weapon(to_str(args[0])))
+            return False
         if name in ("getnearestplayer", "findnearestplayer"):
             return self._nearest_player(args, ctx, name == "getnearestplayer")
         if name == "getnearestplayers":
             return self._nearest_players(args, ctx)
+        if name in ("onmapx", "onmapy"):
+            return self._onmap_pos(args, ctx, 0 if name == "onmapx" else 1)
         # getnpc/getplayer return ScriptObject references that require a
         # script-object member-access model (obj.x / obj.hearts). Deliberately
         # unimplemented: zero usage across the 5732-file GS1 corpus, so it isn't
@@ -398,18 +484,88 @@ class GS1Host(Host):
         """
         ranked = self._sorted_by_distance(args, ctx)
         if not ranked:
-            return 0.0
+            return False
         ctx.player = ranked[0]
-        return float(getattr(ranked[0], "id", 0)) if return_id else 1.0
+        return float(getattr(ranked[0], "id", 0)) if return_id else True
 
     def _nearest_players(self, args, ctx):
-        """getnearestplayers(x,y) -> player ids sorted nearest-first.
+        """getnearestplayers(x,y[,condition]) -> player ids sorted nearest-first.
 
-        The C++ optional flag-filter arg is not supported: GS1 lexes that arg
-        as an expression, so the flag *name* isn't recoverable here.
+        Deviations from upstream fn_getnearestplayers (GS1Functions.cpp:597,
+        the per-candidate re-evaluation added in 81ec8a13):
+
+        1. The optional 3rd "condition" argument is NOT evaluated per
+           candidate. Upstream pushes each candidate player as the current
+           script source and re-runs the condition EXPRESSION once per
+           player (so e.g. `getnearestplayers(x,y,playerhearts>0)` reads a
+           different playerhearts each time), skipping players where it's
+           falsy. That requires the interpreter to hand the *unevaluated*
+           AST node down to the host so it can be re-run under a different
+           ctx.player. reborn_protocol.gs1.interp.Interpreter evaluates all
+           call arguments eagerly, exactly once, before call_function() ever
+           runs (`[self.eval(a) for a in node.args]`) — there is no hook
+           here to re-run args[2] per candidate without changing that
+           evaluation strategy, which lives in reborn-protocol (out of scope
+           for this host). So the condition argument is silently ignored
+           rather than half-applied (a single-evaluation, applied-to-all-or-
+           none filter could easily look "correct" for a condition that
+           doesn't happen to read per-player state and then quietly do the
+           wrong thing for one that does — worse than a documented no-op).
+        2. Return semantics: upstream returns INDICES into level->getPlayers()
+           (a `players[]`-style array a script would index elsewhere in the
+           same script). This host has no players[] array-indexing construct
+           (see call_function's getnpc/getplayer note above), so this keeps
+           returning player IDs instead, as it already did.
         """
         ranked = self._sorted_by_distance(args, ctx)
         return [float(getattr(p, "id", 0)) for p in ranked]
+
+    def _onmap_pos(self, args, ctx, axis):
+        """onmapx(level)/onmapy(level) -> the named level's grid position
+        within the CURRENT level's gmap (GS1Functions.cpp fn_onmapx/fn_onmapy,
+        upstream 9e759e9d): -1 if the current level has no gmap at all, else
+        the target level's (x,y) in that grid, defaulting to (0,0) - not -1 -
+        if the named level isn't actually in the grid (matches the C++
+        `.value_or(MapPosition{0,0})`)."""
+        lvl = self._level_of(ctx)
+        if lvl is None or not args:
+            return -1.0
+        info = self._gmap_info(ctx)
+        if info is None:
+            return -1.0
+        gmap, _, _ = info
+        pos = gmap.find_level(to_str(args[0])) if hasattr(gmap, "find_level") else None
+        return float((pos or (0, 0))[axis])
+
+    def _gmap_info(self, ctx):
+        """(gmap, grid_x, grid_y) for the script's level, or None if it isn't
+        on a gmap (backs the `isonmap` flag and onmapx/onmapy)."""
+        lvl = self._level_of(ctx)
+        world = getattr(self.server, "world", None) if self.server is not None else None
+        if lvl is None or world is None or not hasattr(world, "get_gmap_for_level"):
+            return None
+        return world.get_gmap_for_level(getattr(lvl, "name", ""))
+
+    def _leader_player(self, ctx):
+        """First player on the script's level (GS1Flags.cpp isleader /
+        Level::isPlayerLeader). pygserver's Level only tracks a bare id set
+        with no join-order (Level.get_player_ids -> Set[int]), so this is
+        really "lowest id currently on the level" rather than "first to
+        join" - the closest available proxy given nothing else records
+        join order."""
+        players = self._players_on_level(ctx)
+        return players[0] if players else None
+
+    def _all_baddies_dead(self, ctx):
+        """compsdead (GS1Flags.cpp setLevelFlags: !level->hasLivingBaddies()).
+        Vacuously true if there's no baddy system to ask, same as "no living
+        baddies found" upstream."""
+        lvl = self._level_of(ctx)
+        bm = getattr(self.server, "baddy_manager", None) if self.server is not None else None
+        if lvl is None or bm is None or not hasattr(bm, "get_baddies_on_level"):
+            return True
+        baddies = bm.get_baddies_on_level(getattr(lvl, "name", ""))
+        return all(getattr(b, "dead", False) for b in baddies)
 
 
 # -- command handlers -------------------------------------------------------
@@ -1014,6 +1170,85 @@ def _c_hitplayer(self, a, npc, player, ctx):
         _schedule(cm.apply_damage(players[idx], int(to_num(a[1])), 0, 0, dtype))
 
 
+def _c_hitobjects(self, a, npc, player, ctx):
+    # hitobjects power,x,y — GS1Commands.cpp fn_hitobjects calls
+    # Server::hitObjectsAtPoint(pos, power, level, npc) which, for an
+    # NPC-sourced call, ONLY broadcasts a PLO_HITOBJECTS notification to
+    # nearby clients (Server.cpp:2253-2257 in the GServer-v2 checkout) — it
+    # does NOT itself look up or damage any NPC/baddy/player server-side.
+    # The real server-side hit detection + washit firing happens in the
+    # CLIENT-REPORTED PLI_HITOBJECTS packet handler (msgPLI_HITOBJECTS,
+    # PlayerClientPackets.cpp:1017), i.e. combat.handle_hit_objects, which is
+    # what actually applies a player's own sword swing to nearby NPCs (see
+    # that function's docstring). A serverside NPC script calling
+    # `hitobjects` itself (e.g. from a timeout/AI loop) therefore only ever
+    # produces a client-side visual/audio hit effect here, matching upstream.
+    if npc is None or self.server is None or len(a) < 3:
+        return
+    lvl = self._level_of(ctx)
+    if lvl is None:
+        return
+    try:
+        from .protocol.packets import build_hit_objects
+        power = int(to_num(a[0]) * 2)
+        pkt = build_hit_objects(0, power, to_num(a[1]), to_num(a[2]), npc_id=npc.id)
+        _schedule(self.server.broadcast_to_level(lvl.name, pkt))
+    except Exception:
+        logger.debug("hitobjects failed", exc_info=True)
+
+
+def _c_hitnpc(self, a, npc, player, ctx):
+    # hitnpc index,halfhearts,fromx,fromy — GS1Commands.cpp fn_hitnpc: hits
+    # the NPC at position <index> in the level's NPC list, decrementing its
+    # health and firing washit. fromx/fromy only feed upstream's HURTDXDY
+    # prop, which pygserver doesn't wire to anything client-visible for NPCs
+    # (no knockback-direction prop support) — accepted but otherwise unused,
+    # same as upstream's own dead-end use of it.
+    if npc is None or self.server is None or len(a) < 4:
+        return
+    lvl = self._level_of(ctx)
+    if lvl is None or not hasattr(lvl, "get_npcs"):
+        return
+    npcs = lvl.get_npcs()
+    idx = int(to_num(a[0]))
+    if not (0 <= idx < len(npcs)):
+        return
+    target = npcs[idx]
+    halfhearts = math.floor(to_num(a[1]))
+    target.hearts = max(0.0, to_num(getattr(target, "hearts", 0)) - halfhearts / 2.0)
+    self._dirty(target)
+    nm = getattr(self.server, "npc_manager", None)
+    if nm is not None and hasattr(nm, "on_npc_washit"):
+        _schedule(nm.on_npc_washit(target, player))
+
+
+def _c_hitcompu(self, a, npc, player, ctx):
+    # hitcompu index,power,fromx,fromy — GS1Commands.cpp fn_hitcompu.
+    # Upstream is a client-trust artifact: it sends a bare PLO_BADDYHURT
+    # packet to the level's leader player ONLY and never touches server-side
+    # baddy health at all (relying on that one client to self-report the
+    # damage back, same as a real sword swing would). pygserver treats baddy
+    # health as server-authoritative everywhere else (explosion/arrow/sword
+    # all go through BaddyManager.handle_baddy_hurt), so this deliberately
+    # applies REAL damage via that same path instead of replicating the
+    # leader-only notify quirk — a real hit is strictly more useful than a
+    # packet only one player's client happens to see.
+    if self.server is None or len(a) < 2:
+        return
+    lvl = self._level_of(ctx)
+    bm = getattr(self.server, "baddy_manager", None)
+    if lvl is None or bm is None or not hasattr(bm, "get_baddies_on_level"):
+        return
+    baddies = bm.get_baddies_on_level(lvl.name)
+    idx = int(to_num(a[0]))
+    if not (0 <= idx < len(baddies)):
+        return
+    leader = self._leader_player(ctx)
+    if leader is None:
+        return
+    _schedule(bm.handle_baddy_hurt(leader, baddies[idx].id, int(to_num(a[1]))))
+
+
 def _queue_player_prop(player, prop_id, value):
     dirty = getattr(player, "_gs1_dirty_props", None)
     if dirty is None:
@@ -1154,7 +1389,8 @@ _COMMANDS = {
     # combat
     "putbomb": _c_putbomb, "putexplosion": _c_putexplosion,
     "putexplosion2": _c_putexplosion2, "shootarrow": _c_shootarrow,
-    "hitplayer": _c_hitplayer,
+    "hitplayer": _c_hitplayer, "hitobjects": _c_hitobjects,
+    "hitnpc": _c_hitnpc, "hitcompu": _c_hitcompu,
     "setshape": _c_setshape,
 }
 
@@ -1180,7 +1416,7 @@ _NOOP_COMMANDS = (
     "noplayerkilling", "enabledefmovement", "disabledefmovement",
     "toinventory", "hideplayer", "showplayer",
     # combat projectiles with no pygserver representation (client-side in Reborn)
-    "shootball", "shootfireball", "shootfireblast", "shoot", "hitobjects",
+    "shootball", "shootfireball", "shootfireblast", "shoot",
 )
 for _name in _NOOP_COMMANDS:
     _COMMANDS.setdefault(_name, _c_noop)
@@ -1196,11 +1432,22 @@ def compile_gs1(code: str):
         return None
 
 
-def run_npc_event(npc, event: str, server=None, player=None):
+def run_npc_event(npc, event: str, server=None, player=None, source=None):
     """Fire a GS1 event handler (`if (<event>) {...}`) on an NPC.
 
-    Wires variable scopes so this./thiso./local. persist on the NPC, bare flags
+    Wires variable scopes so this./thiso. persist on the NPC, bare flags
     persist on the player, and server/level/global persist on the server/level.
+    `local.` is TEMPORARY like `temp.` - GS1Variables.h scopes it to the
+    single script execution, not to the NPC, so (like temp.) it gets a fresh
+    dict every call rather than reading npc.gs1_scopes (upstream d6c78ef3;
+    previously this pulled from a dict created once in NPC.__init__ and never
+    cleared, leaking state across events).
+
+    `source` records who/what initiated this event ("player"/"baddy"/"npc")
+    for flags that expose it (wasshot's shotbyplayer/shotbybaddy/shotbynpc,
+    GS1Flags.cpp) - stashed on the Context as `hit_source`, read by
+    GS1Host.get_builtin. None for events with no such flags.
+
     Returns the Context (or None if the NPC has no GS1 program).
     """
     prog = getattr(npc, "gs1_program", None)
@@ -1211,8 +1458,8 @@ def run_npc_event(npc, event: str, server=None, player=None):
     sc = npc.gs1_scopes
     level = getattr(npc, "level", None)
     scopes = {
-        "this": sc["this"], "thiso": sc["thiso"], "local": sc["local"],
-        "temp": {},
+        "this": sc["this"], "thiso": sc["thiso"],
+        "local": {}, "temp": {},
         "client": _lazy(player, "_gs1_client"),
         "server": _lazy(server, "_gs1_server"),
         "level": _lazy(level, "_gs1_vars"),
@@ -1223,6 +1470,7 @@ def run_npc_event(npc, event: str, server=None, player=None):
         player_flags = _lazy(player, "_gs1_flags")
     vs = VarStore(scopes=scopes, player_flags=player_flags)
     ctx = Context(host, vs, this_obj=npc, player=player)
+    ctx.hit_source = source
     try:
         Interpreter(ctx).run_event(prog, event)
     except Exception as e:

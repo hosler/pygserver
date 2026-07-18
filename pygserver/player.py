@@ -790,20 +790,28 @@ class Player:
         )
 
     async def _handle_hit_objects(self, data: bytes):
-        """Handle PLI_HITOBJECTS packet."""
+        """Handle PLI_HITOBJECTS packet (client-detected sword hit at a
+        probe location - the real server-side "sword swing hit something"
+        report; see combat.handle_hit_objects for what happens with it).
+
+        Wire format (GServer-v2 msgPLI_HITOBJECTS, PlayerClientPackets.cpp:
+        1017-1026): {GCHAR power*2}{GCHAR x*2}{GCHAR y*2}[{GINT3 npc_id}].
+        Previously this read x,y,power (wrong order/scale) and then looped
+        reading gint3 "object ids" that the real client never sends -
+        PLI_HITOBJECTS carries a single probe location and an optional
+        trailing npc_id, not a pre-resolved list of hit object ids; the
+        server is the one that determines what's actually at that location.
+        """
+        if not self.level:
+            return
         reader = PacketReader(data)
+        power = reader.read_gchar() / 2.0
         x = reader.read_gchar() / 2.0
         y = reader.read_gchar() / 2.0
-        power = reader.read_gchar()
-
-        # Parse object IDs
-        objects = []
-        while reader.remaining():
-            obj_id = reader.read_gint3()
-            objects.append(obj_id)
+        npc_id = reader.read_gint3() if reader.remaining() else None
 
         if hasattr(self.server, 'combat_manager'):
-            await self.server.combat_manager.handle_hit_objects(self, x, y, power, objects)
+            await self.server.combat_manager.handle_hit_objects(self, x, y, power, npc_id)
 
     async def _handle_shoot(self, data: bytes):
         """Handle PLI_SHOOT packet."""

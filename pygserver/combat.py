@@ -23,6 +23,7 @@ from .protocol.packets import (
     build_fire_spy,
     build_push_away,
     build_throw_carried,
+    build_hit_objects,
 )
 
 if TYPE_CHECKING:
@@ -323,6 +324,27 @@ class CombatManager:
                 bomb.level_name, bomb.x, bomb.y, radius, damage
             )
 
+        # Damage NPCs in radius and fire `exploded` (scripting-gs1-events.md:
+        # "Triggered when an NPC is touched by an explosion" - GServer-v2
+        # Level.cpp:2137/2142/2192 hurtAndPush(..., ScriptEventType::EXPLODED)).
+        npc_mgr = getattr(self.server, 'npc_manager', None)
+        if npc_mgr is not None and hasattr(npc_mgr, 'get_npcs_on_level'):
+            attacker = None
+            if hasattr(self.server, 'get_player'):
+                attacker = self.server.get_player(bomb.player_id)
+            for npc in npc_mgr.get_npcs_on_level(level):
+                if not getattr(npc, 'visible', True):
+                    continue
+                dx = npc.x - bomb.x
+                dy = npc.y - bomb.y
+                distance = (dx * dx + dy * dy) ** 0.5
+                if distance < radius:
+                    npc.hearts = max(0.0, npc.hearts - damage / 2.0)
+                    if hasattr(npc, 'mark_dirty'):
+                        npc.mark_dirty()
+                    if hasattr(npc_mgr, 'on_npc_exploded'):
+                        await npc_mgr.on_npc_exploded(npc, attacker)
+
         logger.debug(f"Bomb detonated at ({bomb.x}, {bomb.y}) with radius {radius}")
 
     async def handle_arrow_add(self, player: 'Player', x: float, y: float,
@@ -450,13 +472,41 @@ class CombatManager:
                 return
 
         # Check baddy collision
+        arrow_consumed = False
         if hasattr(self.server, 'baddy_manager'):
-            hit = await self.server.baddy_manager.check_arrow_hit(
+            arrow_consumed = await self.server.baddy_manager.check_arrow_hit(
                 arrow.level_name, arrow.x, arrow.y, self.arrow_damage, arrow.player_id
             )
-            if hit:
-                if arrow.level_name in self._arrows:
-                    self._arrows[arrow.level_name].pop(arrow.id, None)
+
+        # Check NPC collision + fire `wasshot` (scripting-gs1-events.md:
+        # "Triggers when an NPC was shot with an arrow" - GServer-v2
+        # Level.cpp:2653 hurtAndPush(..., ScriptEventType::WASSHOT, arrow->from)).
+        # Only player-fired arrows reach this loop today: _c_shootarrow (an
+        # NPC firing an arrow via GS1) only ever broadcasts a cosmetic
+        # PLO_ARROWADD and never registers a real flight/hit Arrow here, so
+        # `source` is always "player" in practice - "baddy"/"npc" are still
+        # recognised by GS1Host (shotbybaddy/shotbynpc) for if/when a baddy-
+        # or NPC-fired arrow ever gets real flight simulation.
+        if not arrow_consumed:
+            npc_mgr = getattr(self.server, 'npc_manager', None)
+            if npc_mgr is not None and hasattr(npc_mgr, 'get_npcs_on_level'):
+                for npc in npc_mgr.get_npcs_on_level(level):
+                    if not getattr(npc, 'visible', True):
+                        continue
+                    if abs(npc.x - arrow.x) < 1.0 and abs(npc.y - arrow.y) < 1.0:
+                        npc.hearts = max(0.0, npc.hearts - self.arrow_damage / 2.0)
+                        if hasattr(npc, 'mark_dirty'):
+                            npc.mark_dirty()
+                        if hasattr(npc_mgr, 'on_npc_wasshot'):
+                            shooter = None
+                            if hasattr(self.server, 'get_player'):
+                                shooter = self.server.get_player(arrow.player_id)
+                            await npc_mgr.on_npc_wasshot(npc, 'player', shooter)
+                        arrow_consumed = True
+                        break
+
+        if arrow_consumed and arrow.level_name in self._arrows:
+            self._arrows[arrow.level_name].pop(arrow.id, None)
 
     async def handle_hurt_player(self, attacker: 'Player', target_id: int,
                                   power: int, from_x: float, from_y: float):
@@ -735,28 +785,56 @@ class CombatManager:
         )
 
     async def handle_hit_objects(self, player: 'Player', x: float, y: float,
-                                  power: int, objects: List[int]):
+                                  power: float, npc_id: Optional[int] = None):
         """
-        Handle PLI_HITOBJECTS packet (hitting multiple objects with sword).
+        Handle PLI_HITOBJECTS packet — the client reporting its sword swing
+        landed at (x, y). This is the real server-side sword-hit-detection
+        path: unlike the GS1 `hitobjects` COMMAND (gs1_host._c_hitobjects,
+        which upstream defines as a pure client-notification broadcast with
+        no server-side hit logic), this handler is the one that actually
+        probes for NPCs at the location and applies damage server-side,
+        matching GServer-v2's msgPLI_HITOBJECTS (PlayerClientPackets.cpp:
+        1017-1044): decrement the NPC's health and fire `washit`.
+
+        Baddy sword hits are a SEPARATE client packet (PLI_BADDYHURT ->
+        BaddyManager.handle_baddy_hurt, wired in player._handle_baddy_hurt)
+        and are intentionally not duplicated here — upstream's classic
+        baddies and this NPC lookup are two unrelated code paths too.
 
         Args:
-            player: Player hitting
-            x: Hit X position
-            y: Hit Y position
-            power: Hit power
-            objects: List of object IDs hit
+            player: Player whose sword swing landed
+            x: Hit X position (tiles)
+            y: Hit Y position (tiles)
+            power: Damage in HEARTS (already /2-scaled off the wire byte by
+                the caller, matching msgPLI_HITOBJECTS's own `power/2.0f`)
+            npc_id: Optional npc id the client itself reports the hit came
+                from (rare - forwarded to the relay only; upstream doesn't
+                use it for hit detection either, see the packet handler)
         """
         if not player.level:
             return
 
-        # Process each hit object
-        for obj_id in objects:
-            # Could be NPCs, baddies, etc.
-            # Check if it's a baddy
-            if hasattr(self.server, 'baddy_manager'):
-                await self.server.baddy_manager.handle_hit(
-                    player.level.name, obj_id, power, player.id
-                )
+        # Relay a notification to nearby OTHER players so their clients can
+        # show a hit effect too (GServer-v2 sendPacketToNearby(..., {m_id})
+        # excludes the sender, who already knows locally that it swung).
+        if hasattr(self.server, 'broadcast_to_level'):
+            packet = build_hit_objects(player.id, int(power * 2), x, y, npc_id)
+            await self.server.broadcast_to_level(
+                player.level.name, packet, exclude={player.id}
+            )
+
+        npc_mgr = getattr(self.server, 'npc_manager', None)
+        if npc_mgr is None or not hasattr(npc_mgr, 'get_npcs_on_level'):
+            return
+        for npc in npc_mgr.get_npcs_on_level(player.level):
+            if not getattr(npc, 'visible', True):
+                continue
+            if abs(npc.x - x) < 1.0 and abs(npc.y - y) < 1.0:
+                npc.hearts = max(0.0, npc.hearts - power)
+                if hasattr(npc, 'mark_dirty'):
+                    npc.mark_dirty()
+                if hasattr(npc_mgr, 'on_npc_washit'):
+                    await npc_mgr.on_npc_washit(npc, player)
 
     def is_invincible(self, player_id: int) -> bool:
         """Check if a player is currently invincible."""

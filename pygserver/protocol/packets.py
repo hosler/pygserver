@@ -820,6 +820,29 @@ def build_hurt_player(attacker_id: int, hurt_dx: int, hurt_dy: int,
     return builder.build()
 
 
+def build_hit_objects(source_id: int, power: int, x: float, y: float,
+                       npc_id: Optional[int] = None) -> bytes:
+    """Build PLO_HITOBJECTS packet (client hit-effect notification).
+
+    Wire format (GServer-v2 msgPLI_HITOBJECTS relay / Server::hitObjectsAtPoint,
+    PlayerClientPackets.cpp:1017-1044, Server.cpp:2247-2257):
+        {GSHORT source_id}{GCHAR power}{GCHAR x*2}{GCHAR y*2}[{GINT3 npc_id}]
+    source_id is the hitting player's id, or 0 when the hit was NPC-sourced
+    (in which case npc_id is appended instead). `power` is already
+    half-heart scaled (callers pass power*2, matching the C++ side which
+    pre-scales before this call - see gs1_host._c_hitobjects).
+    """
+    builder = PacketBuilder().write_gchar(PLO.HITOBJECTS)
+    builder.write_gshort(source_id)
+    builder.write_gchar(int(power) & 0xFF)
+    builder.write_gchar(int(x * 2))
+    builder.write_gchar(int(y * 2))
+    if npc_id is not None:
+        builder.write_gint3(npc_id)
+    builder.write_newline()
+    return builder.build()
+
+
 def build_fire_spy(player_id: int, x: float, y: float) -> bytes:
     """Build PLO_FIRESPY packet."""
     builder = PacketBuilder().write_gchar(PLO.FIRESPY)
@@ -842,14 +865,6 @@ def build_throw_carried(player_id: int) -> bytes:
     """
     builder = PacketBuilder().write_gchar(PLO.THROWCARRIED)
     builder.write_gshort(player_id)
-    builder.write_newline()
-    return builder.build()
-
-
-def build_hit_objects(data: bytes) -> bytes:
-    """Build PLO_HITOBJECTS packet."""
-    builder = PacketBuilder().write_gchar(PLO.HITOBJECTS)
-    builder.write_bytes(data)
     builder.write_newline()
     return builder.build()
 
