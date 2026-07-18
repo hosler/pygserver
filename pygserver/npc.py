@@ -82,6 +82,17 @@ class NPC:
         self.gs1_program: Optional[Any] = None
         self.gs1_scopes: Dict[str, dict] = {"this": {}, "thiso": {}}
 
+        # Resumable-sleep state (gs1_host.run_npc_event): `_gs1_ctx` is this
+        # NPC's single persistent reborn_protocol Context, reused across
+        # every event so a bare `timeout = x;` can cancel a sleep left
+        # pending by an earlier execution (Context.sleep_cancelled).
+        # `_gs1_pending` is the still-suspended _PendingGS1Sleep (if any) -
+        # only resumed by this NPC's own next `timeout` event, matching
+        # GServer-v2's m_sleepCallStack (see gs1_host.py for the full
+        # design/citations).
+        self._gs1_ctx: Optional[Any] = None
+        self._gs1_pending: Optional[Any] = None
+
         # Movement (smooth, per-tick): target tile the NPC is walking toward,
         # advanced by NPCManager.tick() using real elapsed time.
         self._move_target: Optional[tuple] = None

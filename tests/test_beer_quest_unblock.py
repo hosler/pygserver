@@ -137,11 +137,40 @@ def test_beer_quest_sets_drunkguard_on_player():
     asyncio.run(main())
 
 
+async def _drive_mountain_guard_to_destroy(server, mountain_guard, max_ticks=200):
+    """Force-fire the mountain guard's `timeout` repeatedly (bypassing real
+    wall-clock waits, same idiom as the pre-existing `set_timer(-1.0)`
+    force-fire this test already used) until it destroys itself or
+    `max_ticks` is exhausted. Each `sleep` inside the walk-away script now
+    genuinely suspends (gs1_host.run_npc_event's resumable-sleep adoption)
+    and is only resumed by the NPC's OWN next `timeout` tick -
+    npc.set_timer(pending_sleep) is exactly what schedules that tick, so
+    forcing the timer to -1.0 before every tick() call is what stands in for
+    "real time has passed" here, same as it always was.
+
+    Returns the list of (x, y) positions sampled after each tick that
+    actually ran the guard's script (i.e. actually progressed the walk),
+    including the starting position.
+    """
+    positions = [(mountain_guard.x, mountain_guard.y)]
+    for _ in range(max_ticks):
+        if mountain_guard.id not in server.npc_manager._npcs:
+            break
+        mountain_guard.set_timer(-1.0)
+        await server.npc_manager.tick()
+        await asyncio.sleep(0)  # let the scheduled destroy_npc() task run
+        if mountain_guard.id not in server.npc_manager._npcs:
+            break
+        positions.append((mountain_guard.x, mountain_guard.y))
+    return positions
+
+
 def test_mountain_guard_timeout_moves_off_doorway_when_drunkguard_set():
     """Full chain: deliver 5 beers -> drunkguard set on the player -> force
     the mountain guard's timeout to fire through the real NPCManager.tick()
     path (which must give it a player context so the bare `drunkguard` flag
-    is even readable) -> assert the guard leaves (30, 6)."""
+    is even readable) -> assert the guard actually WALKS off (30, 6) across
+    many ticks, not a single one-tile jump."""
     async def main():
         server, level = load_chicken_cave_entrance()
         beer_guard = find_npc_at(server, level, 34.5, 15.5)
@@ -158,24 +187,26 @@ def test_mountain_guard_timeout_moves_off_doorway_when_drunkguard_set():
             await server.npc_manager.on_player_touches(player, beer_guard)
         assert player.flags.get("drunkguard"), "beer quest didn't set drunkguard"
 
-        # Force the mountain guard's timer to have already expired, then run
-        # the real tick() path (check_timer -> leader lookup -> fire 'timeout').
-        mountain_guard.set_timer(-1.0)
-        await server.npc_manager.tick()
-        await asyncio.sleep(0)  # let the scheduled destroy_npc() task run
+        # With resumable sleep adopted, the script's three walk-away while
+        # loops each `sleep .05;`/`sleep .5;` per iteration and genuinely
+        # suspend/resume across many NPC timer ticks instead of breaking
+        # after one iteration - so driving it to completion takes many
+        # forced ticks, and the guard's position should visibly progress
+        # (multiple distinct tiles) rather than jump straight to its final
+        # spot.
+        positions = await _drive_mountain_guard_to_destroy(server, mountain_guard)
 
-        # In pygserver's synchronous (non-coroutine) GS1 execution, `sleep`
-        # inside a while/for loop breaks that loop after the current
-        # iteration (interp.py _gx: "sync: yield by breaking the wait-loop"
-        # - a deliberate reborn-protocol simplification, not something to
-        # "fix" here) rather than truly suspending for real time, so each of
-        # the three walk-away while loops in the script only runs one
-        # iteration before falling through to `unset drunkguard; destroy;`.
-        # Either way, the guard must no longer be occupying the doorway tile
-        # once the event has run, and - since it destroys itself - it must
-        # actually be gone (not just moved, but removed and its removal
-        # broadcast to the client so it doesn't linger as a ghost).
-        assert (mountain_guard.x, mountain_guard.y) != (30, 6), (
+        distinct = set(positions)
+        assert len(distinct) > 2, (
+            f"mountain guard should have walked through several distinct "
+            f"positions, only saw {sorted(distinct)}"
+        )
+        assert positions[0] == (30, 6)
+        assert positions[1] == (30, 6), (
+            "the FIRST timeout tick only reaches the initial `sleep .5;` "
+            "before any movement - the guard must not have moved yet"
+        )
+        assert positions[-1] != (30, 6), (
             "mountain guard never left the doorway tile"
         )
         assert mountain_guard.id not in server.npc_manager._npcs, (
@@ -214,9 +245,7 @@ def test_mountain_guard_destroy_notifies_client_no_ghost_npc():
         for _ in range(5):
             await server.npc_manager.on_player_touches(player, beer_guard)
 
-        mountain_guard.set_timer(-1.0)
-        await server.npc_manager.tick()
-        await asyncio.sleep(0)  # let the scheduled destroy_npc() task run
+        await _drive_mountain_guard_to_destroy(server, mountain_guard)
 
         from pygserver.protocol.packets import build_npc_del
         expected = build_npc_del(mountain_guard.id)
