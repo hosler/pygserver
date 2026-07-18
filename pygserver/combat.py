@@ -120,6 +120,17 @@ class CombatManager:
         self._tick_task: Optional[asyncio.Task] = None
         self._running = False
 
+        # Pending respawn tasks, keyed by nothing in particular - just held
+        # so the event loop's *weak* reference to a fire-and-forget task
+        # (asyncio docs: "Save a reference to the result of this function,
+        # to avoid a task disappearing mid-execution") can't get the
+        # respawn coroutine garbage-collected between the death and the
+        # warp. Losing it silently stranded the player on the old level
+        # forever (no player-left broadcast, no new-level roster) until an
+        # unrelated later warp happened to run the real leave/arrive flow -
+        # this was the "stale ghost player" bug live 2-bot testing found.
+        self._respawn_tasks: Set[asyncio.Task] = set()
+
         # Combat settings
         self.bomb_damage_radius = 2.5  # Tiles
         self.arrow_damage = 1  # Half hearts
@@ -627,8 +638,12 @@ class CombatManager:
         if npc_mgr is not None and hasattr(npc_mgr, 'on_player_dies'):
             await npc_mgr.on_player_dies(player, killer_id)
 
-        # Respawn after delay
-        asyncio.create_task(self._respawn_player(player))
+        # Respawn after delay. Keep a strong reference in self._respawn_tasks
+        # (see comment on that attribute) so the task can't be garbage
+        # collected before it fires.
+        task = asyncio.create_task(self._respawn_player(player))
+        self._respawn_tasks.add(task)
+        task.add_done_callback(self._respawn_tasks.discard)
 
     async def _respawn_player(self, player: 'Player'):
         """

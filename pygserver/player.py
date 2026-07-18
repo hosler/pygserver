@@ -927,13 +927,40 @@ class Player:
     async def _handle_baddy_hurt(self, data: bytes):
         """Handle PLI_BADDYHURT packet.
 
-        Client format (build_baddy_hurt): [gchar baddy_id][gchar damage].
+        Wire format (GServer-v2 msgPLI_BADDYHURT, PlayerClientPackets.cpp:
+        523-539, commit e0cd07af9bb4be09c54c0335f222dd0eacb71c1):
+            [GUChar baddyId][GChar hurtDX][GChar hurtDY][GUChar damage,
+            half-hearts]
+        hurtDX/hurtDY are commented there as "midpoint: 64" - the same
+        recentering idiom as read_gchar_signed() (byte - 32) with an extra
+        -64 on top, i.e. value = read_gchar_signed() - 64 (mirrors GServer's
+        PropertyHurtDxDy<MidPoint>::deserialize: dx = readGChar() - MidPoint).
+        GServer-v2 itself treats these as a client-trust artifact and never
+        parses them server-side (it just relays the raw packet to the
+        baddy's leader) - pygserver is authoritative for baddy damage
+        (BaddyManager.handle_baddy_hurt already computes its own knockback
+        direction from baddy/player position), so hurt_dx/hurt_dy are parsed
+        here and intentionally dropped rather than fed into knockback.
+
+        Backward tolerance: older pyReborn builds sent the legacy 2-field
+        [baddy_id][damage] payload with no knockback fields - fall back to
+        that when the packet is too short for the 4-field format.
         """
         if not self.level:
             return
         reader = PacketReader(data)
-        baddy_id = reader.read_gchar()
-        damage = reader.read_gchar() if reader.remaining() else 1
+        if len(data) >= 4:
+            baddy_id = reader.read_gchar()
+            hurt_dx = reader.read_gchar_signed() - 64  # noqa: F841 (parsed, unused - see docstring)
+            hurt_dy = reader.read_gchar_signed() - 64  # noqa: F841
+            damage = reader.read_gchar()
+        else:
+            logger.debug(
+                f"PLI_BADDYHURT: {len(data)}-byte packet too short for the "
+                "4-field format, falling back to legacy [id][damage]"
+            )
+            baddy_id = reader.read_gchar()
+            damage = reader.read_gchar() if reader.remaining() else 1
 
         if hasattr(self.server, 'baddy_manager'):
             await self.server.baddy_manager.handle_baddy_hurt(self, baddy_id, damage)

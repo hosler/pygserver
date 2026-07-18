@@ -503,11 +503,15 @@ class BaddyManager:
         dx = baddy.x - player.x
         dy = baddy.y - player.y
         distance = max(0.1, math.sqrt(dx * dx + dy * dy))
-        baddy.x += (dx / distance) * 0.5
-        baddy.y += (dy / distance) * 0.5
+        norm_dx = dx / distance
+        norm_dy = dy / distance
+        baddy.x += norm_dx * 0.5
+        baddy.y += norm_dy * 0.5
 
-        # Broadcast hurt
-        packet = build_baddy_hurt(baddy_id, damage, player.x, player.y)
+        # Broadcast hurt. PLO_BADDYHURT's hurtDX/hurtDY carry the knockback
+        # direction (normalized -1.0..1.0 per axis), not a position - reuse
+        # the same direction vector just applied to the baddy above.
+        packet = build_baddy_hurt(baddy_id, norm_dx, norm_dy, damage)
         await self.server.broadcast_to_level(player.level.name, packet)
 
         logger.debug(f"Baddy {baddy_id} hurt by player {player.id}, health: {baddy.health}")

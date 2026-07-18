@@ -986,13 +986,28 @@ def build_baddy_props(baddy_id: int, props: dict) -> bytes:
     return builder.build()
 
 
-def build_baddy_hurt(baddy_id: int, power: int, from_x: float, from_y: float) -> bytes:
-    """Build PLO_BADDYHURT packet."""
+def build_baddy_hurt(baddy_id: int, hurt_dx: float, hurt_dy: float, damage: int) -> bytes:
+    """Build PLO_BADDYHURT packet.
+
+    Wire format (GServer-v2 msgPLI_BADDYHURT, PlayerClientPackets.cpp:523-539,
+    commit e0cd07af9bb4be09c54c0335f222dd0eacb71c1): [GUChar baddyId]
+    [GChar hurtDX][GChar hurtDY][GUChar damage in half-hearts]. GServer-v2
+    itself never parses these server-side - it just forwards the raw inbound
+    PLI_BADDYHURT payload to the baddy's leader verbatim. pygserver is
+    authoritative for baddy damage/knockback (see BaddyManager.handle_baddy_hurt),
+    so this builds the relay from scratch instead of echoing client input -
+    hurt_dx/hurt_dy are the server-computed knockback direction, normalized to
+    -1.0..1.0 per axis.
+
+    hurtDX/hurtDY use the "midpoint: 64" gchar idiom that packet handler notes:
+    a value of 0 encodes as byte 64+32, +1.0 as 128+32, -1.0 as 0+32 - the
+    write-side mirror of PacketReader.read_gchar_signed() minus 64 on read.
+    """
     builder = PacketBuilder().write_gchar(PLO.BADDYHURT)
     builder.write_gchar(baddy_id)
-    builder.write_gchar(power)
-    builder.write_gchar(int(from_x * 2))
-    builder.write_gchar(int(from_y * 2))
+    builder.write_gchar_signed(int(max(-1.0, min(1.0, hurt_dx)) * 64) + 64)
+    builder.write_gchar_signed(int(max(-1.0, min(1.0, hurt_dy)) * 64) + 64)
+    builder.write_gchar(damage)
     builder.write_newline()
     return builder.build()
 
