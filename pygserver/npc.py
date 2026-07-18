@@ -586,12 +586,23 @@ class NPCManager:
             del self._npcs[npc.id]
 
         if npc.level:
+            # Level.remove_npc() clears npc.level back to None as part of
+            # removal, so grab the name FIRST - reading npc.level.name after
+            # the call (as this used to) always raised AttributeError on a
+            # None, which silently killed this as a background task
+            # (asyncio only logs "Task exception was never retrieved", never
+            # surfaces to a player/admin) before the PLO_NPCDEL broadcast
+            # below ever ran. Every GS1 `destroy;` was hitting this - the
+            # NPC was gone server-side (removed from self._npcs above) but
+            # every connected client kept rendering a ghost at its last
+            # position forever, since they never got told it was deleted.
+            level_name = npc.level.name
             npc.level.remove_npc(npc)
 
             # Notify players on level
             from .protocol.packets import build_npc_del
             packet = build_npc_del(npc.id)
-            await self.server.broadcast_to_level(npc.level.name, packet)
+            await self.server.broadcast_to_level(level_name, packet)
 
     async def warp_npc(self, npc: NPC, level_name: str, x: float, y: float):
         """Warp an NPC to a new location."""
@@ -633,7 +644,20 @@ class NPCManager:
             if npc.check_timer():
                 api = npc.get_api(self)
                 await npc.trigger_event('on_timeout', api)
-                self._fire_gs1(npc, 'timeout')
+                # `timeout` has no triggering player of its own, but GS1
+                # scripts commonly gate it on bare (unprefixed) flags set
+                # earlier by an unrelated NPC (e.g. a beer-quest guard
+                # setting `drunkguard` for a mountain guard's timeout to
+                # read later) - those bare flags live on player.flags
+                # (run_npc_event), so without a player context here they'd
+                # always resolve against a fresh, throwaway dict and never
+                # see what was actually set. GServer-v2 ties exactly this
+                # case to the level leader (scripting-gs1-flags.md isleader:
+                # "can trigger timeout events on NPCs that didn't issue the
+                # timereverywhere command"), so do the same here.
+                from .gs1_host import leader_player_for_level
+                leader = leader_player_for_level(self.server, npc.level)
+                self._fire_gs1(npc, 'timeout', leader)
 
         # Push props for any NPC whose visible state changed this tick so
         # players see movement, animation, chat, and appearance updates live.

@@ -553,8 +553,8 @@ class GS1Host(Host):
         really "lowest id currently on the level" rather than "first to
         join" - the closest available proxy given nothing else records
         join order."""
-        players = self._players_on_level(ctx)
-        return players[0] if players else None
+        lvl = self._level_of(ctx)
+        return leader_player_for_level(self.server, lvl)
 
     def _all_baddies_dead(self, ctx):
         """compsdead (GS1Flags.cpp setLevelFlags: !level->hasLivingBaddies()).
@@ -1420,6 +1420,35 @@ _NOOP_COMMANDS = (
 )
 for _name in _NOOP_COMMANDS:
     _COMMANDS.setdefault(_name, _c_noop)
+
+
+def leader_player_for_level(server, level):
+    """First player on `level` (GS1Flags.cpp isleader / Level::isPlayerLeader),
+    used as the triggering-player context for NPC events that have no
+    natural player of their own - notably `timeout`. GServer-v2 documents
+    exactly this: the level leader "can trigger timeout events on NPCs that
+    didn't issue the timereverywhere command" (scripting-gs1-flags.md), i.e.
+    upstream runs a non-timereverywhere `timeout` in the leader's script
+    context, not player-less. Without a player context here, bare (unprefixed)
+    `set`/`unset` flags - which run_npc_event stores on player.flags - have
+    nowhere to persist and can never be read back by a later event, breaking
+    any quest that sets a flag on the player (e.g. a beer-guard NPC) and
+    later reads it from an unrelated NPC's `timeout` (e.g. a mountain guard
+    that should unblock once `drunkguard` is set).
+
+    Same "lowest id currently on the level" proxy as GS1Host._leader_player -
+    pygserver's Level only tracks a bare id set with no join-order
+    (Level.get_player_ids -> Set[int]), so this is the closest available
+    stand-in for "first to join" given nothing else records join order.
+    Returns None (matching prior behaviour) if the level has no players.
+    """
+    if level is None or server is None or not hasattr(level, "get_player_ids"):
+        return None
+    for pid in level.get_player_ids():
+        p = server.get_player(pid)
+        if p is not None:
+            return p
+    return None
 
 
 # -- script binding / event firing -----------------------------------------

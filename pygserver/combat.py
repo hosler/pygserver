@@ -393,12 +393,30 @@ class CombatManager:
         arrow_id = self._next_arrow_id
         self._next_arrow_id += 1
 
+        # Simulate flight from the server's own tracked player.x/y, NOT the
+        # wire-reported x/y. player.x/y is kept authoritative and always in
+        # the current level's LOCAL 0-63 space by _handle_player_props (every
+        # movement update stores it there, gmap or not - see player.warp()'s
+        # PLO_PLAYERWARP2 use of local coords for gmap segments). The client-
+        # reported x/y, on the other hand, is whatever coordinate frame the
+        # client happens to be using for its own rendering - on a GMAP,
+        # pyReborn's Client.player.x/y are WORLD coordinates (local + grid*64,
+        # unlike Client.move()'s explicit local_x/local_y conversion), so a
+        # PLI_ARROWADD sent while standing on a gmap segment carried e.g.
+        # x=94 for a level whose Level.WIDTH is 64 - the bounds check below
+        # saw that as instantly out-of-map and dropped the arrow before it
+        # ever reached the player-hit check, so PvP arrows always dealt zero
+        # damage on gmap levels (ammo still decremented since that happens
+        # above, unconditionally). Trusting our own authoritative position
+        # instead - matching the "server is authoritative here by design"
+        # policy in _update_arrow's docstring - fixes flight/collision
+        # regardless of what frame the firing client's x/y happens to be in.
         arrow = Arrow(
             id=arrow_id,
             player_id=player.id,
             level_name=player.level.name,
-            x=x,
-            y=y,
+            x=player.x,
+            y=player.y,
             direction=direction
         )
 
