@@ -27,6 +27,19 @@ logger = logging.getLogger(__name__)
 
 APP_VERSION = "pygserver-0.1.0"
 
+# Keep-alive tuning (mirrors GServer-v2 ServerList::doTimedEvents).
+#
+# SVI_PING from the list server is a latency probe, not a "are you there"
+# check: it expects SVO_PING back and times the round trip. That means our
+# existing _handle_ping() reply never originates traffic on its own, and a
+# silently dropped NAT/TCP session (no RST, no FIN) never surfaces as a
+# read() EOF either -- the server just believes it's registered forever and
+# quietly falls off the public list. To catch that, we originate our own
+# keep-alive every PING_INTERVAL seconds and force a reconnect if nothing at
+# all has arrived from the list server in DEAD_CONNECTION_TIMEOUT seconds.
+PING_INTERVAL = 60.0              # seconds between originated keep-alive pings
+DEAD_CONNECTION_TIMEOUT = 300.0   # seconds of silence before forcing a reconnect
+
 
 class ServerListClient:
     """
@@ -49,6 +62,10 @@ class ServerListClient:
         self.connection_attempts = 0
         self.next_connection_attempt = 0.0
         self.max_backoff = 300  # 5 minutes max
+
+        # Keep-alive / dead-connection detection
+        self.last_ping_time = 0.0
+        self.last_data_time = 0.0
 
         # Codec for list server packets (Gen2: zlib compression, no encryption)
         self.codec = Gen2Codec()
@@ -97,6 +114,7 @@ class ServerListClient:
                 # Process incoming packets if connected
                 if self.connected:
                     await self._receive_packets()
+                    await self._check_keepalive()
 
                 # Small delay to prevent busy loop
                 await asyncio.sleep(0.1)
@@ -121,6 +139,12 @@ class ServerListClient:
 
             self.connected = True
             self.connection_attempts = 0
+
+            # Reset keep-alive timers so a fresh connection isn't immediately
+            # flagged as stale and doesn't send its first ping right away.
+            now = time.time()
+            self.last_ping_time = now
+            self.last_data_time = now
 
             # Get local and remote IPs
             sock_info = self.writer.get_extra_info('socket')
@@ -172,6 +196,48 @@ class ServerListClient:
 
         self.next_connection_attempt = time.time() + wait_time
         logger.info(f"Will retry connection in {wait_time} seconds")
+
+    async def _check_keepalive(self):
+        """Originate a keep-alive ping, and detect a dead connection.
+
+        Called once per loop iteration while connected. A connection that's
+        gone silent for DEAD_CONNECTION_TIMEOUT seconds is forced through
+        the normal disconnect/reconnect path rather than left to rot.
+        """
+        if not self.connected:
+            return
+
+        now = time.time()
+
+        if now - self.last_data_time >= DEAD_CONNECTION_TIMEOUT:
+            logger.warning(
+                f"No data from list server in over {DEAD_CONNECTION_TIMEOUT:.0f}s, "
+                "assuming connection is dead and reconnecting"
+            )
+            await self._disconnect()
+            await self._schedule_reconnect()
+            return
+
+        if now - self.last_ping_time >= PING_INTERVAL:
+            await self._send_keepalive_ping()
+            self.last_ping_time = now
+
+    async def _send_keepalive_ping(self):
+        """Send an originated keep-alive packet to the list server.
+
+        We send SVO_SETIP rather than SVO_PING here: SVO_PING is the
+        *response* to the list server's own SVI_PING and is used by it to
+        measure round-trip latency, so sending one unprompted would be
+        misleading. Re-announcing our advertised IP is a safe no-op that
+        still counts as originated traffic, so a silently dropped NAT/TCP
+        session gets caught by our own send failing (or by the dead-connection
+        check above) instead of never being noticed.
+        """
+        packet = PacketBuilder()
+        packet.write_gchar(SVO.SETIP)
+        packet.write_gchar(len(self.config.serverip))
+        packet.write_bytes(self.config.serverip.encode('latin1'))
+        await self._send_packet(packet.build())
 
     async def _send_registration(self, local_ip: str, remote_ip: str):
         """Send initial registration packets to list server."""
@@ -278,6 +344,10 @@ class ServerListClient:
                 await self._disconnect()
                 await self._schedule_reconnect()
                 return
+
+            # Any inbound bytes count as proof the connection is alive, even
+            # before we've reassembled a full packet.
+            self.last_data_time = time.time()
 
             # Debug: Log received data
             logger.debug(f"Received data: {data.hex()} | Length: {len(data)} bytes | ASCII: {data!r}")
