@@ -743,9 +743,10 @@ def encode_sign_text(text: str) -> bytes:
     out = bytearray()
     for line in text.split('\n'):
         for ch in line:
-            idx = _SIGN_ALPHABET.find(ch)
-            if idx == -1 and ch == '#':
-                idx = 86
+            # LevelSign::encodeSignCode always uses code 86 for a literal '#'.
+            # Its earlier alphabet position (67) is reserved by the escape
+            # table and decodes as '#.'.
+            idx = 86 if ch == '#' else _SIGN_ALPHABET.find(ch)
             if idx != -1:
                 out.append((idx + 32) & 0xFF)
         # Encoded newline (alphabet index of '\n').
