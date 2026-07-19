@@ -43,6 +43,10 @@ class RCSession:
     rights: int = 0
     file_browser_path: str = ""
     file_browser_active: bool = False
+    # Chunked RC large-file uploads in flight, keyed by filename (mirrors
+    # GServer-v2 PlayerRC::m_rcLargeFiles, a per-connection map populated by
+    # RC_LARGEFILESTART and flushed on RC_LARGEFILEEND).
+    large_file_uploads: Dict[str, bytearray] = field(default_factory=dict)
 
     def has_right(self, right: PLPERM) -> bool:
         """Check if session has a specific right."""
@@ -381,26 +385,78 @@ class RCManager:
             await session.player.send_raw(packet)
 
     async def _handle_player_props_get3(self, session: RCSession, data: bytes):
-        """Handle RC_PLAYERPROPSGET3 - Get player props by account."""
-        await self._handle_player_props_get(session, data)
+        """Handle RC_PLAYERPROPSGET3 - Get player props by account.
+
+        Wire format (msgPLI_RC_PLAYERPROPSGET3): [GUCHAR-len account name],
+        unlike RC_PLAYERPROPSGET's raw-to-end name - this used to delegate
+        to that handler, which read the leading length byte as part of the
+        name (a leading garbage character on every lookup).
+        """
+        if not session.has_right(PLPERM.VIEWATTRIBUTES):
+            return
+
+        reader = PacketReader(data)
+        player_name = reader.read_gstring()
+
+        player = self.server.get_player_by_name(player_name)
+        if player:
+            props = self._build_player_props(player)
+            packet = build_rc_player_props(player.account_name, props)
+            await session.player.send_raw(packet)
 
     async def _handle_player_props_set(self, session: RCSession, data: bytes):
-        """Handle RC_PLAYERPROPSSET - Set player properties."""
+        """Handle RC_PLAYERPROPSSET - Set player properties.
+
+        Wire format (PlayerRCPackets.cpp msgPLI_RC_PLAYERPROPSSET):
+        [GUSHORT player id][prop stream: world/props/flags/chests/weapons -
+        see Player::setPropsFromRCPacket]. Applying the prop stream is not
+        implemented here (stub), so it is left unparsed - only the leading
+        id is read, to identify the target and to stop this handler from
+        misreading the id as a length-prefixed name (the previous
+        `read_string()` call had no length argument and always raised).
+
+        NOTE: if the prop stream is ever applied here, any CURLEVEL change
+        must route through player.warp() rather than mutating position
+        directly - GServer-v2 always re-warps at the end of
+        setPropsFromRCPacket (commit 36f409da) so the client's level state
+        stays in sync.
+        """
         if not session.has_right(PLPERM.SETATTRIBUTES):
             return
 
         reader = PacketReader(data)
-        player_name = reader.read_string()
-        # Parse props from remaining data
-        # Apply to player
+        player_id = reader.read_gshort()
+        # Remainder is the prop stream (world/props/flags/chests/weapons) -
+        # not applied; see docstring.
+
+        player = self.server.get_player(player_id)
+        target_name = player.account_name if player else str(player_id)
+
+        await self._broadcast_rc_message(
+            f"{session.player.account_name} modified props for {target_name}"
+        )
+
+    async def _handle_player_props_set2(self, session: RCSession, data: bytes):
+        """Handle RC_PLAYERPROPSSET2 - Set player properties by account name.
+
+        Wire format (msgPLI_RC_PLAYERPROPSSET2): [GUCHAR-len account
+        name][prop stream] - unlike RC_PLAYERPROPSSET's GUSHORT player id,
+        so this does NOT simply delegate to _handle_player_props_set (that
+        would misread the name's length byte as the high byte of an id).
+        Same stub caveat as _handle_player_props_set applies to the prop
+        stream.
+        """
+        if not session.has_right(PLPERM.SETATTRIBUTES):
+            return
+
+        reader = PacketReader(data)
+        player_name = reader.read_gstring()
+        # Remainder is the prop stream (world/props/flags/chests/weapons) -
+        # not applied; see _handle_player_props_set docstring.
 
         await self._broadcast_rc_message(
             f"{session.player.account_name} modified props for {player_name}"
         )
-
-    async def _handle_player_props_set2(self, session: RCSession, data: bytes):
-        """Handle RC_PLAYERPROPSSET2 - Set player properties (alt)."""
-        await self._handle_player_props_set(session, data)
 
     async def _handle_player_props_reset(self, session: RCSession, data: bytes):
         """Handle RC_PLAYERPROPSRESET - Reset player properties."""
@@ -444,13 +500,14 @@ class RCManager:
             return
 
         reader = PacketReader(data)
-        player_name = reader.remaining().decode('latin-1', errors='replace')
+        player_id = reader.read_gshort()
+        reason = reader.remaining().decode('latin-1', errors='replace')
 
-        player = self.server.get_player_by_name(player_name)
+        player = self.server.get_player(player_id)
         if player:
-            await player.disconnect()
+            await player.disconnect(reason)
             await self._broadcast_rc_message(
-                f"{session.player.account_name} disconnected {player_name}"
+                f"{session.player.account_name} disconnected {player.account_name}"
             )
 
     async def _handle_warp_player(self, session: RCSession, data: bytes):
@@ -459,16 +516,18 @@ class RCManager:
             return
 
         reader = PacketReader(data)
-        player_name = reader.read_string()
-        x = reader.read_gchar() / 2.0
-        y = reader.read_gchar() / 2.0
+        player_id = reader.read_gshort()
+        # Half-tile units, signed (knockback-style GCHAR, not clamped to 0 -
+        # a warp north/west of the origin needs negative values).
+        x = reader.read_gchar_signed() / 2.0
+        y = reader.read_gchar_signed() / 2.0
         level_name = reader.remaining().decode('latin-1', errors='replace')
 
-        player = self.server.get_player_by_name(player_name)
+        player = self.server.get_player(player_id)
         if player:
             await player.warp(level_name, x, y)
             await self._broadcast_rc_message(
-                f"{session.player.account_name} warped {player_name} to {level_name}"
+                f"{session.player.account_name} warped {player.account_name} to {level_name}"
             )
 
     # =========================================================================
@@ -499,8 +558,13 @@ class RCManager:
             return
 
         reader = PacketReader(data)
-        player_name = reader.read_string()
+        player_name = reader.read_gstring()
         rights = reader.read_gint5()
+        # admin_ip/folders are parsed to consume the packet correctly but
+        # not applied yet - only adminRights is wired up below, matching
+        # this handler's prior scope.
+        admin_ip = reader.read_gstring()
+        folders = reader.read_gstring_short()
 
         if hasattr(self.server, 'account_manager'):
             account = self.server.account_manager.get_account(player_name)
@@ -539,7 +603,7 @@ class RCManager:
             return
 
         reader = PacketReader(data)
-        player_name = reader.read_string()
+        player_name = reader.read_gstring()
         comments = reader.remaining().decode('latin-1', errors='replace')
 
         if hasattr(self.server, 'account_manager'):
@@ -573,7 +637,7 @@ class RCManager:
             return
 
         reader = PacketReader(data)
-        player_name = reader.read_string()
+        player_name = reader.read_gstring()
         is_banned = reader.read_gchar() != 0
         ban_reason = reader.remaining().decode('latin-1', errors='replace')
 
@@ -616,14 +680,17 @@ class RCManager:
         if not session.has_right(PLPERM.SETATTRIBUTES):
             return
 
+        # Wire format (msgPLI_RC_SERVERFLAGSSET): [GUSHORT count] then
+        # count x [GUCHAR len][chars] "name=value" pairs - not a
+        # newline-delimited blob.
         reader = PacketReader(data)
-        flags_str = reader.remaining().decode('latin-1', errors='replace')
+        count = reader.read_gshort()
 
-        # Parse flags
         if hasattr(self.server, 'server_flags'):
-            for line in flags_str.split('\n'):
-                if '=' in line:
-                    key, value = line.split('=', 1)
+            for _ in range(count):
+                pair = reader.read_gstring()
+                if '=' in pair:
+                    key, value = pair.split('=', 1)
                     self.server.server_flags[key.strip()] = value.strip()
 
         await self._broadcast_rc_message(
@@ -639,9 +706,16 @@ class RCManager:
         if not session.has_right(PLPERM.SETATTRIBUTES):
             return
 
+        # Wire format (msgPLI_RC_ACCOUNTADD): [GUCHAR-len account][GUCHAR-len
+        # password][GUCHAR-len email][GUCHAR banned][GUCHAR onlyLoad]
+        # [GUCHAR adminlevel, deprecated].
         reader = PacketReader(data)
-        account_name = reader.read_string()
-        password = reader.remaining().decode('latin-1', errors='replace')
+        account_name = reader.read_gstring()
+        password = reader.read_gstring()
+        email = reader.read_gstring()
+        banned = reader.read_gchar() != 0
+        only_load = reader.read_gchar() != 0
+        reader.read_gchar()  # admin level, deprecated
 
         if hasattr(self.server, 'account_manager'):
             self.server.account_manager.create_account(account_name, password)
@@ -703,9 +777,21 @@ class RCManager:
         if not session.has_right(PLPERM.SETATTRIBUTES):
             return
 
+        # Wire format (msgPLI_RC_ACCOUNTSET): [GUCHAR-len account][GUCHAR-len
+        # password][GUCHAR-len email][GUCHAR banned][GUCHAR loadOnly]
+        # [GUCHAR adminlevel, deprecated][GUCHAR-len world][GUCHAR-len
+        # banreason]. Applying these fields is not implemented (stub); only
+        # parsed here so the packet doesn't desync/crash.
         reader = PacketReader(data)
-        account_name = reader.read_string()
-        # Parse and apply account changes
+        account_name = reader.read_gstring()
+        password = reader.read_gstring()
+        email = reader.read_gstring()
+        banned = reader.read_gchar() != 0
+        load_only = reader.read_gchar() != 0
+        reader.read_gchar()  # admin level, deprecated
+        world = reader.read_gstring()
+        ban_reason = reader.read_gstring()
+
         logger.info(f"Account {account_name} modified by {session.player.account_name}")
 
     # =========================================================================
@@ -749,10 +835,10 @@ class RCManager:
             return
 
         reader = PacketReader(data)
-        player_name = reader.read_string()
+        player_id = reader.read_gshort()
         message = reader.remaining().decode('latin-1', errors='replace')
 
-        player = self.server.get_player_by_name(player_name)
+        player = self.server.get_player(player_id)
         if player:
             from .protocol.packets import build_admin_message
             packet = build_admin_message(message)
@@ -874,11 +960,16 @@ class RCManager:
         if not session.has_right(PLPERM.SETATTRIBUTES):
             return
 
+        # Wire format (msgPLI_RC_FILEBROWSER_MOVE): [GUCHAR-len destination
+        # dir][filename to end] - the filename is moved from the RC's
+        # current folder into the given destination dir.
         reader = PacketReader(data)
-        src = reader.read_string()
-        dst = reader.remaining().decode('latin-1', errors='replace')
+        dest_dir = reader.read_gstring()
+        filename = reader.remaining().decode('latin-1', errors='replace')
 
         if hasattr(self.server, 'filesystem'):
+            src = session.file_browser_path + "/" + filename if session.file_browser_path else filename
+            dst = dest_dir + "/" + filename if dest_dir else filename
             self.server.filesystem.move_file(src, dst)
             await self._send_directory_listing(session)
 
@@ -900,9 +991,12 @@ class RCManager:
         if not session.has_right(PLPERM.SETATTRIBUTES):
             return
 
+        # Wire format (msgPLI_RC_FILEBROWSER_RENAME): [GUCHAR-len old
+        # name][GUCHAR-len new name] - new_name is also length-prefixed,
+        # not the rest of the packet.
         reader = PacketReader(data)
-        old_name = reader.read_string()
-        new_name = reader.remaining().decode('latin-1', errors='replace')
+        old_name = reader.read_gstring()
+        new_name = reader.read_gstring()
 
         if hasattr(self.server, 'filesystem'):
             old_path = session.file_browser_path + "/" + old_name if session.file_browser_path else old_name
@@ -938,24 +1032,46 @@ class RCManager:
     # =========================================================================
 
     async def _handle_large_file_start(self, session: RCSession, data: bytes):
-        """Handle RC_LARGEFILESTART - Start large file upload."""
+        """Handle RC_LARGEFILESTART - Start a chunked large-file upload.
+
+        Wire format (msgPLI_RC_LARGEFILESTART): [filename = rest of
+        packet] - there is no size field on the wire (GServer-v2 just keys
+        an empty CString buffer by filename; bytes stream in afterward via
+        RC_FILEBROWSER_UP chunks and get flushed on RC_LARGEFILEEND).
+        """
         if not session.has_right(PLPERM.SETATTRIBUTES):
             return
 
         reader = PacketReader(data)
-        file_size = reader.read_gint5()
         filename = reader.remaining().decode('latin-1', errors='replace')
 
-        logger.info(f"Large file upload started: {filename} ({file_size} bytes)")
-        # Store state for receiving file data
+        session.large_file_uploads[filename] = bytearray()
+        logger.info(f"Large file upload started: {filename}")
 
     async def _handle_large_file_end(self, session: RCSession, data: bytes):
-        """Handle RC_LARGEFILEEND - End large file upload."""
+        """Handle RC_LARGEFILEEND - Finish a chunked large-file upload.
+
+        Wire format (msgPLI_RC_LARGEFILEEND): [filename = rest of packet] -
+        the filename that keys the buffered upload started by
+        RC_LARGEFILESTART. Previously this never read it, so the buffered
+        upload could never be matched up and finalized.
+        """
         if not session.has_right(PLPERM.SETATTRIBUTES):
             return
 
-        logger.info("Large file upload completed")
-        # Finalize file
+        reader = PacketReader(data)
+        filename = reader.remaining().decode('latin-1', errors='replace')
+
+        buf = session.large_file_uploads.pop(filename, None)
+        if buf is None:
+            logger.warning(f"Large file upload ended for unknown file: {filename}")
+            return
+
+        if hasattr(self.server, 'filesystem'):
+            path = session.file_browser_path + "/" + filename if session.file_browser_path else filename
+            self.server.filesystem.write_file(path, bytes(buf))
+
+        logger.info(f"Large file upload completed: {filename} ({len(buf)} bytes)")
 
     # =========================================================================
     # Utility Methods
