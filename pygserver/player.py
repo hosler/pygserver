@@ -12,7 +12,7 @@ import time
 from typing import TYPE_CHECKING, Optional, Dict, Any, List, Set
 
 from .protocol.codec import ServerCodec, PacketBuffer
-from .protocol.constants import PLI, PLO, PLPROP, PLTYPE, PLPERM
+from .protocol.constants import PLI, PLO, PLPROP, PLTYPE, PLPERM, BDPROP, BDMODE
 from .protocol.packets import (
     PacketReader,
     PacketBuilder,
@@ -31,6 +31,8 @@ from .protocol.packets import (
     build_level_name,
     build_raw_data_announcement,
     build_private_message,
+    build_baddy_props,
+    build_is_leader,
     build_flag_set,
     build_flag_del,
 )
@@ -268,6 +270,11 @@ class Player:
             if getattr(self.server, 'npc_manager', None):
                 await self.server.npc_manager.on_player_leaves(self, self.level)
             self.level.remove_player(self)
+            if (not self.server.world.get_gmap_for_level(self.level.name)
+                    and self.level.get_leader_id() is not None):
+                new_leader = self.server.get_player(self.level.get_leader_id())
+                if new_leader:
+                    await new_leader.send_raw(build_is_leader())
 
         # Dismount horse if mounted
         if hasattr(self.server, 'horse_manager'):
@@ -839,7 +846,8 @@ class Player:
         if hasattr(self.server, 'item_manager'):
             from .protocol.constants import LevelItemType
             await self.server.item_manager.spawn_item(
-                self.level, x, y, LevelItemType(item_type)
+                self.level, x, y, LevelItemType(item_type),
+                exclude_player_id=self.id,
             )
 
     async def _handle_item_del(self, data: bytes):
@@ -921,8 +929,46 @@ class Player:
 
     async def _handle_baddy_props(self, data: bytes):
         """Handle PLI_BADDYPROPS packet."""
-        # Client updating baddy props (usually from server-controlled baddies)
-        pass
+        if not self.level or not self.level.is_player_leader(self):
+            return
+
+        reader = PacketReader(data)
+        baddy_id = reader.read_gchar()
+        props = {}
+        while reader.has_data():
+            prop_id = reader.read_gchar()
+            if prop_id == BDPROP.ID:
+                props[prop_id] = reader.read_gchar()
+            elif prop_id in (BDPROP.X, BDPROP.Y):
+                props[prop_id] = reader.read_gchar() / 2.0
+            elif prop_id == BDPROP.TYPE:
+                props[prop_id] = reader.read_gchar()
+            elif prop_id == BDPROP.POWERIMAGE:
+                props[prop_id] = (reader.read_gchar(), reader.read_gstring())
+            elif prop_id == BDPROP.MODE:
+                props[prop_id] = reader.read_gchar()
+            elif prop_id in (BDPROP.ANI, BDPROP.DIR):
+                props[prop_id] = reader.read_gchar()
+            elif prop_id in (BDPROP.VERSESIGHT, BDPROP.VERSEHURT,
+                              BDPROP.VERSEATTACK):
+                props[prop_id] = reader.read_gstring()
+            else:
+                break
+
+        manager = getattr(self.server, 'baddy_manager', None)
+        baddy = manager.get_baddy(self.level.name, baddy_id) if manager else None
+        if not baddy:
+            return
+
+        if BDPROP.POWERIMAGE in props:
+            baddy.health = props[BDPROP.POWERIMAGE][0]
+        if props.get(BDPROP.MODE) == BDMODE.DEAD:
+            await manager.handle_baddy_death(baddy, self, exclude={self.id})
+        else:
+            await self.server.broadcast_to_level(
+                self.level.name, build_baddy_props(baddy_id, props),
+                exclude={self.id},
+            )
 
     async def _handle_baddy_hurt(self, data: bytes):
         """Handle PLI_BADDYHURT packet.
@@ -1060,11 +1106,14 @@ class Player:
         count = reader.read_gshort()
         target_ids = [reader.read_gshort() for _ in range(count)]
         message = reader.remaining().decode('latin-1', errors='replace')
+        is_mass = len(target_ids) > 1
 
         for target_id in target_ids:
             target = self.server.get_player(target_id)
             if target:
-                packet = build_private_message(self.id, self.nickname, message)
+                packet = build_private_message(
+                    self.id, self.nickname, message, is_mass=is_mass
+                )
                 await target.send_raw(packet)
 
     async def _handle_show_img(self, data: bytes):
@@ -1088,9 +1137,16 @@ class Player:
         """Handle PLI_FLAGSET packet."""
         reader = PacketReader(data)
         flag_data = reader.remaining().decode('latin-1', errors='replace')
-        if '=' in flag_data:
-            name, value = flag_data.split('=', 1)
-            self.flags[name.strip()] = value.strip()
+        if '=' not in flag_data:
+            self.flags[flag_data.strip()] = True
+            return
+        name, value = flag_data.split('=', 1)
+        name = name.strip()
+        value = value.strip()
+        if value:
+            self.flags[name] = value
+        else:
+            self.flags.pop(name, None)
 
     async def _handle_flag_del(self, data: bytes):
         """Handle PLI_FLAGDEL packet."""
@@ -1449,6 +1505,11 @@ class Player:
         # warped to.
         if old_level:
             old_level.remove_player(self)
+            if (not self.server.world.get_gmap_for_level(old_level.name)
+                    and old_level.get_leader_id() is not None):
+                new_leader = self.server.get_player(old_level.get_leader_id())
+                if new_leader:
+                    await new_leader.send_raw(build_is_leader())
         self.x = x
         self.y = y
         self.level = level
@@ -1539,6 +1600,9 @@ class Player:
         # Send horses on level
         if hasattr(self.server, 'horse_manager'):
             await self.server.horse_manager.send_level_horses(self, level)
+
+        if level.is_player_leader(self) or gmap_info:
+            await self.send_raw(build_is_leader())
 
         # Send other players on level
         for other_id in level.get_player_ids():

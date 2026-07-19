@@ -1081,15 +1081,27 @@ def build_hide_npcs(hide: bool) -> bytes:
 # Communication Packets
 # =============================================================================
 
-def build_private_message(from_id: int, sender_name: str, message: str) -> bytes:
+def build_private_message(from_id: int, sender_name: str, message: str,
+                          is_mass: bool = False) -> bytes:
     """Build PLO_PRIVATEMESSAGE packet.
 
-    Format (GServer-v2 Player.cpp:1037): [gshort from_id][raw typed message],
-    where the body is `"<sender>","Private message:",<message>`. The client
-    (parse_private_message) reads the leading short as the sender id, then splits
-    the comma-quoted body into type + message.
+    Format (GServer-v2 Player.cpp sendPrivateMessage): [gshort from_id][body],
+    where the body is the constructed message "#b{label}:#b{msg}" (newlines
+    and literal "#b" both act as line breaks) split into lines and re-joined
+    with toCSV(force_quoted=True) - every line becomes a comma-separated
+    quoted field with '"' and '\\' doubled. The client strips the first line,
+    so the body always leads with an empty quoted field:
+
+        '"","Private message:","line1","line2"'
+
+    The sender is identified by from_id only; sender_name is not on the wire.
     """
-    body = f'"{sender_name}","Private message:",{message}'
+    label = "Mass message:" if is_mass else "Private message:"
+    lines = ['', label] + message.replace('\n', '#b').split('#b')
+    body = ','.join(
+        '"' + line.replace('\\', '\\\\').replace('"', '""') + '"'
+        for line in lines
+    )
     builder = PacketBuilder().write_gchar(PLO.PRIVATEMESSAGE)
     builder.write_gshort(from_id)
     builder.write_string(body)
@@ -1416,10 +1428,9 @@ def build_fullstop() -> bytes:
     return builder.build()
 
 
-def build_is_leader(is_leader: bool) -> bytes:
-    """Build PLO_ISLEADER packet (guild leader status)."""
+def build_is_leader() -> bytes:
+    """Build the valueless PLO_ISLEADER packet."""
     builder = PacketBuilder().write_gchar(PLO.ISLEADER)
-    builder.write_gchar(1 if is_leader else 0)
     builder.write_newline()
     return builder.build()
 

@@ -6,7 +6,7 @@ tiles, NPCs, items, signs, and links.
 """
 
 import logging
-from typing import TYPE_CHECKING, Optional, List, Set, Dict, Tuple
+from typing import TYPE_CHECKING, Optional, List, Dict, Tuple
 from pathlib import Path
 
 if TYPE_CHECKING:
@@ -53,8 +53,15 @@ class Level:
         # Tile data (64x64 = 4096 tiles, 2 bytes each)
         self._tiles = bytearray(self.BOARD_SIZE)
 
-        # Players on this level
-        self._players: Set[int] = set()
+        # Players on this level, insertion-ordered (dict[id, None] as an
+        # ordered set) so the first key is always the current level leader -
+        # GServer-v2's Level::getPlayers() is a std::vector, and
+        # isPlayerLeader()/PLO_ISLEADER rely on "first to join, still
+        # present" (see add_player/remove_player/is_player_leader below). A
+        # plain Set had no join order, so leader assignment could only ever
+        # guess at "lowest id currently on the level" (see the now-stale
+        # caveat this replaces in gs1_host.leader_player_for_level).
+        self._players: Dict[int, None] = {}
 
         # NPCs on this level
         self._npcs: Dict[int, 'NPC'] = {}
@@ -290,15 +297,27 @@ class Level:
 
     def add_player(self, player: 'Player'):
         """Add a player to this level."""
-        self._players.add(player.id)
+        self._players[player.id] = None
 
     def remove_player(self, player: 'Player'):
         """Remove a player from this level."""
-        self._players.discard(player.id)
+        self._players.pop(player.id, None)
 
-    def get_player_ids(self) -> Set[int]:
-        """Get IDs of players on this level."""
-        return self._players.copy()
+    def get_player_ids(self) -> List[int]:
+        """Get IDs of players on this level, in join order (first = leader)."""
+        return list(self._players.keys())
+
+    def get_leader_id(self) -> Optional[int]:
+        """ID of this level's leader (the first player who joined and is
+        still present), or None if the level is empty. GServer-v2
+        Level::getPlayers().front() / Level::isPlayerLeader."""
+        return next(iter(self._players), None)
+
+    def is_player_leader(self, player: 'Player') -> bool:
+        """True if `player` is this level's leader. Backs PLO_ISLEADER
+        assignment/handoff (Player._send_level, Player.warp, Player._cleanup)
+        and gates leader-only packets like PLI_BADDYPROPS."""
+        return self.get_leader_id() == player.id
 
     def add_npc(self, npc: 'NPC'):
         """Add an NPC to this level."""

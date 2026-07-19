@@ -175,7 +175,8 @@ class ItemManager:
 
     async def spawn_item(self, level: 'Level', x: float, y: float,
                          item_type: LevelItemType,
-                         despawn_time: Optional[float] = None) -> Optional[LevelItem]:
+                         despawn_time: Optional[float] = None,
+                         exclude_player_id: Optional[int] = None) -> Optional[LevelItem]:
         """
         Spawn an item on a level.
 
@@ -217,7 +218,8 @@ class ItemManager:
 
         # Broadcast to level
         packet = build_item_add(x, y, item_type.value)
-        await self.server.broadcast_to_level(level_name, packet)
+        exclude = {exclude_player_id} if exclude_player_id is not None else None
+        await self.server.broadcast_to_level(level_name, packet, exclude=exclude)
 
         logger.debug(f"Spawned {item_type.name} at ({x}, {y}) on {level_name}")
         return item

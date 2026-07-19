@@ -548,11 +548,9 @@ class GS1Host(Host):
 
     def _leader_player(self, ctx):
         """First player on the script's level (GS1Flags.cpp isleader /
-        Level::isPlayerLeader). pygserver's Level only tracks a bare id set
-        with no join-order (Level.get_player_ids -> Set[int]), so this is
-        really "lowest id currently on the level" rather than "first to
-        join" - the closest available proxy given nothing else records
-        join order."""
+        Level::isPlayerLeader). Level._players is insertion-ordered, so this
+        is genuinely "first to join and still present" (same player PLO_
+        ISLEADER is sent to), not just a lowest-id proxy."""
         lvl = self._level_of(ctx)
         return leader_player_for_level(self.server, lvl)
 
@@ -1439,11 +1437,10 @@ def leader_player_for_level(server, level):
     later reads it from an unrelated NPC's `timeout` (e.g. a mountain guard
     that should unblock once `drunkguard` is set).
 
-    Same "lowest id currently on the level" proxy as GS1Host._leader_player -
-    pygserver's Level only tracks a bare id set with no join-order
-    (Level.get_player_ids -> Set[int]), so this is the closest available
-    stand-in for "first to join" given nothing else records join order.
-    Returns None (matching prior behaviour) if the level has no players.
+    Same "first player" lookup as GS1Host._leader_player - Level._players is
+    insertion-ordered, so iterating level.get_player_ids() genuinely yields
+    join order. Returns None (matching prior behaviour) if the level has no
+    players.
     """
     if level is None or server is None or not hasattr(level, "get_player_ids"):
         return None

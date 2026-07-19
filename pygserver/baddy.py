@@ -520,7 +520,8 @@ class BaddyManager:
         if baddy.health <= 0:
             await self.handle_baddy_death(baddy, player)
 
-    async def handle_baddy_death(self, baddy: Baddy, killer: Optional['Player'] = None):
+    async def handle_baddy_death(self, baddy: Baddy, killer: Optional['Player'] = None,
+                                 exclude: Optional[set] = None):
         """
         Handle baddy death.
 
@@ -533,7 +534,10 @@ class BaddyManager:
         baddy.mode = BDMODE.DEAD
 
         # Broadcast death
-        await self._broadcast_baddy_props(baddy)
+        packet = baddy.build_props_packet()
+        await self.server.broadcast_to_level(
+            baddy.level_name, packet, exclude=exclude
+        )
 
         # Spawn drop
         level = self.server.world.get_level(baddy.level_name)
