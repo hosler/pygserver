@@ -73,8 +73,10 @@ ITEM_EFFECTS = {
     LevelItemType.HEART: ('hearts', 1),
     LevelItemType.DARTS: ('arrows', 5),  # DARTS = arrows in protocol
     LevelItemType.BOMBS: ('bombs', 5),
-    LevelItemType.GLOVE1: ('glove_power', 1),
-    LevelItemType.GLOVE2: ('glove_power', 2),
+    # Player GLOVEPOWER is 2/3 for glove1/glove2. NPCs use the distinct 1/2
+    # scale; this table applies only to player level-item pickup.
+    LevelItemType.GLOVE1: ('glove_power', 2),
+    LevelItemType.GLOVE2: ('glove_power', 3),
     LevelItemType.FULLHEART: ('max_hearts', 1),
     LevelItemType.SUPERBOMB: ('bombs', 10),
     LevelItemType.SPINATTACK: ('spin_attack', True),

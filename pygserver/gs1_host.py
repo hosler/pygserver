@@ -91,7 +91,8 @@ PLAYER_ATTR = {
 NPC_ATTR = {
     "x": "x", "y": "y", "dir": "direction", "nick": "nickname",
     "hearts": "hearts", "rupees": "rupees", "arrows": "arrows",
-    "bombs": "bombs", "image": "image", "ani": "gani",
+    "bombs": "bombs", "glovepower": "glove_power",
+    "image": "image", "ani": "gani",
 }
 
 # setcharprop / setplayerprop message codes -> target. Mirrors the C++
@@ -205,8 +206,25 @@ class GS1Host(Host):
             # (GS1Commands.cpp:3138 sets this on tokenize; mirrors the
             # client host's implementation in pyreborn.gs1_client)
             return float(len(getattr(ctx, "tokenize_tokens", []) or []))
+        if name == "timevar2":
+            # Serverside timevar2 is the Unix timestamp (seconds).
+            return float(int(time.time()))
+        if name == "playerfreezetime":
+            if player is None or not getattr(player, "is_frozen", False):
+                return -1.0
+            deadline = getattr(player, "_gs1_freeze_until", None)
+            if deadline is None:  # freezeplayer2 has no timed expiry.
+                return 0.0
+            remaining = max(0.0, deadline - time.monotonic())
+            if remaining == 0.0:
+                player.is_frozen = False
+                player._gs1_freeze_until = None
+                return -1.0
+            return remaining
         if name in PLAYER_ATTR and player is not None:
-            return self._coerce(getattr(player, PLAYER_ATTR[name], 0))
+            value = getattr(player, PLAYER_ATTR[name], 0)
+            # The player wire/state scale is 0/2/3; NPC glove power is 0/1/2.
+            return self._coerce(value)
         if name == "playerlevel" and player is not None:
             lvl = getattr(player, "level", None)
             return getattr(lvl, "name", "") if lvl else ""
@@ -1445,6 +1463,9 @@ def _c_freezeplayer(self, a, npc, player, ctx):
         return
     try:
         player.is_frozen = True
+        player._gs1_freeze_until = (
+            time.monotonic() + max(0.0, to_num(a[0])) if a else None
+        )
     except Exception:
         pass
     if hasattr(player, "send_raw"):
@@ -1459,6 +1480,7 @@ def _c_unfreezeplayer(self, a, npc, player, ctx):
         return
     try:
         player.is_frozen = False
+        player._gs1_freeze_until = None
     except Exception:
         pass
     if hasattr(player, "send_raw"):
@@ -1484,6 +1506,12 @@ def _schedule(coro):
         asyncio.get_running_loop().create_task(coro)
         return True
     except RuntimeError:
+        # Callers construct the coroutine before asking us to schedule it.
+        # Close it when invoked from a synchronous unit context so it does
+        # not leak a never-awaited coroutine warning.
+        close = getattr(coro, "close", None)
+        if close is not None:
+            close()
         return False
 
 
@@ -1532,6 +1560,87 @@ def _c_noop(self, a, npc, player, ctx):
     pass
 
 
+def _showimg_index(args):
+    return math.floor(to_num(args[0])) if args else -1
+
+
+def _broadcast_showimgs(host, npc, images, *, reset=False):
+    if host.server is None or npc is None or getattr(npc, "level", None) is None:
+        return
+    from .protocol.packets import build_npc_showimgs
+    packet = build_npc_showimgs(npc.id, images, reset=reset)
+    _schedule(host.server.broadcast_to_level(npc.level.name, packet))
+
+
+def _c_showimg(self, a, npc, player, ctx):
+    if npc is None or len(a) < 4:
+        return
+    index = _showimg_index(a)
+    if not 0 <= index <= 199:
+        return
+    props = {0: to_str(a[1]), 1: int(to_num(a[2]) * 2),
+             2: int(to_num(a[3]) * 2)}
+    if len(a) >= 5:
+        z = int(to_num(a[4]))
+        if z != 0:
+            props[7] = z
+    npc.showimgs[index] = props
+    npc._had_showimgs = True
+    _broadcast_showimgs(self, npc, {index: props})
+
+
+def _c_hideimg(self, a, npc, player, ctx):
+    if npc is None or not a:
+        return
+    index = _showimg_index(a)
+    if not 0 <= index <= 199:
+        return
+    end = math.floor(to_num(a[1])) if len(a) > 1 else index
+    for layer in range(index, min(end, 199) + 1):
+        npc.showimgs.pop(layer, None)
+    npc._had_showimgs = True
+    _broadcast_showimgs(self, npc, npc.showimgs, reset=True)
+
+
+def _change_showimg(self, a, npc, prop_id, value):
+    if npc is None or not a:
+        return
+    index = _showimg_index(a)
+    if not 0 <= index <= 199 or index not in npc.showimgs:
+        return
+    npc.showimgs[index][prop_id] = value
+    _broadcast_showimgs(self, npc, {index: {prop_id: value}})
+
+
+def _c_changeimgvis(self, a, npc, player, ctx):
+    if len(a) >= 2:
+        _change_showimg(self, a, npc, 3, int(to_num(a[1])) & 0xff)
+
+
+def _c_changeimgpart(self, a, npc, player, ctx):
+    if len(a) >= 5:
+        value = (int(to_num(a[1])) & 0xffff, int(to_num(a[2])) & 0xffff,
+                 int(to_num(a[3])) & 0xff, int(to_num(a[4])) & 0xff)
+        _change_showimg(self, a, npc, 4, value)
+
+
+def _c_changeimgcolors(self, a, npc, player, ctx):
+    if len(a) >= 5:
+        value = tuple(int(max(0.0, min(1.0, to_num(v))) * 200) for v in a[1:5])
+        _change_showimg(self, a, npc, 5, value)
+
+
+def _c_changeimgzoom(self, a, npc, player, ctx):
+    if len(a) >= 2:
+        value = int(max(0.0, min(22.0, to_num(a[1]))) * 10)
+        _change_showimg(self, a, npc, 6, value)
+
+
+def _c_changeimgmode(self, a, npc, player, ctx):
+    if len(a) >= 2:
+        _change_showimg(self, a, npc, 8, int(to_num(a[1])) & 0xff)
+
+
 _COMMANDS = {
     "setimg": _c_setimg, "setgif": _c_setimg, "seticon": _c_noop,
     "setimgpart": _c_setimgpart,
@@ -1574,6 +1683,11 @@ _COMMANDS = {
     "hitnpc": _c_hitnpc, "hitcompu": _c_hitcompu,
     "sendtorc": _c_sendtorc,
     "setshape": _c_setshape,
+    "showimg": _c_showimg, "showimg2": _c_showimg,
+    "hideimg": _c_hideimg, "hideimgs": _c_hideimg,
+    "changeimgvis": _c_changeimgvis, "changeimgpart": _c_changeimgpart,
+    "changeimgcolors": _c_changeimgcolors, "changeimgzoom": _c_changeimgzoom,
+    "changeimgmode": _c_changeimgmode,
 }
 
 # Client-side visual / sound / timing commands. pygserver runs GS1 server-side
@@ -1589,8 +1703,8 @@ _NOOP_COMMANDS = (
     "timereverywhere", "drawunderplayer", "drawoverplayer",
     "drawaslight", "drawovertrees", "dontblock", "blockagain",
     "dontblocklocal", "blockagainlocal",
-    "showimg", "hideimg", "showimg2", "changeimgvis", "changeimgpart",
-    "changeimgcolors", "changeimgzoom", "setimgvis", "putleaps",
+    # setimgvis is client-only; the server-owned equivalent is changeimgvis.
+    "setimgvis", "putleaps",
     "setbackpal", "setletters", "setmap", "setminimap",
     "showtext", "showtext2", "showstats", "replaceani",
     "setfocus", "centermap", "putcomp", "putnewcomp", "removecompus",

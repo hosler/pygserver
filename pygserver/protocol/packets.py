@@ -1148,6 +1148,45 @@ def build_show_img(code: int, x: float, y: float, image: str) -> bytes:
     return builder.build()
 
 
+# PLO_SHOWIMGNPC is absent from the shared beta4 enum, but is packet 166 in
+# the reference server's gs2lib IEnums.h. It is distinct from PLO_SHOWIMG (32),
+# which carries player-originated images/legacy level chat.
+PLO_SHOWIMGNPC = 166
+
+
+def _write_showimg_prop(builder: PacketBuilder, prop_id: int, value) -> None:
+    builder.write_gchar(prop_id)
+    if prop_id == 0:  # image: GSTRING
+        builder.write_gstring(str(value))
+    elif prop_id in (1, 2, 3, 6, 8):  # x, y, layer, zoom, draw mode
+        builder.write_gchar(int(value))
+    elif prop_id == 4:  # enabled byte, then GSHORT x/y and GCHAR width/height
+        x, y, width, height = value
+        if width == 0 and height == 0:
+            builder.write_gchar(0)
+        else:
+            builder.write_gchar(1).write_gshort(x).write_gshort(y)
+            builder.write_gchar(width).write_gchar(height)
+    elif prop_id == 5:  # RGBA, each 0..200
+        for component in value:
+            builder.write_gchar(component)
+    elif prop_id == 7:  # z tile coordinate, biased by 50
+        builder.write_gchar(max(-50, min(170, int(value))) + 50)
+
+
+def build_npc_showimgs(npc_id: int, images: dict, *, reset: bool = False) -> bytes:
+    """Build packet 166 with one or more indexed NPC showimg records."""
+    builder = PacketBuilder().write_gchar(PLO_SHOWIMGNPC).write_gint3(npc_id)
+    if reset:
+        builder.write_gchar(9)
+    for index, props in sorted(images.items()):
+        builder.write_gchar(index + 10)
+        for prop_id, value in sorted(props.items()):
+            _write_showimg_prop(builder, prop_id, value)
+    builder.write_newline()
+    return builder.build()
+
+
 def build_admin_message(message: str) -> bytes:
     """Build PLO_RC_ADMINMESSAGE packet."""
     builder = PacketBuilder().write_gchar(PLO.RC_ADMINMESSAGE)

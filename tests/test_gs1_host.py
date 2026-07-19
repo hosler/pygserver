@@ -5,6 +5,7 @@ These exercise the GS1Host bridge with light fakes — see test_gs1_integration
 for the base wiring; this file covers the commands added on top of it.
 """
 import asyncio
+import time
 
 from pygserver.npc import NPC, NPCManager
 from pygserver.gs1_host import compile_gs1, run_npc_event
@@ -767,3 +768,81 @@ def test_takehorse_mounts_npc_and_removes_horse():
         assert server.horse_manager.get_horses_on_level(level.name) == []
 
     asyncio.run(main())
+
+
+# -- server-owned showimg / clock / freeze / glove semantics ---------------
+def test_showimg_initial_packet_is_minimal_and_stateful():
+    async def main():
+        server = SpawnServer()
+        npc = make_npc(
+            "if (created) { showimg 1,pic.png,3,4; changeimgzoom 1,1.5; }"
+        )
+        run_npc_event(npc, "created", server, None)
+        await asyncio.sleep(0)
+        assert npc.showimgs == {
+            1: {0: "pic.png", 1: 6, 2: 8, 6: 15}
+        }
+        initial = server.broadcasts[0][1]
+        assert initial == bytes([
+            198, 32, 32, 33, 43,       # packet 166, NPC 1, image index 1
+            32, 39,                    # prop 0, string length 7
+            *b"pic.png",
+            33, 38, 34, 40,           # x=6, y=8
+            10,
+        ])
+        # The change packet contains only selector + changed zoom property.
+        assert server.broadcasts[1][1] == bytes(
+            [198, 32, 32, 33, 43, 38, 47, 10]
+        )
+
+    asyncio.run(main())
+
+
+def test_hideimgs_resets_and_replays_remaining_layers_and_ignores_local_range():
+    async def main():
+        server = SpawnServer()
+        npc = make_npc(
+            "if (created) { showimg 1,a.png,1,2; showimg 2,b.png,3,4;"
+            " showimg 200,local.png,5,6; hideimgs 1,1; }"
+        )
+        run_npc_event(npc, "created", server, None)
+        await asyncio.sleep(0)
+        assert set(npc.showimgs) == {2}
+        assert len(server.broadcasts) == 3  # index 200 never broadcasts
+        hide = server.broadcasts[-1][1]
+        assert hide[4] == 41               # selector 9: clear all
+        assert hide[5] == 44               # then replay index 2
+
+    asyncio.run(main())
+
+
+def test_timevar2_is_unix_seconds_and_playerfreezetime_counts_down():
+    npc = make_npc(
+        "if (created) { this.now=timevar2; freezeplayer 2;"
+        " this.left=playerfreezetime; }"
+    )
+    player = FakePlayer()
+    before = int(time.time())
+    run_npc_event(npc, "created", None, player)
+    assert before <= npc.gs1_scopes["this"]["now"] <= int(time.time())
+    assert 0 < npc.gs1_scopes["this"]["left"] <= 2
+    assert player.is_frozen is True
+
+    npc.gs1_program = compile_gs1(
+        "if (created) { unfreezeplayer; this.left=playerfreezetime; }"
+    )
+    run_npc_event(npc, "created", None, player)
+    assert npc.gs1_scopes["this"]["left"] == -1
+
+
+def test_player_glovepower_uses_player_wire_scale():
+    npc = make_npc(
+        "if (created) { glovepower=1; this.playerpower=playerglovepower;"
+        " this.npcpower=glovepower; }"
+    )
+    player = FakePlayer()
+    player.glove_power = 2
+    run_npc_event(npc, "created", None, player)
+    assert npc.gs1_scopes["this"]["playerpower"] == 2
+    assert npc.gs1_scopes["this"]["npcpower"] == 1
+    assert npc.glove_power == 1

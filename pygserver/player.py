@@ -1598,6 +1598,9 @@ class Player:
         # Send NPCs on level
         for npc in level.get_npcs():
             await self.send_raw(npc.build_props_packet())
+            showimgs = npc.build_showimgs_packet()
+            if showimgs is not None:
+                await self.send_raw(showimgs)
 
         # Send items on level
         if hasattr(self.server, 'item_manager'):

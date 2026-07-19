@@ -57,6 +57,7 @@ class NPC:
         self.rupees = 0
         self.arrows = 0
         self.bombs = 0
+        self.glove_power = 0  # NPC scale: glove1=1, glove2=2.
 
         # Visibility
         self.visible = True
@@ -81,6 +82,12 @@ class NPC:
         # given a slot here (see memory: gs1-python-port, upstream d6c78ef3).
         self.gs1_program: Optional[Any] = None
         self.gs1_scopes: Dict[str, dict] = {"this": {}, "thiso": {}}
+
+        # Server-owned GS1 showimg layers. Only indices 0..199 belong here;
+        # 200+ are local to a client-side script and are never broadcast by
+        # the server. Values contain the image's currently-set wire props.
+        self.showimgs: Dict[int, dict] = {}
+        self._had_showimgs = False
 
         # Resumable-sleep state (gs1_host.run_npc_event): `_gs1_ctx` is this
         # NPC's single persistent reborn_protocol Context, reused across
@@ -165,6 +172,7 @@ class NPC:
             # SPRITE carries the facing direction in its low 2 bits. direction
             # can arrive as a float (script/default), so coerce before masking.
             NPCPROP.SPRITE: int(self.direction) & 0x03,
+            NPCPROP.GLOVEPOWER: self.glove_power,
         }
         if self.gani:
             props[NPCPROP.GANI] = self.gani
@@ -189,6 +197,14 @@ class NPC:
         for prop_id, val in self.gattribs.items():
             props[prop_id] = val
         return build_npc_props(self.id, props)
+
+    def build_showimgs_packet(self) -> Optional[bytes]:
+        """Build the authoritative reset-and-replay packet for this NPC."""
+        if not self._had_showimgs and not self.showimgs:
+            return None
+        from .protocol.packets import build_npc_showimgs
+        self._had_showimgs = True
+        return build_npc_showimgs(self.id, self.showimgs, reset=True)
 
     async def trigger_event(self, event_name: str, *args):
         """Trigger a script event."""
