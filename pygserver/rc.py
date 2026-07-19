@@ -803,8 +803,32 @@ class RCManager:
         reader = PacketReader(data)
         message = reader.remaining().decode('latin-1', errors='replace')
 
-        # Format: "account: message"
-        formatted = f"{session.player.account_name}: {message}"
+        await self.process_chat(message, session)
+
+    async def process_chat(self, message: str,
+                           session: Optional[RCSession] = None):
+        """Process chat from an RC or the GS1 ``sendtorc`` bridge.
+
+        A missing session denotes server-originated GS1 text.  Keeping this
+        entry point shared ensures slash commands take the same route as text
+        entered by an RC instead of accidentally being broadcast as chat.
+        """
+        if not message:
+            return
+
+        if message.startswith('/'):
+            if message.split(None, 1)[0].startswith('/npc'):
+                # TODO(c8fa015f): tokenize message[4:] with the GS1 quote-aware
+                # tokenizer and dispatch rcchat/#p(index) to the control NPC
+                # once pygserver has a control-NPC/NPC-server model.
+                return
+            # No other RC slash commands are implemented yet.  Do not leak a
+            # command into ordinary RC chat; future commands belong here.
+            return
+
+        # RC-authored chat is labelled; server-originated sendtorc text is not.
+        formatted = (f"{session.player.account_name}: {message}"
+                     if session is not None else message)
         packet = build_rc_chat(formatted)
 
         # Broadcast to all RCs

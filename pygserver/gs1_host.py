@@ -1317,7 +1317,28 @@ def _c_hitplayer(self, a, npc, player, ctx):
             dtype = DamageType.OTHER
         except Exception:
             dtype = None
-        _schedule(cm.apply_damage(players[idx], int(to_num(a[1])), 0, 0, dtype))
+        target = players[idx]
+        hurt_dx, hurt_dy = _player_hurt_push(target, to_num(a[2]), to_num(a[3]))
+        _schedule(cm.apply_damage(target, math.floor(to_num(a[1])),
+                                  hurt_dx, hurt_dy, dtype))
+
+
+def _normalized_push(target, from_x, from_y, distance=1.0):
+    """C++ GS1 hit direction: normalize target tile minus source tile."""
+    dx = to_num(getattr(target, "x", 0)) - to_num(from_x)
+    dy = to_num(getattr(target, "y", 0)) - to_num(from_y)
+    length = math.hypot(dx, dy)
+    if length:
+        dx /= length
+        dy /= length
+    return dx * distance, dy * distance
+
+
+def _player_hurt_push(target, from_x, from_y):
+    # Server::hitPlayer pushes four tiles, converts to pixels (*16), then
+    # recentres both wire components at 64.
+    dx, dy = _normalized_push(target, from_x, from_y, 4.0)
+    return int(dx * 16) + 64, int(dy * 16) + 64
 
 
 def _c_hitobjects(self, a, npc, player, ctx):
@@ -1350,10 +1371,8 @@ def _c_hitobjects(self, a, npc, player, ctx):
 def _c_hitnpc(self, a, npc, player, ctx):
     # hitnpc index,halfhearts,fromx,fromy — GS1Commands.cpp fn_hitnpc: hits
     # the NPC at position <index> in the level's NPC list, decrementing its
-    # health and firing washit. fromx/fromy only feed upstream's HURTDXDY
-    # prop, which pygserver doesn't wire to anything client-visible for NPCs
-    # (no knockback-direction prop support) — accepted but otherwise unused,
-    # same as upstream's own dead-end use of it.
+    # health and firing washit. HURTDXDY stores the normalized target-from
+    # source direction at midpoint 32.
     if npc is None or self.server is None or len(a) < 4:
         return
     lvl = self._level_of(ctx)
@@ -1365,6 +1384,9 @@ def _c_hitnpc(self, a, npc, player, ctx):
         return
     target = npcs[idx]
     halfhearts = math.floor(to_num(a[1]))
+    dx, dy = _normalized_push(target, a[2], a[3])
+    target.hurt_dx = int(max(-1.0, min(1.0, dx)) * 32)
+    target.hurt_dy = int(max(-1.0, min(1.0, dy)) * 32)
     target.hearts = max(0.0, to_num(getattr(target, "hearts", 0)) - halfhearts / 2.0)
     self._dirty(target)
     nm = getattr(self.server, "npc_manager", None)
@@ -1383,7 +1405,7 @@ def _c_hitcompu(self, a, npc, player, ctx):
     # applies REAL damage via that same path instead of replicating the
     # leader-only notify quirk — a real hit is strictly more useful than a
     # packet only one player's client happens to see.
-    if self.server is None or len(a) < 2:
+    if self.server is None or len(a) < 4:
         return
     lvl = self._level_of(ctx)
     bm = getattr(self.server, "baddy_manager", None)
@@ -1396,7 +1418,16 @@ def _c_hitcompu(self, a, npc, player, ctx):
     leader = self._leader_player(ctx)
     if leader is None:
         return
-    _schedule(bm.handle_baddy_hurt(leader, baddies[idx].id, int(to_num(a[1]))))
+    _schedule(bm.handle_baddy_hurt(
+        leader, baddies[idx].id, math.floor(to_num(a[1])),
+        to_num(a[2]), to_num(a[3])))
+
+
+def _c_sendtorc(self, a, npc, player, ctx):
+    message = to_str(a[0]) if a else ""
+    rc_manager = getattr(self.server, "rc_manager", None) if self.server else None
+    if rc_manager is not None and hasattr(rc_manager, "process_chat"):
+        _schedule(rc_manager.process_chat(message))
 
 
 def _queue_player_prop(player, prop_id, value):
@@ -1541,6 +1572,7 @@ _COMMANDS = {
     "putexplosion2": _c_putexplosion2, "shootarrow": _c_shootarrow,
     "hitplayer": _c_hitplayer, "hitobjects": _c_hitobjects,
     "hitnpc": _c_hitnpc, "hitcompu": _c_hitcompu,
+    "sendtorc": _c_sendtorc,
     "setshape": _c_setshape,
 }
 

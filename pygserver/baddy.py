@@ -478,7 +478,8 @@ class BaddyManager:
             return None
         return self._baddies[level_name].get(baddy_id)
 
-    async def handle_baddy_hurt(self, player: 'Player', baddy_id: int, damage: int):
+    async def handle_baddy_hurt(self, player: 'Player', baddy_id: int, damage: int,
+                                from_x=None, from_y=None):
         """
         Handle player hitting a baddy.
 
@@ -499,9 +500,12 @@ class BaddyManager:
         baddy.hurt_timer = 0.5  # Hurt state duration
         baddy.mode = BDMODE.HURT
 
-        # Knockback away from player
-        dx = baddy.x - player.x
-        dy = baddy.y - player.y
+        # Knockback away from the explicit GS1 origin when supplied, otherwise
+        # from the attacking player (ordinary client-reported combat).
+        origin_x = player.x if from_x is None else from_x
+        origin_y = player.y if from_y is None else from_y
+        dx = baddy.x - origin_x
+        dy = baddy.y - origin_y
         distance = max(0.1, math.sqrt(dx * dx + dy * dy))
         norm_dx = dx / distance
         norm_dy = dy / distance

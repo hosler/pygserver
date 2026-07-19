@@ -184,6 +184,7 @@ def test_hitcompu_damages_a_baddy_via_the_real_baddy_hurt_path():
 
         baddy = await server.baddy_manager.add_baddy(level, 10, 10, BaddyType.GRAYSNAKE)
         starting_health = baddy.health
+        starting_pos = (baddy.x, baddy.y)
 
         mgr = server.npc_manager
         caller = mgr.create_npc(name="caller", level=level, x=5, y=5)
@@ -191,6 +192,11 @@ def test_hitcompu_damages_a_baddy_via_the_real_baddy_hurt_path():
         await asyncio.sleep(0)
 
         assert baddy.health == starting_health - 2
+        # from=(0,0), target=(10,10): normalized diagonal, then pygserver's
+        # authoritative baddy movement applies its standard 0.5-tile push.
+        expected = 0.5 / (2 ** 0.5)
+        assert baddy.x == starting_pos[0] + expected
+        assert baddy.y == starting_pos[1] + expected
 
     asyncio.run(main())
 

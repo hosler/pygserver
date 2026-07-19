@@ -62,6 +62,9 @@ class FakeLevel:
     def get_player_ids(self):
         return self._player_ids
 
+    def get_npcs(self):
+        return list(self._npcs)
+
 
 def make_npc(code, level=None):
     npc = NPC(1, "t")
@@ -557,7 +560,7 @@ class _FakeCombatMgr:
         self.died = []
 
     async def apply_damage(self, player, dmg, kx, ky, dtype=None, attacker=None):
-        self.damaged.append((player.id, dmg))
+        self.damaged.append((player.id, dmg, kx, ky))
 
     async def handle_player_death(self, player, killer_id=None, damage_type=None):
         self.died.append((player.id, killer_id, damage_type))
@@ -656,6 +659,73 @@ def test_putexplosion_damages_players_in_radius():
         run_npc_event(npc, "created", Server(), None)
         await asyncio.sleep(0)
         assert [d[0] for d in cm.damaged] == [1]  # only the near player
+
+    asyncio.run(main())
+
+
+def test_sendtorc_uses_shared_rc_chat_processor():
+    async def main():
+        class RC:
+            def __init__(self):
+                self.messages = []
+
+            async def process_chat(self, message, session=None):
+                self.messages.append((message, session))
+
+        rc = RC()
+
+        class Server:
+            rc_manager = rc
+
+        npc = make_npc('if (created) { sendtorc "hello staff"; sendtorc /version; }')
+        run_npc_event(npc, "created", Server(), None)
+        await asyncio.sleep(0)
+        assert rc.messages == [('\"hello staff\"', None), ("/version", None)]
+
+    asyncio.run(main())
+
+
+def test_hitplayer_uses_halfhearts_and_cpp_push_encoding():
+    async def main():
+        target = FakePlayer()
+        target.x, target.y = 10.0, 10.0
+        level = _level_with_players(target)
+        cm = _FakeCombatMgr()
+
+        class Server:
+            combat_manager = cm
+
+            def get_player(self, pid):
+                return target if pid == target.id else None
+
+        npc = make_npc("if (created) { hitplayer 0,3.9,9,10; }", level)
+        run_npc_event(npc, "created", Server(), None)
+        await asyncio.sleep(0)
+        # normalized (target-from)=(1,0), push 4 tiles, *16, midpoint 64
+        assert cm.damaged == [(target.id, 3, 128, 64)]
+
+    asyncio.run(main())
+
+
+def test_hitnpc_uses_halfhearts_and_normalized_push_direction():
+    async def main():
+        level = FakeLevel()
+        source = make_npc("if (created) { hitnpc 1,3.9,5,8; }", level)
+        target = NPC(2, "target")
+        target.x, target.y, target.hearts = 8.0, 12.0, 3.0
+        level._npcs = [source, target]
+
+        class Manager:
+            async def on_npc_washit(self, *args):
+                pass
+
+        class Server:
+            npc_manager = Manager()
+
+        run_npc_event(source, "created", Server(), None)
+        await asyncio.sleep(0)
+        assert target.hearts == 1.5
+        assert (target.hurt_dx, target.hurt_dy) == (19, 25)
 
     asyncio.run(main())
 
