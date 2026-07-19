@@ -70,7 +70,9 @@ def test_messagecode_trim_char_value():
 def test_tokenize_and_token_code():
     ctx = run("tokenize alpha beta gamma; setstring this.t,#t(2);")
     assert probe(ctx, "this.t") == "gamma"
-    ctx = run("tokenize2 a-b-c,-; setstring this.t,#t(1);")
+    # tokenize2 takes DELIMITERS first, then text (fn_tokenize2; oracle:
+    # `tokenize2 -,a-b-c` -> 3 tokens a/b/c).
+    ctx = run("tokenize2 -,a-b-c; setstring this.t,#t(1);")
     assert probe(ctx, "this.t") == "b"
 
 

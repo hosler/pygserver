@@ -146,9 +146,11 @@ def test_quoted_string_literal_in_if_condition():
 
 def test_quoted_string_literal_as_command_call_arg():
     # from chicken_house1.nw: `setcharani("sit","");` — quotes used
-    # function-call-style around a command's arguments.
+    # function-call-style around a command's arguments. Oracle-verified
+    # (GServer-v2 Oracle, paren-setstring probe): S-mode string text keeps
+    # parens AND quote chars verbatim; the whole blob is one string arg.
     ts = texts('setcharani("sit","");')
-    assert ("STRING", "sit") in ts
+    assert ("STRING", '("sit","")') in ts
 
 
 def test_quoted_string_doubled_quote_is_literal_quote():
