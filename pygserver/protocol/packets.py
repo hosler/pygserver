@@ -171,6 +171,21 @@ class PacketBuilder:
         self.data.append(((value & 0x7F) + 32) & 0xFF)
         return self
 
+    def write_gint4(self, value: int) -> 'PacketBuilder':
+        """Write a 4-byte GINT4. Max 471347295, lanes clamp at 223 with
+        carry, matching gs2lib CString::writeGInt4 (and reborn-protocol's
+        writer) — an unclamped top lane would silently wrap mod 256."""
+        t = max(0, min(int(value), 471347295))
+        b0 = min(t >> 21, 223)
+        t -= b0 << 21
+        b1 = min(t >> 14, 223)
+        t -= b1 << 14
+        b2 = min(t >> 7, 223)
+        b3 = t - (b2 << 7)
+        for b in (b0, b1, b2, b3):
+            self.data.append((b + 32) & 0xFF)
+        return self
+
     def write_string(self, value: str) -> 'PacketBuilder':
         """Write raw string bytes."""
         self.data.extend(value.encode('latin-1', errors='replace'))
@@ -692,12 +707,16 @@ def build_player_left(player_id: int) -> bytes:
 
 
 def build_world_time() -> bytes:
-    """Build PLO_NEWWORLDTIME heartbeat packet."""
+    """Build PLO_NEWWORLDTIME heartbeat packet.
+
+    Wire format per GServer-v2 Server.cpp calculateNWTime(): GINT4 of
+    (unixtime - 981048814) / 5, i.e. 5-second units since the timevar
+    epoch 2001-02-01T17:33:34Z. Clients read exactly 4 G-bytes; the old
+    3-byte seconds-of-day encoding parsed as time=0 on their side.
+    """
     import time
-    # World time is seconds since midnight
-    t = time.localtime()
-    world_time = t.tm_hour * 3600 + t.tm_min * 60 + t.tm_sec
-    return PacketBuilder().write_gchar(PLO.NEWWORLDTIME).write_gint3(world_time).write_byte(ord('\n')).build()
+    world_time = int(time.time() - 981048814) // 5
+    return PacketBuilder().write_gchar(PLO.NEWWORLDTIME).write_gint4(world_time).write_byte(ord('\n')).build()
 
 
 def build_npc_del(npc_id: int) -> bytes:
