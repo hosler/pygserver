@@ -71,7 +71,7 @@ class PacketReader:
         b2 = self.data[self.pos + 1] - 32
         b3 = self.data[self.pos + 2] - 32
         self.pos += 3
-        return (b1 << 14) | (b2 << 7) | b3
+        return (b1 << 14) + (b2 << 7) + b3  # + not |: carry crosses bit 14 (see codec.read_gint3)
 
     def read_string(self, length: int) -> str:
         """Read a fixed-length string."""
@@ -311,6 +311,15 @@ def parse_player_props(data: bytes, start_pos: int = 0) -> dict:
                 props[prop_id] = data[pos] - 32
                 pos += 1
 
+        # ID of the NPC currently carried by the player (3-byte GInt).
+        elif prop_id == PLPROP.CARRYNPC:
+            if pos + 2 < len(data):
+                b1 = data[pos] - 32
+                b2 = data[pos + 1] - 32
+                b3 = data[pos + 2] - 32
+                props[prop_id] = (b1 << 14) + (b2 << 7) + b3  # + not |: carry crosses bit 14 (see codec.read_gint3)
+                pos += 3
+
         # Sword/Shield power (1 byte, or 1 + string if > threshold)
         elif prop_id == PLPROP.SWORDPOWER:
             if pos < len(data):
@@ -348,7 +357,7 @@ def parse_player_props(data: bytes, start_pos: int = 0) -> dict:
                 b1 = data[pos] - 32
                 b2 = data[pos + 1] - 32
                 b3 = data[pos + 2] - 32
-                props[prop_id] = (b1 << 14) | (b2 << 7) | b3
+                props[prop_id] = (b1 << 14) + (b2 << 7) + b3  # + not |: carry crosses bit 14 (see codec.read_gint3)
                 pos += 3
 
         # Text codepage (3 bytes gInt3)
@@ -357,7 +366,7 @@ def parse_player_props(data: bytes, start_pos: int = 0) -> dict:
                 b1 = data[pos] - 32
                 b2 = data[pos + 1] - 32
                 b3 = data[pos + 2] - 32
-                props[prop_id] = (b1 << 14) | (b2 << 7) | b3
+                props[prop_id] = (b1 << 14) + (b2 << 7) + b3  # + not |: carry crosses bit 14 (see codec.read_gint3)
                 pos += 3
 
         # High-precision position (2 bytes each)

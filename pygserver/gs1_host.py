@@ -25,6 +25,9 @@ from reborn_protocol.gs1.interp import Interpreter
 from reborn_protocol.gs1.parser import parse
 from reborn_protocol.gs1.values import to_num, to_str
 
+from . import tiletypes
+from .combat import CarryObjectSprite
+
 logger = logging.getLogger(__name__)
 
 # Surface GS1 script/command failures (they used to be swallowed at DEBUG,
@@ -153,6 +156,12 @@ _SHOTBY_SOURCE = {
     "shotbyplayer": "player", "shotbybaddy": "baddy", "shotbynpc": "npc",
 }
 
+_PELTWITH_TYPE = {
+    "peltwithbush": 2, "peltwithstone": 3, "peltwithvase": 4,
+    "peltwithsign": 5, "peltwithblackstone": 10,
+    "peltwithnpc": 11, "peltwithperson": 11, "peltwithplayer": 12,
+}
+
 
 def _charprop_target(code, table):
     """Resolve a setcharprop/setplayerprop message code to its target.
@@ -176,6 +185,22 @@ class GS1Host(Host):
     def get_builtin(self, name, indices, ctx):
         player = ctx.player
         npc = ctx.this_obj
+        if name == "tiles":
+            resolved = self._resolve_tile(indices, ctx)
+            if resolved is None:
+                return 0.0
+            level, x, y = resolved
+            return float(level.get_tile(x, y))
+        if name == "board":
+            level = getattr(npc, "level", None) if npc is not None else None
+            if level is None or not hasattr(level, "get_tile"):
+                return 0.0
+            if not indices:
+                return [float(level.get_tile(i % 64, i // 64)) for i in range(4096)]
+            index = int(to_num(indices[0]))
+            if index < 0 or index >= 4096:
+                return 0.0
+            return float(level.get_tile(index % 64, index // 64))
         if name == "tokenscount":   # number of tokens from the last `tokenize`
             # (GS1Commands.cpp:3138 sets this on tokenize; mirrors the
             # client host's implementation in pyreborn.gs1_client)
@@ -187,6 +212,27 @@ class GS1Host(Host):
             return getattr(lvl, "name", "") if lvl else ""
         if name == "playeronline":
             return 1.0 if player is not None else 0.0
+        if name == "isweapon":
+            return 0.0
+        if name == "playerswimming":
+            return 1.0 if player is not None and self._player_is_swimming(player) else 0.0
+        if name == "carrying":
+            return 1.0 if player is not None and int(getattr(player, "carrysprite", 0) or 0) != 0 else 0.0
+        carry_flags = {
+            "carriesbush": CarryObjectSprite.BUSH,
+            "carriesstone": CarryObjectSprite.STONE,
+            "carriesvase": CarryObjectSprite.VASE,
+            "carriessign": CarryObjectSprite.SIGN,
+            "carriesblackstone": CarryObjectSprite.BLACKSTONE,
+        }
+        if name in carry_flags:
+            sprite = int(getattr(player, "carrysprite", 0) or 0) if player is not None else 0
+            return 1.0 if sprite == int(carry_flags[name]) else 0.0
+        if name == "carriesnpc":
+            carried_npc = (getattr(player, "carryNPC", 0) or
+                           getattr(player, "carry_npc", 0) or
+                           getattr(player, "npc_id", 0)) if player is not None else 0
+            return 1.0 if carried_npc else 0.0
         if name in NPC_ATTR and npc is not None:
             return self._coerce(getattr(npc, NPC_ATTR[name], 0))
         if name == "sprite" and npc is not None:
@@ -203,16 +249,11 @@ class GS1Host(Host):
             if ctx.active_event != "wasshot":
                 return 0.0
             return 1.0 if getattr(ctx, "hit_source", None) == _SHOTBY_SOURCE[name] else 0.0
+        if name in _PELTWITH_TYPE:
+            if ctx.active_event != "waspelt":
+                return 0.0
+            return 1.0 if getattr(ctx, "carryobject_type", None) == _PELTWITH_TYPE[name] else 0.0
         # -- player flags with real pygserver-side backing state
-        # (GS1Flags.cpp setPlayerFlags). Flags with no backing state here
-        # (carrying*/isweapon/playerswimming/mouse*/music* etc.) are
-        # deliberately skipped - see the comment block above _COMMANDS for
-        # the equivalent "no server state to read" reasoning on the command
-        # side; pygserver never tracks PLPROP.CARRYSPRITE/CARRYNPC server-
-        # side (client-authoritative, never parsed off incoming props), and
-        # weapon scripts (Weapon.server_script) are parsed but never
-        # executed, so there is no "this script is running as a weapon"
-        # context to test either.
         if name == "weaponsenabled" and player is not None:
             return 0.0 if getattr(player, "weapons_disabled", False) else 1.0
         if name == "playeronhorse" and player is not None:
@@ -242,6 +283,13 @@ class GS1Host(Host):
     def set_builtin(self, name, value, indices, ctx) -> bool:
         player = ctx.player
         npc = ctx.this_obj
+        if name == "tiles":
+            resolved = self._resolve_tile(indices, ctx)
+            if resolved is not None:
+                level, x, y = resolved
+                level.set_tile(x, y, int(to_num(value)))
+                self._broadcast_tiles(level, x, y, 1, 1)
+            return True
         if name in PLAYER_ATTR and player is not None:
             self._set_player_attr(player, PLAYER_ATTR[name], value)
             return True
@@ -257,6 +305,51 @@ class GS1Host(Host):
             self._set_timer(npc, to_num(value))
             return True
         return False
+
+    def _resolve_tile(self, indices, ctx):
+        """Resolve tiles[x,y], including classic bigmap segment overflow."""
+        if len(indices) < 2:
+            return None
+        level = getattr(ctx.this_obj, "level", None) if ctx.this_obj is not None else None
+        if level is None or not hasattr(level, "get_tile"):
+            return None
+        x = max(0, int(to_num(indices[0])))
+        y = max(0, int(to_num(indices[1])))
+
+        # GServer checks the adjacent segment before reducing the coordinates
+        # to the selected level's dimensions.
+        world = getattr(self.server, "world", None) if self.server is not None else None
+        if world is not None and (x > 64 or y > 64):
+            info = world.get_gmap_for_level(getattr(level, "name", ""))
+            if info is not None:
+                gmap, gx, gy = info
+                target_name = gmap.get_level_at(gx + x // 64, gy + y // 64)
+                target = world.get_level(target_name) if target_name else None
+                if target is not None:
+                    level = target
+
+        width = int(getattr(level, "WIDTH", 64))
+        height = int(getattr(level, "HEIGHT", 64))
+        if width <= 0 or height <= 0:
+            return None
+        x = max(0, min(width - 1, x % width))
+        y = max(0, min(height - 1, y % height))
+        return level, x, y
+
+    def _broadcast_tiles(self, level, x, y, width, height):
+        if self.server is None or not hasattr(level, "_tiles"):
+            return
+        tiles = bytearray()
+        level_width = int(getattr(level, "WIDTH", 64))
+        for row in range(y, y + height):
+            start = (row * level_width + x) * 2
+            tiles += bytes(level._tiles[start:start + width * 2])
+        try:
+            from .protocol.packets import build_board_modify
+            _schedule(self.server.broadcast_to_level(
+                level.name, build_board_modify(x, y, width, height, bytes(tiles))))
+        except Exception:
+            logger.debug("tiles assignment broadcast failed", exc_info=True)
 
     # -- commands ----------------------------------------------------------
     def call_command(self, name, args, ctx) -> None:
@@ -278,6 +371,10 @@ class GS1Host(Host):
             return self._onwall(args, ctx)
         if name in ("onwater", "onwater2"):
             return 0.0  # known stub: real level water-tile detection isn't wired server-side
+        if name == "testnpc":
+            return self._test_at(args, ctx, players=False)
+        if name == "testplayer":
+            return self._test_at(args, ctx, players=True)
         if name == "playersays":
             return self._playersays(args, ctx, contains=False)
         if name == "playersays2":
@@ -465,6 +562,61 @@ class GS1Host(Host):
             if p is not None:
                 out.append(p)
         return out
+
+    def _player_is_swimming(self, player):
+        level = getattr(player, "level", None)
+        if level is None:
+            return False
+        x = math.floor(to_num(getattr(player, "x", 0)) + 1.5)
+        y = math.floor(to_num(getattr(player, "y", 0)) + 2.0)
+        tile_id = level.get_tile(x, y) if hasattr(level, "get_tile") else 0
+        return tiletypes.get_tile_type(tile_id) in (tiletypes.WATER, tiletypes.LAVA)
+
+    def _test_at(self, args, ctx, players):
+        miss = -2.0 if players else -1.0
+        if len(args) < 2:
+            return miss
+        px, py = math.floor(to_num(args[0]) * 16), math.floor(to_num(args[1]) * 16)
+        objects = self._players_on_level(ctx) if players else []
+        level = self._level_of(ctx)
+        if players and not objects and level is not None:
+            direct = getattr(level, "players", None)
+            if direct is not None:
+                objects = list(direct.values()) if isinstance(direct, dict) else list(direct)
+        if not players:
+            if level is not None:
+                if hasattr(level, "get_npcs"):
+                    objects = level.get_npcs()
+                else:
+                    direct = getattr(level, "npcs", getattr(level, "_npcs", []))
+                    objects = list(direct.values()) if isinstance(direct, dict) else list(direct)
+        for index, obj in enumerate(objects):
+            rect = self._collision_rect(obj, players)
+            if rect is not None:
+                x, y, width, height = rect
+                if x <= px <= x + width and y <= py <= y + height:
+                    return float(index)
+        return miss
+
+    @staticmethod
+    def _collision_rect(obj, player):
+        getter = getattr(obj, "getCollisionBoundingBox", None)
+        if getter is None:
+            getter = getattr(obj, "get_collision_bounding_box", None)
+        if getter is not None:
+            rect = getter()
+            if isinstance(rect, (tuple, list)) and len(rect) >= 4:
+                return tuple(to_num(v) for v in rect[:4])
+        x, y = to_num(getattr(obj, "x", 0)) * 16, to_num(getattr(obj, "y", 0)) * 16
+        if player:
+            return x + 8, y + 16, 32, 32
+        shape = getattr(obj, "shape", None)
+        if shape and len(shape) >= 2:
+            return x, y, to_num(shape[0]), to_num(shape[1])
+        # Character NPCs use the same feet-centred 2x2 collision square.
+        if getattr(obj, "gani", "") or getattr(obj, "body_image", "") or getattr(obj, "head_image", ""):
+            return x + 8, y + 16, 32, 32
+        return None
 
     def _sorted_by_distance(self, args, ctx):
         if len(args) < 2:
@@ -1526,7 +1678,8 @@ def _ensure_gs1_ctx(npc, host):
     return ctx
 
 
-def _bind_fresh_gs1_call(ctx, npc, server, player, event, source):
+def _bind_fresh_gs1_call(ctx, npc, server, player, event, source,
+                         carryobject_type=None):
     """(Re)configure the NPC's persistent ctx for a brand-new top-level
     firing (as opposed to resuming a pending sleep). Rebuilds `ctx.vars` from
     scratch exactly like the pre-resumable code used to build a whole new
@@ -1555,13 +1708,16 @@ def _bind_fresh_gs1_call(ctx, npc, server, player, event, source):
     ctx.this_obj = npc
     ctx.player = player
     ctx.hit_source = source
+    ctx.carryobject_type = (int(carryobject_type)
+                            if carryobject_type is not None else None)
     ctx.active_event = event
     ctx.tokenize_tokens = []
     ctx.charprop_source = None
     ctx.steps = 0
 
 
-def run_npc_event(npc, event: str, server=None, player=None, source=None):
+def run_npc_event(npc, event: str, server=None, player=None, source=None,
+                  carryobject_type=None):
     """Fire a GS1 event handler (`if (<event>) {...}`) on an NPC.
 
     Always runs through reborn_protocol's resumable API (Interpreter.
@@ -1627,7 +1783,8 @@ def run_npc_event(npc, event: str, server=None, player=None, source=None):
         return ctx
 
     ctx = _ensure_gs1_ctx(npc, host)
-    _bind_fresh_gs1_call(ctx, npc, server, player, event, source)
+    _bind_fresh_gs1_call(ctx, npc, server, player, event, source,
+                         carryobject_type)
     try:
         resumable = Interpreter(ctx).run_event_resumable(prog, event)
     except Exception as e:

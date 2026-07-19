@@ -112,6 +112,29 @@ class NPC:
         """Flag this NPC for a props re-broadcast on the next server tick."""
         self._dirty = True
 
+    async def hurtAndPush(self, damage: int, direction_vec, event,
+                          source: Optional['Player'], carryobject_type=None):
+        """Apply server damage and dispatch the matching GS1 hit event."""
+        # Callers may supply the client-facing sprite or the already-mapped
+        # script-facing type.  Preserve typed CarryObjectType values; map
+        # CarryObjectSprite and plain wire integers here at the API boundary.
+        from .combat import CarryObjectSprite, CarryObjectType, _SPRITE_TO_TYPE
+        if isinstance(carryobject_type, CarryObjectSprite):
+            carryobject_type = _SPRITE_TO_TYPE.get(carryobject_type)
+        elif not isinstance(carryobject_type, CarryObjectType):
+            try:
+                carryobject_type = _SPRITE_TO_TYPE.get(
+                    CarryObjectSprite(int(carryobject_type))
+                )
+            except (TypeError, ValueError):
+                carryobject_type = None
+        self.hearts = max(0.0, self.hearts - damage / 2.0)
+        self.mark_dirty()
+        manager = getattr(getattr(source, 'server', None), 'npc_manager', None)
+        event_name = getattr(event, 'value', event)
+        if manager is not None and event_name == 'waspelt':
+            await manager.on_npc_waspelt(self, carryobject_type, source)
+
     def set_script(self, script_class: type):
         """Set the script class for this NPC."""
         self.script_class = script_class
@@ -539,7 +562,7 @@ class NPCManager:
         run_npc_event(npc, 'created', self.server, None)
 
     def _fire_gs1(self, npc: NPC, event: str, player: Optional['Player'] = None,
-                  source: Optional[str] = None):
+                  source: Optional[str] = None, carryobject_type=None):
         """Run a GS1 event handler on an NPC if it has a GS1 program.
 
         `source` is who/what initiated the hit for events that expose it as
@@ -549,7 +572,8 @@ class NPCManager:
         if npc.gs1_program is None:
             return
         from .gs1_host import run_npc_event
-        run_npc_event(npc, event, self.server, player, source=source)
+        run_npc_event(npc, event, self.server, player, source=source,
+                      carryobject_type=carryobject_type)
 
     async def on_npc_washit(self, npc: NPC, player: Optional['Player'] = None):
         """Fire `washit` on an NPC hit by hitnpc/hitobjects or a player's
@@ -565,6 +589,15 @@ class NPCManager:
     async def on_npc_exploded(self, npc: NPC, player: Optional['Player'] = None):
         """Fire `exploded` on an NPC caught in a bomb explosion radius."""
         self._fire_gs1(npc, 'exploded', player)
+
+    async def on_npc_waspelt(self, npc: NPC, carryobject_type,
+                             player: Optional['Player'] = None):
+        self._fire_gs1(npc, 'waspelt', player,
+                       carryobject_type=carryobject_type)
+
+    async def on_npc_wasthrown(self, npc: NPC,
+                               player: Optional['Player'] = None):
+        self._fire_gs1(npc, 'wasthrown', player)
 
     async def on_baddies_cleared(self, level: 'Level'):
         """Fire `compusdied` on every NPC on a level once its last living

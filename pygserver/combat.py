@@ -46,6 +46,39 @@ class DamageType(IntEnum):
     OTHER = 7
 
 
+class CarryObjectSprite(IntEnum):
+    BUSH = 1
+    STONE = 3
+    VASE = 5
+    SIGN = 7
+    BLACKSTONE = 201
+    NPC = 251
+
+
+class CarryObjectType(IntEnum):
+    BUSH = 2
+    STONE = 3
+    VASE = 4
+    SIGN = 5
+    BLACKSTONE = 10
+    NPC = 11
+    PLAYER = 12
+
+
+class ScriptEventType(str):
+    WASPELT = 'waspelt'
+
+
+_SPRITE_TO_TYPE = {
+    CarryObjectSprite.BUSH: CarryObjectType.BUSH,
+    CarryObjectSprite.STONE: CarryObjectType.STONE,
+    CarryObjectSprite.VASE: CarryObjectType.VASE,
+    CarryObjectSprite.SIGN: CarryObjectType.SIGN,
+    CarryObjectSprite.BLACKSTONE: CarryObjectType.BLACKSTONE,
+    CarryObjectSprite.NPC: CarryObjectType.NPC,
+}
+
+
 @dataclass
 class Bomb:
     """Represents an active bomb in the world."""
@@ -130,6 +163,7 @@ class CombatManager:
         # unrelated later warp happened to run the real leave/arrive flow -
         # this was the "stale ghost player" bug live 2-bot testing found.
         self._respawn_tasks: Set[asyncio.Task] = set()
+        self._thrown_npc_tasks: Set[asyncio.Task] = set()
 
         # Combat settings
         self.bomb_damage_radius = 2.5  # Tiles
@@ -723,17 +757,9 @@ class CombatManager:
                     DamageType.FIRE, player.id
                 )
 
-    async def handle_throw_carried(self, player: 'Player', x: float, y: float,
-                                    carried_type: int):
-        """
-        Handle throwing a carried object (bush, pot, etc).
-
-        Args:
-            player: Player throwing object
-            x: Target X position
-            y: Target Y position
-            carried_type: Type of carried object
-        """
+    async def handle_throw_carried(self, player: 'Player', direction: int,
+                                    carrysprite: int):
+        """Relay and simulate a client throw using server-owned state."""
         if not player.level:
             return
 
@@ -747,30 +773,55 @@ class CombatManager:
             player.level.name, packet, exclude={player.id}
         )
 
-        # Damage calculation depends on carried_type. Kept server-authoritative
-        # (pygserver computes hit damage itself rather than trusting the
-        # client) same as the rest of this module's combat handling.
-        damage = 1 if carried_type > 0 else 0
+        velocities = ((0.0, -0.85), (-0.85, 0.0),
+                      (0.0, 0.85), (0.85, 0.0))
+        velocity = velocities[int(direction) & 3]
+        x, y = player.x + 0.5, player.y + 1.0
+        carry_type = _SPRITE_TO_TYPE.get(carrysprite)
+        fly_duration = 0
+        hit = False
+        npc_mgr = getattr(self.server, 'npc_manager', None)
+        while fly_duration < 10 and not hit:
+            x += velocity[0] * 2
+            y += velocity[1] * 2
+            fly_duration += 2
+            if npc_mgr is not None:
+                for npc in npc_mgr.get_npcs_on_level(player.level):
+                    # A thrown item's search rectangle is 2x2 tiles.
+                    if abs((npc.x + 0.5) - (x + 1.0)) < 1.5 and \
+                            abs((npc.y + 0.5) - (y + 1.0)) < 1.5:
+                        await npc.hurtAndPush(2, velocity, ScriptEventType.WASPELT,
+                                              player, carry_type)
+                        hit = True
 
-        # Check for player hits at target
-        for player_id in player.level.get_player_ids():
-            if player_id == player.id:
-                continue
-
-            other = self.server.get_player(player_id)
-            if not other:
-                continue
-
-            dist_x = abs(other.x - x)
-            dist_y = abs(other.y - y)
-
-            if dist_x < 1.5 and dist_y < 1.5 and damage > 0:
-                knockback_x = (other.x - player.x)
-                knockback_y = (other.y - player.y)
-                await self.apply_damage(
-                    other, damage, knockback_x, knockback_y,
-                    DamageType.OTHER, player.id
+        if int(carrysprite) == CarryObjectSprite.NPC:
+            npc_id = getattr(player, 'npc_id', 0)
+            carried_npc = npc_mgr.get_npc(npc_id) if npc_mgr and npc_id else None
+            if carried_npc is not None:
+                carried_npc.x, carried_npc.y = player.x, player.y
+                carried_npc.visible = True
+                carried_npc.mark_dirty()
+                task = asyncio.create_task(
+                    self._move_thrown_npc(carried_npc, player, int(direction) & 3)
                 )
+                self._thrown_npc_tasks.add(task)
+                task.add_done_callback(self._thrown_npc_tasks.discard)
+            player.npc_id = 0
+
+    async def _move_thrown_npc(self, npc, player: 'Player', direction: int):
+        dx, dy = ((0.0, -0.9), (-0.9, 0.0),
+                  (0.0, 0.9), (0.9, 0.0))[direction]
+        for _ in range(10):
+            npc.x += dx
+            npc.y += dy
+            npc.mark_dirty()
+            await asyncio.sleep(0.05)
+        npc.direction = direction
+        npc.gani = 'idle'
+        npc.mark_dirty()
+        npc_mgr = getattr(self.server, 'npc_manager', None)
+        if npc_mgr is not None:
+            await npc_mgr.on_npc_wasthrown(npc, player)
 
     async def handle_shoot(self, player: 'Player', shoot_data: bytes):
         """

@@ -81,6 +81,10 @@ class Player:
         self.x = 0.0
         self.y = 0.0
         self.direction = 2  # Down
+        self.carrysprite = 0
+        # Retained until a carried-NPC throw consumes it.  Clients normally
+        # clear CARRYNPC separately from sending THROWCARRIED.
+        self.npc_id = 0
 
         # Stats
         self.hearts = 3.0
@@ -578,6 +582,14 @@ class Player:
         if PLPROP.SPRITE in props:
             self.sprite = props[PLPROP.SPRITE]
 
+        if PLPROP.CARRYSPRITE in props:
+            self.carrysprite = props[PLPROP.CARRYSPRITE]
+
+        if PLPROP.CARRYNPC in props:
+            # Unconditional like CARRYSPRITE: 0 means the carried NPC was
+            # released, so a stale id must not survive a drop-without-throw.
+            self.npc_id = props[PLPROP.CARRYNPC]
+
         if PLPROP.GANI in props:
             self.gani = props[PLPROP.GANI]
 
@@ -731,16 +743,14 @@ class Player:
             await self.server.combat_manager.handle_fire_spy(self, x, y)
 
     async def _handle_throw_carried(self, data: bytes):
-        """Handle PLI_THROWCARRIED packet."""
+        """Handle the payload-less PLI_THROWCARRIED packet."""
         if not self.level:
             return
-        reader = PacketReader(data)
-        x = reader.read_gchar() / 2.0
-        y = reader.read_gchar() / 2.0
-        carried_type = reader.read_gchar() if reader.remaining() else 0
 
         if hasattr(self.server, 'combat_manager'):
-            await self.server.combat_manager.handle_throw_carried(self, x, y, carried_type)
+            await self.server.combat_manager.handle_throw_carried(
+                self, direction=self.direction, carrysprite=self.carrysprite
+            )
 
     async def _handle_hurt_player(self, data: bytes):
         """Handle PLI_HURTPLAYER packet.
