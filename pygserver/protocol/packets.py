@@ -1063,10 +1063,12 @@ def build_npc_del2(level_name: str, npc_id: int) -> bytes:
 
 
 def build_npc_weapon_add(weapon_name: str, image: str, script: str) -> bytes:
-    """Build PLO_NPCWEAPONADD packet."""
+    """Build a classic-script PLO_NPCWEAPONADD packet for v6.037."""
     builder = PacketBuilder().write_gchar(PLO.NPCWEAPONADD)
     builder.write_gstring(weapon_name)
+    builder.write_gchar(0)  # NPCProp.IMAGE
     builder.write_gstring(image)
+    builder.write_gchar(1)  # NPCProp.SCRIPT
     builder.write_gstring_short(script)
     builder.write_newline()
     return builder.build()

@@ -1138,7 +1138,10 @@ def _c_toweapons(self, a, npc, player, ctx):
         try:
             from .protocol.packets import build_npc_weapon_add
             _schedule(player.send_raw(build_npc_weapon_add(
-                name, to_str(getattr(npc, "image", "")), "")))
+                weapon_name=name,
+                image=to_str(getattr(npc, "image", "")),
+                script="",
+            )))
         except Exception:
             logger.debug("toweapons send failed for %s", name, exc_info=True)
 

@@ -113,6 +113,33 @@ def test_control_flow_keywords():
     assert "KW_ELSE" in ts
 
 
+@pytest.mark.parametrize("src", [
+    "set !Name:fixed;",
+    "set name:#s(var);",
+    "unset !Name:#s(var);",
+])
+def test_set_unset_accept_free_form_interpolated_flag_names(src):
+    parser = Parser(tokenize(src), recover=False)
+    program = parser.parse_program()
+    assert len(program.body) == 1
+    assert not parser.errors
+
+
+def test_negated_free_form_flag_condition():
+    parser = Parser(tokenize("if (!Spar:xyz) { set matched; }"), recover=False)
+    program = parser.parse_program()
+    assert len(program.body) == 1
+    assert not parser.errors
+
+
+@pytest.mark.parametrize("code", ["#s(name)", "#v(index)", "#p(0)"])
+def test_hash_interpolations_in_expression_context(code):
+    parser = Parser(tokenize(f"value={code};"), recover=False)
+    program = parser.parse_program()
+    assert len(program.body) == 1
+    assert not parser.errors
+
+
 def test_for_loop():
     ts = types("for (i=0; i<10; i++) { x=i; }")
     assert ts[:2] == ["KW_FOR", "TOKEN_PAREN_LEFT"]
