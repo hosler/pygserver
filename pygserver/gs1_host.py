@@ -363,9 +363,24 @@ class GS1Host(Host):
             start = (row * level_width + x) * 2
             tiles += bytes(level._tiles[start:start + width * 2])
         try:
-            from .protocol.packets import build_board_modify
+            from .protocol.packets import build_board_modify, build_board_modify2
+            world = getattr(self.server, "world", None)
+            gmap_info = (
+                world.get_gmap_for_level(level.name)
+                if world and hasattr(world, "get_gmap_for_level")
+                else None
+            )
+            if gmap_info:
+                _, map_x, map_y = gmap_info
+                packet = build_board_modify2(
+                    map_x, map_y, x, y, width, height, bytes(tiles)
+                )
+            else:
+                packet = build_board_modify(
+                    x, y, width, height, bytes(tiles)
+                )
             _schedule(self.server.broadcast_to_level(
-                level.name, build_board_modify(x, y, width, height, bytes(tiles))))
+                level.name, packet))
         except Exception:
             logger.debug("tiles assignment broadcast failed", exc_info=True)
 
@@ -1165,9 +1180,22 @@ def _c_updateboard(self, a, npc, player, ctx):
         start = (row * 64 + x) * 2
         tiles += bytes(lvl._tiles[start:start + w * 2])
     try:
-        from .protocol.packets import build_board_modify
+        from .protocol.packets import build_board_modify, build_board_modify2
+        world = getattr(self.server, "world", None)
+        gmap_info = (
+            world.get_gmap_for_level(lvl.name)
+            if world and hasattr(world, "get_gmap_for_level")
+            else None
+        )
+        if gmap_info:
+            _, map_x, map_y = gmap_info
+            packet = build_board_modify2(
+                map_x, map_y, x, y, w, h, bytes(tiles)
+            )
+        else:
+            packet = build_board_modify(x, y, w, h, bytes(tiles))
         _schedule(self.server.broadcast_to_level(
-            lvl.name, build_board_modify(x, y, w, h, bytes(tiles))))
+            lvl.name, packet))
     except Exception:
         logger.debug("updateboard failed", exc_info=True)
 

@@ -1276,6 +1276,21 @@ def build_board_modify(x: int, y: int, width: int, height: int, tiles: bytes) ->
     return builder.build()
 
 
+def build_board_modify2(map_x: int, map_y: int, x: int, y: int,
+                        width: int, height: int, tiles: bytes) -> bytes:
+    """Build PLO_BOARDMODIFY2 packet for a gmap segment."""
+    builder = PacketBuilder().write_gchar(PLO.BOARDMODIFY2)
+    builder.write_gchar(map_x)
+    builder.write_gchar(map_y)
+    builder.write_gchar(x)
+    builder.write_gchar(y)
+    builder.write_gchar(width)
+    builder.write_gchar(height)
+    builder.write_bytes(tiles)
+    builder.write_newline()
+    return builder.build()
+
+
 def build_board_layer(layer: int, tiles: bytes) -> bytes:
     """Build PLO_BOARDLAYER packet."""
     builder = PacketBuilder().write_gchar(PLO.BOARDLAYER)

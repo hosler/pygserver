@@ -1304,8 +1304,17 @@ class Player:
                     idx += 2
 
         # Broadcast modification to other players on level
-        from .protocol.packets import build_board_modify
-        packet = build_board_modify(x, y, w, h, tile_data[:expected_size])
+        from .protocol.packets import build_board_modify, build_board_modify2
+        gmap_info = self.server.world.get_gmap_for_level(self.level.name)
+        if gmap_info:
+            _, map_x, map_y = gmap_info
+            packet = build_board_modify2(
+                map_x, map_y, x, y, w, h, tile_data[:expected_size]
+            )
+        else:
+            packet = build_board_modify(
+                x, y, w, h, tile_data[:expected_size]
+            )
         await self.server.broadcast_to_level(
             self.level.name, packet, exclude={self.id}
         )

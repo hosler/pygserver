@@ -65,6 +65,49 @@ class TestValuelessFlags:
         assert "flagname" not in player.flags
 
 
+class TestBoardModifyPackets:
+    @staticmethod
+    def _payload(x=3, y=4, width=1, height=1, tile=0x1234):
+        return (
+            PacketBuilder()
+            .write_gchar(x)
+            .write_gchar(y)
+            .write_gchar(width)
+            .write_gchar(height)
+            .write_bytes(tile.to_bytes(2, "little"))
+            .build()
+        )
+
+    def test_plain_level_uses_level_local_packet(self):
+        level = Level("plain.nw")
+        server = LevelServer([level])
+        player = make_player(server, 1, level)
+
+        asyncio.run(player._handle_board_modify(self._payload()))
+
+        packet = server.broadcast_to_level.await_args.args[1]
+        reader = PacketReader(packet)
+        assert reader.read_gchar() == PLO.BOARDMODIFY
+        assert reader.remaining() == self._payload() + b"\n"
+
+    def test_gmap_level_uses_map_position_packet(self):
+        level = Level("segment.nw")
+        server = LevelServer([level], gmap_levels={level.name})
+        server.world.get_gmap_for_level = MagicMock(
+            return_value=(MagicMock(name="world"), 5, 7)
+        )
+        player = make_player(server, 1, level)
+
+        asyncio.run(player._handle_board_modify(self._payload()))
+
+        packet = server.broadcast_to_level.await_args.args[1]
+        reader = PacketReader(packet)
+        assert reader.read_gchar() == PLO.BOARDMODIFY2
+        assert reader.read_gchar() == 5
+        assert reader.read_gchar() == 7
+        assert reader.remaining() == self._payload() + b"\n"
+
+
 class World:
     def __init__(self, levels, gmap_levels=()):
         self.levels = {level.name: level for level in levels}
@@ -189,4 +232,3 @@ class TestLeaderBaddyProps:
         call = self.server.broadcast_to_level.await_args
         assert call.kwargs["exclude"] == {self.leader.id}
         assert call.args[1][0] == PLO.BADDYPROPS + 32
-
