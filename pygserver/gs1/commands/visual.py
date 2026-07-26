@@ -52,6 +52,18 @@ def _c_hideimg(self, a, npc, player, ctx):
     npc._had_showimgs = True
     _broadcast_showimgs(self, npc, npc.showimgs, reset=True)
 
+def _c_hideimgs(self, a, npc, player, ctx):
+    if npc is None:
+        return
+    start = math.floor(to_num(a[0])) if a else None
+    end = math.floor(to_num(a[1])) if len(a) > 1 else None
+    for layer in [layer for layer in npc.showimgs
+                  if (start is None or layer >= start)
+                  and (end is None or layer <= end)]:
+        npc.showimgs.pop(layer, None)
+    npc._had_showimgs = True
+    _broadcast_showimgs(self, npc, npc.showimgs, reset=True)
+
 def _change_showimg(self, a, npc, prop_id, value):
     if npc is None or not a:
         return
@@ -89,7 +101,7 @@ _COMMANDS = {
     'showimg': _c_showimg,
     'showimg2': _c_showimg,
     'hideimg': _c_hideimg,
-    'hideimgs': _c_hideimg,
+    'hideimgs': _c_hideimgs,
     'changeimgvis': _c_changeimgvis,
     'changeimgpart': _c_changeimgpart,
     'changeimgcolors': _c_changeimgcolors,

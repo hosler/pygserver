@@ -70,8 +70,8 @@ def _c_setshape(self, a, npc, player, ctx):
     # setshape type,width,height — type 1 is a fully-solid box; other type
     # values are unimplemented in the GServer-v2 C++ oracle too
     # (GS1Commands.cpp:2384 fn_setshape returns early unless type == 1).
-    # width/height are stored in tiles, matching the client host's
-    # setshape/setshape2 (gs1_client.py). Not a wire prop (no NPCPROP for a
+    # width/height arguments are pixels and the stored collision shape uses
+    # tiles, matching the client host's conversion. Not a wire prop (no NPCPROP for a
     # shape rect) — this is server-side collision geometry; note for the
     # touch-handling owner: nothing in gs1_host.py currently *reads*
     # npc.shape for collision, so a touch-handler change elsewhere would be
@@ -80,7 +80,9 @@ def _c_setshape(self, a, npc, player, ctx):
         return
     if int(to_num(a[0])) != 1:
         return
-    npc.shape = (int(to_num(a[1])), int(to_num(a[2])))
+    width = max(1, (int(to_num(a[1])) + 15) // 16)
+    height = max(1, (int(to_num(a[2])) + 15) // 16)
+    npc.shape = (width, height)
 
 def _gattribs_of(obj):
     ga = getattr(obj, "gattribs", None)

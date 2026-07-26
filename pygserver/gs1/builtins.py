@@ -3,6 +3,7 @@ import time
 from reborn_protocol.coords import LEVEL_SIZE, LEVEL_TILE_COUNT
 from reborn_protocol.gs1.runtime import UNSET
 from reborn_protocol.gs1.values import to_num
+from reborn_protocol.gs1.host_shared import tokens_count
 
 from ..combat import CarryObjectSprite
 from .host import (
@@ -55,7 +56,7 @@ def _b_tokenscount(self, name, indices, ctx, npc, player):
     # number of tokens from the last `tokenize` (GS1Commands.cpp:3138 sets this
     # on tokenize; mirrors the client host's implementation in
     # pyreborn.gs1_client)
-    return float(len(getattr(ctx, "tokenize_tokens", []) or []))
+    return tokens_count(ctx)
 
 
 def _b_timevar2(self, name, indices, ctx, npc, player):
@@ -85,31 +86,31 @@ def _b_playerlevel(self, name, indices, ctx, npc, player):
 
 
 def _b_playeronline(self, name, indices, ctx, npc, player):
-    return 1.0 if player is not None else 0.0
+    return player is not None
 
 
 def _b_isweapon(self, name, indices, ctx, npc, player):
-    return 0.0
+    return False
 
 
 def _b_playerswimming(self, name, indices, ctx, npc, player):
-    return 1.0 if player is not None and self._player_is_swimming(player) else 0.0
+    return player is not None and self._player_is_swimming(player)
 
 
 def _b_carrying(self, name, indices, ctx, npc, player):
-    return 1.0 if player is not None and int(getattr(player, "carrysprite", 0) or 0) != 0 else 0.0
+    return player is not None and int(getattr(player, "carrysprite", 0) or 0) != 0
 
 
 def _b_carries_object(self, name, indices, ctx, npc, player):
     sprite = int(getattr(player, "carrysprite", 0) or 0) if player is not None else 0
-    return 1.0 if sprite == int(_CARRY_SPRITE[name]) else 0.0
+    return sprite == int(_CARRY_SPRITE[name])
 
 
 def _b_carriesnpc(self, name, indices, ctx, npc, player):
     carried_npc = (getattr(player, "carryNPC", 0) or
                    getattr(player, "carry_npc", 0) or
                    getattr(player, "npc_id", 0)) if player is not None else 0
-    return 1.0 if carried_npc else 0.0
+    return bool(carried_npc)
 
 
 def _b_sprite(self, name, indices, ctx, npc, player):
@@ -134,14 +135,14 @@ def _b_shotby(self, name, indices, ctx, npc, player):
     # hit-source flags: WASSHOT only (GS1Flags.cpp:136-138); washit has no
     # equivalent source flags upstream.
     if ctx.active_event != "wasshot":
-        return 0.0
-    return 1.0 if getattr(ctx, "hit_source", None) == _SHOTBY_SOURCE[name] else 0.0
+        return False
+    return getattr(ctx, "hit_source", None) == _SHOTBY_SOURCE[name]
 
 
 def _b_peltwith(self, name, indices, ctx, npc, player):
     if ctx.active_event != "waspelt":
-        return 0.0
-    return 1.0 if getattr(ctx, "carryobject_type", None) == _PELTWITH_TYPE[name] else 0.0
+        return False
+    return getattr(ctx, "carryobject_type", None) == _PELTWITH_TYPE[name]
 
 
 # -- player flags with real pygserver-side backing state
@@ -149,7 +150,7 @@ def _b_peltwith(self, name, indices, ctx, npc, player):
 def _b_weaponsenabled(self, name, indices, ctx, npc, player):
     if player is None:
         return UNSET
-    return 0.0 if getattr(player, "weapons_disabled", False) else 1.0
+    return not getattr(player, "weapons_disabled", False)
 
 
 def _b_playeronhorse(self, name, indices, ctx, npc, player):
@@ -157,7 +158,7 @@ def _b_playeronhorse(self, name, indices, ctx, npc, player):
         return UNSET
     hm = getattr(self.server, "horse_manager", None) if self.server is not None else None
     pid = getattr(player, "id", None)
-    return 1.0 if hm is not None and pid is not None and hm.is_mounted(pid) else 0.0
+    return hm is not None and pid is not None and hm.is_mounted(pid)
 
 
 def _b_player_gender(self, name, indices, ctx, npc, player):
@@ -169,14 +170,14 @@ def _b_player_gender(self, name, indices, ctx, npc, player):
     if player is None:
         return UNSET
     is_male = int(to_num(getattr(player, "gender", 0))) == 0
-    return 1.0 if is_male == (name == "playerismale") else 0.0
+    return is_male == (name == "playerismale")
 
 
 def _b_isleader(self, name, indices, ctx, npc, player):
     if player is None:
         return UNSET
     leader = self._leader_player(ctx)
-    return 1.0 if leader is not None and leader is player else 0.0
+    return leader is not None and leader is player
 
 
 # -- NPC/level flags (GS1Flags.cpp setNPCFlags/setLevelFlags)
@@ -184,15 +185,15 @@ def _b_isleader(self, name, indices, ctx, npc, player):
 def _b_visible(self, name, indices, ctx, npc, player):
     if npc is None:
         return UNSET
-    return 1.0 if getattr(npc, "visible", True) else 0.0
+    return bool(getattr(npc, "visible", True))
 
 
 def _b_isonmap(self, name, indices, ctx, npc, player):
-    return 1.0 if self._gmap_info(ctx) is not None else 0.0
+    return self._gmap_info(ctx) is not None
 
 
 def _b_compsdead(self, name, indices, ctx, npc, player):
-    return 1.0 if self._all_baddies_dead(ctx) else 0.0
+    return bool(self._all_baddies_dead(ctx))
 
 
 _BUILTINS = {

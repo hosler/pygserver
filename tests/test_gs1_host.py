@@ -7,6 +7,10 @@ for the base wiring; this file covers the commands added on top of it.
 import asyncio
 import time
 
+import pytest
+
+from pygserver.combat import CarryObjectSprite
+from pygserver.gs1.host import GS1Host, _PELTWITH_TYPE, _SHOTBY_SOURCE
 from pygserver.npc import NPC, NPCManager
 from pygserver.gs1_host import compile_gs1, run_npc_event
 
@@ -72,6 +76,84 @@ def make_npc(code, level=None):
     npc.level = level or FakeLevel()
     npc.gs1_program = compile_gs1(code)
     return npc
+
+
+_PREDICATE_CASES = [
+    "playeronline", "isweapon", "playerswimming", "carrying",
+    "carriesbush", "carriesstone", "carriesvase", "carriessign",
+    "carriesblackstone", "carriesnpc", "weaponsenabled", "playeronhorse",
+    "playerismale", "playerisfemale", "isleader", "visible",
+    "shotbyplayer", "shotbybaddy", "shotbynpc",
+    *_PELTWITH_TYPE,
+    "isonmap", "compsdead",
+]
+
+
+@pytest.mark.parametrize("name", _PREDICATE_CASES)
+def test_predicate_builtins_are_bools_and_work_in_bare_conditions(
+        monkeypatch, name):
+    player = FakePlayer()
+    player.carrysprite = 0
+    player.carryNPC = 0
+    player.weapons_disabled = False
+    player.gender = 0
+
+    class HorseManager:
+        @staticmethod
+        def is_mounted(pid):
+            return True
+
+    class Server:
+        horse_manager = HorseManager()
+
+    server = Server()
+    event = "created"
+    source = None
+    carryobject_type = None
+    expected = name != "isweapon"
+
+    monkeypatch.setattr(GS1Host, "_player_is_swimming",
+                        lambda host, acting_player: True)
+    monkeypatch.setattr(GS1Host, "_leader_player",
+                        lambda host, ctx: ctx.player)
+    monkeypatch.setattr(GS1Host, "_gmap_info",
+                        lambda host, ctx: object())
+    monkeypatch.setattr(GS1Host, "_all_baddies_dead",
+                        lambda host, ctx: True)
+
+    carry_sprites = {
+        "carriesbush": CarryObjectSprite.BUSH,
+        "carriesstone": CarryObjectSprite.STONE,
+        "carriesvase": CarryObjectSprite.VASE,
+        "carriessign": CarryObjectSprite.SIGN,
+        "carriesblackstone": CarryObjectSprite.BLACKSTONE,
+    }
+    if name == "carrying":
+        player.carrysprite = CarryObjectSprite.BUSH
+    elif name in carry_sprites:
+        player.carrysprite = carry_sprites[name]
+    elif name == "carriesnpc":
+        player.carryNPC = 7
+    elif name == "playerisfemale":
+        player.gender = 1
+    elif name in _SHOTBY_SOURCE:
+        event = "wasshot"
+        source = _SHOTBY_SOURCE[name]
+    elif name in _PELTWITH_TYPE:
+        event = "waspelt"
+        carryobject_type = _PELTWITH_TYPE[name]
+
+    npc = make_npc(
+        f"if ({event}) {{ if ({name}) {{ this.hit=true; }}"
+        " else { this.hit=false; } }"
+    )
+    run_npc_event(
+        npc, event, server, player, source=source,
+        carryobject_type=carryobject_type,
+    )
+    value = npc._gs1_ctx.host.get_builtin(name, [], npc._gs1_ctx)
+    assert type(value) is bool
+    assert npc.gs1_scopes["this"]["hit"] is expected
 
 
 # -- setcharprop (NPC appearance) ------------------------------------------
@@ -814,6 +896,31 @@ def test_hideimgs_resets_and_replays_remaining_layers_and_ignores_local_range():
         assert hide[5] == 44               # then replay index 2
 
     asyncio.run(main())
+
+
+@pytest.mark.parametrize(
+    ("command", "remaining"),
+    [
+        ("hideimgs;", set()),
+        ("hideimgs 2;", {1}),
+        ("hideimgs 2,3;", {1, 4}),
+    ],
+)
+def test_hideimgs_all_open_ended_and_inclusive_forms(command, remaining):
+    npc = make_npc(
+        "if (created) {"
+        " showimg 1,a.png,1,1; showimg 2,b.png,1,1;"
+        " showimg 3,c.png,1,1; showimg 4,d.png,1,1;"
+        f" {command} }}"
+    )
+    run_npc_event(npc, "created", None, None)
+    assert set(npc.showimgs) == remaining
+
+
+def test_setshape_converts_pixel_dimensions_to_tiles():
+    npc = make_npc("if (created) { setshape 1,32,17; }")
+    run_npc_event(npc, "created", None, None)
+    assert npc.shape == (2, 2)
 
 
 def test_timevar2_is_unix_seconds_and_playerfreezetime_counts_down():

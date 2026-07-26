@@ -24,6 +24,9 @@ from reborn_protocol.coords import (
 )
 from reborn_protocol.gs1.runtime import Host, UNSET
 from reborn_protocol.gs1.values import to_num, to_str
+from reborn_protocol.gs1.host_shared import (
+    A_CLASS_NPC_ATTR, A_CLASS_PLAYER_ATTR, host_value,
+)
 
 from .. import tiletypes
 from .players import players_on_level_for, leader_player_for_level
@@ -76,23 +79,18 @@ except Exception:  # constants unavailable (e.g. isolated unit context)
 
 # player-prefixed attribute name -> Python attribute on Player
 PLAYER_ATTR = {
-    "playerx": "x", "playery": "y", "playerdir": "direction",
-    "playersprite": "sprite", "playerrupees": "rupees", "playergralats": "rupees",
-    "playerhearts": "hearts", "playerfullhearts": "max_hearts",
-    "playerarrows": "arrows", "playerbombs": "bombs",
-    "playerswordpower": "sword_power", "playershieldpower": "shield_power",
+    **A_CLASS_PLAYER_ATTR,
+    "playerx": "x", "playery": "y",
     "playerglovepower": "glove_power", "playerkills": "kills",
-    "playerdeaths": "deaths", "playerchat": "chat", "playernick": "nickname",
-    "playeraccount": "account_name", "playerhead": "head_image",
-    "playerbody": "body_image", "playersword": "sword_image",
-    "playershield": "shield_image", "playerap": "ap", "playergani": "gani",
+    "playerdeaths": "deaths", "playerchat": "chat",
+    "playeraccount": "account_name",
+    "playerap": "ap", "playergani": "gani",
 }
 # unprefixed attribute name -> Python attribute on the NPC ("this")
 NPC_ATTR = {
-    "x": "x", "y": "y", "dir": "direction", "nick": "nickname",
+    **A_CLASS_NPC_ATTR,
     "hearts": "hearts", "rupees": "rupees", "arrows": "arrows",
-    "bombs": "bombs", "glovepower": "glove_power",
-    "image": "image", "ani": "gani",
+    "bombs": "bombs",
 }
 
 # setcharprop / setplayerprop message codes -> target. Mirrors the C++
@@ -387,12 +385,7 @@ class GS1Host(Host):
     # -- helpers -----------------------------------------------------------
     @staticmethod
     def _coerce(v):
-        if isinstance(v, str):
-            return v
-        try:
-            return float(v)
-        except (TypeError, ValueError):
-            return 0.0
+        return host_value(v)
 
     @staticmethod
     def _num_or_str(value):
