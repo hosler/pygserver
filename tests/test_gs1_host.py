@@ -315,16 +315,16 @@ def test_setplayerprop_codes_and_propagation():
 
 # -- addweapon -------------------------------------------------------------
 def test_addweapon_adds_and_sends_packet():
-    class Weapon:
-        image = "bow.png"
-        client_script = "//bow"
+    from pygserver.gs2 import GS2Script
 
-    class WM:
+    class GS2:
         def get_weapon(self, name):
-            return Weapon() if name == "bow" else None
+            return (GS2Script(kind="weapon", name="bow", image="bow.png",
+                              clientside="//bow")
+                    if name == "bow" else None)
 
     class Server:
-        weapon_manager = WM()
+        gs2_manager = GS2()
 
     async def main():
         npc = make_npc("if (playertouchsme) { addweapon bow; }")

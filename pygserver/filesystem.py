@@ -24,7 +24,6 @@ from .protocol.packets import (
     build_large_file_start,
     build_large_file_end,
     build_large_file_size,
-    build_gani_script,
 )
 
 if TYPE_CHECKING:
@@ -274,56 +273,6 @@ class FileSystem:
                 del self._downloads[player.id]
             packet = build_file_send_failed(filename)
             await player.send_raw(packet)
-
-    # =========================================================================
-    # Gani/Script Handling
-    # =========================================================================
-
-    async def handle_update_gani(self, player: 'Player', filename: str):
-        """
-        Handle PLI_UPDATEGANI - Client requesting gani.
-
-        Args:
-            player: Player requesting gani
-            filename: Gani filename
-        """
-        file_path = self._find_file(filename)
-        if not file_path:
-            return
-
-        try:
-            with open(file_path, 'r', encoding='latin-1') as f:
-                script = f.read()
-
-            packet = build_gani_script(filename, script)
-            await player.send_raw(packet)
-
-        except Exception as e:
-            logger.error(f"Error sending gani {filename}: {e}")
-
-    async def handle_update_script(self, player: 'Player', filename: str):
-        """
-        Handle PLI_UPDATESCRIPT - Client requesting script.
-
-        Args:
-            player: Player requesting script
-            filename: Script filename
-        """
-        await self.handle_update_gani(player, filename)
-
-    async def handle_update_class(self, player: 'Player', classname: str):
-        """
-        Handle PLI_UPDATECLASS - Client requesting class script.
-
-        Args:
-            player: Player requesting class
-            classname: Class name
-        """
-        if hasattr(self.server, 'class_manager'):
-            cls = self.server.class_manager.get_class(classname)
-            if cls:
-                packet = build_gani_script(classname, cls.script)
-                await player.send_raw(packet)
 
     # =========================================================================
     # Upload Handling

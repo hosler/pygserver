@@ -1030,14 +1030,22 @@ def _c_addweapon(self, a, npc, player, ctx):
     name = to_str(a[0])
     if hasattr(player, "add_weapon"):
         player.add_weapon(name)
-    wm = getattr(self.server, "weapon_manager", None)
-    weapon = wm.get_weapon(name) if wm is not None and hasattr(wm, "get_weapon") else None
-    if weapon is None or not hasattr(player, "send_raw"):
+    # The GS2 manager owns weapons/*.txt whether or not the clientside half
+    # compiled: a compiled one is announced by it (image + joined classes +
+    # script header, then the client pulls the bytecode), an uncompiled one
+    # goes out as a classic GS1-text weapon.
+    gs2 = getattr(self.server, "gs2_manager", None)
+    weapon = gs2.get_weapon(name) if gs2 is not None else None
+    if weapon is None:
+        return
+    if weapon.bytecode:
+        _schedule(gs2.announce_weapon(player, name))
+        return
+    if not hasattr(player, "send_raw"):
         return
     try:
         from .protocol.packets import build_npc_weapon_add
-        pkt = build_npc_weapon_add(name, getattr(weapon, "image", ""),
-                                   getattr(weapon, "client_script", ""))
+        pkt = build_npc_weapon_add(weapon.name, weapon.image, weapon.clientside)
         _schedule(player.send_raw(pkt))
     except Exception:
         logger.debug("addweapon send failed for %s", name, exc_info=True)

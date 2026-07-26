@@ -1,0 +1,9 @@
+// qa_gs2vmclass - GS2 class with callable methods for the VM QA tier.
+//#CLIENTSIDE
+function qaDouble(n) {
+  return n * 2;
+}
+
+function qaGreet(name) {
+  return "hi " @ name;
+}

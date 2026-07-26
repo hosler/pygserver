@@ -347,3 +347,38 @@ class TestRCApIncrementSet:
         async def main():
             await rc._handle_ap_increment_set(session, payload)
         asyncio.run(main())
+
+
+class TestNCWeaponAndClassGuards:
+    """GameServer used to declare weapon_manager/class_manager and leave them
+    None forever, so every `hasattr(server, ...)` guard below passed and then
+    dereferenced None. The attributes are gone with the dead WeaponManager, so
+    the guards finally skip the way they were written to."""
+
+    def _nc(self):
+        from pygserver.nc import NCManager, NCSession
+        from pygserver.server import GameServer
+
+        # A real GameServer, since the point of the test is which attributes it
+        # declares; a hand-rolled stub would pass either way.
+        nc = NCManager(GameServer())
+        return nc, NCSession(player=_make_player(MagicMock()))
+
+    def test_weapon_handlers_skip_instead_of_dereferencing_none(self):
+        nc, session = self._nc()
+
+        async def main():
+            await nc._handle_weapon_list_get(session, b"")
+            await nc._handle_weapon_get(session, b"bow")
+            await nc._handle_weapon_delete(session, b"bow")
+        asyncio.run(main())
+
+    def test_class_edit_skips_instead_of_dereferencing_none(self):
+        nc, session = self._nc()
+
+        async def main():
+            await nc._handle_class_edit(session, b"someclass")
+        asyncio.run(main())
+
+        packet = session.player.send_raw.await_args[0][0]
+        assert b"someclass" in packet

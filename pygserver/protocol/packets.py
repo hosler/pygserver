@@ -21,7 +21,7 @@ from reborn_protocol.props import (
 )
 
 from .constants import (
-    PLO, PLI, PLPROP, BDPROP, BDMODE, LevelItemType,
+    PLO, PLI, PLPROP, NPCPROP, BDPROP, BDMODE, LevelItemType,
     PLSTATUS, PLPERM, NPCVISFLAG, NPCBLOCKFLAG
 )
 
@@ -985,6 +985,24 @@ def build_npc_weapon_add(weapon_name: str, image: str, script: str) -> bytes:
     return builder.build()
 
 
+def build_npc_weapon_add_scripted(weapon_name: str, image: str,
+                                  joined_classes: str = "") -> bytes:
+    """Build the compiled-script PLO_NPCWEAPONADD packet for v6.037.
+
+    Format (GServer-v2 Weapon.cpp registerWeaponWithPlayer, bytecode branch):
+    the CLASS property replaces SCRIPT, and the bytecode itself follows later
+    as PLO_LOADSCRIPT + the client's PLI_UPDATESCRIPT pull.
+    """
+    builder = PacketBuilder().write_gchar(PLO.NPCWEAPONADD)
+    builder.write_gstring(weapon_name)
+    builder.write_gchar(NPCPROP.IMAGE)
+    builder.write_gstring(image)
+    builder.write_gchar(NPCPROP.CLASS)
+    builder.write_gstring_short(joined_classes)
+    builder.write_newline()
+    return builder.build()
+
+
 def build_npc_weapon_del(weapon_name: str) -> bytes:
     """Build PLO_NPCWEAPONDEL packet."""
     builder = PacketBuilder().write_gchar(PLO.NPCWEAPONDEL)
@@ -993,11 +1011,38 @@ def build_npc_weapon_del(weapon_name: str) -> bytes:
     return builder.build()
 
 
-def build_npc_weapon_script(info_length: int, script: str) -> bytes:
-    """Build PLO_NPCWEAPONSCRIPT packet."""
+def build_npc_weapon_script(header: str, bytecode: bytes) -> bytes:
+    """Build PLO_NPCWEAPONSCRIPT: [gshort header_len][header CSV][bytecode].
+
+    Bytecode is binary and routinely contains 0x0a, so this packet must be
+    announced with build_raw_data_announcement() - unframed it is truncated at
+    the first newline.
+    """
     builder = PacketBuilder().write_gchar(PLO.NPCWEAPONSCRIPT)
-    builder.write_gshort(info_length)
-    builder.write_string(script)
+    builder.write_gstring_short(header)
+    builder.write_bytes(bytecode)
+    builder.write_newline()
+    return builder.build()
+
+
+def build_load_script_header(header: str) -> bytes:
+    """Build the announcement form of PLO_LOADSCRIPT: a bare header CSV with no
+    length prefix and no bytecode (Weapon.cpp registerWeaponWithPlayer)."""
+    builder = PacketBuilder().write_gchar(PLO.LOADSCRIPT)
+    builder.write_string(header)
+    builder.write_newline()
+    return builder.build()
+
+
+def build_load_script_bytecode(header: str, bytecode: bytes) -> bytes:
+    """Build the class-bytecode form of PLO_LOADSCRIPT:
+    [gchar header_len][header CSV][bytecode] (ScriptClass.cpp getClassPacket).
+
+    Like PLO_NPCWEAPONSCRIPT this must be sent inside PLO_RAWDATA framing.
+    """
+    builder = PacketBuilder().write_gchar(PLO.LOADSCRIPT)
+    builder.write_gstring(header)
+    builder.write_bytes(bytecode)
     builder.write_newline()
     return builder.build()
 
@@ -1289,11 +1334,26 @@ def build_large_file_size(size: int) -> bytes:
     return builder.build()
 
 
-def build_gani_script(gani_name: str, script: str) -> bytes:
-    """Build PLO_GANISCRIPT packet."""
+def build_gani_script(gani_name: str, bytecode: bytes) -> bytes:
+    """Build PLO_GANISCRIPT: [gchar name_len][gani name][bytecode]
+    (GameAni.cpp getBytecodePacket; the name carries no .gani suffix).
+
+    The payload is compiled GS2, not gani text, and like PLO_NPCWEAPONSCRIPT
+    it must be announced with build_raw_data_announcement().
+    """
     builder = PacketBuilder().write_gchar(PLO.GANISCRIPT)
     builder.write_gstring(gani_name)
-    builder.write_string(script)
+    builder.write_bytes(bytecode)
+    builder.write_newline()
+    return builder.build()
+
+
+def build_load_gani(gani_name: str, setbackto: str = "") -> bytes:
+    """Build PLO_LOADGANI: [gchar name_len][gani name]["SETBACKTO <ani>"]
+    (PlayerClientPackets.cpp msgPLI_UPDATEGANI)."""
+    builder = PacketBuilder().write_gchar(PLO.LOADGANI)
+    builder.write_gstring(gani_name)
+    builder.write_string(f'"SETBACKTO {setbackto}"')
     builder.write_newline()
     return builder.build()
 

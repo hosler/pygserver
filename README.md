@@ -44,6 +44,7 @@ pygserver/
 ├── level.py              # Level loading and management
 ├── npc.py                # NPC system with Python scripting
 ├── weapon.py             # Weapon definitions
+├── gs2.py                # GS2 clientside bytecode (compile on load, serve)
 ├── world.py              # World/GMAP management
 ├── config.py             # Server configuration
 ├── listserver.py         # List server client (registration/verification)
@@ -186,6 +187,22 @@ When enabled, the server will:
 - Send player join/leave notifications
 - Support account verification (if `verify_login = True`)
 - Automatically reconnect if disconnected
+
+## GS2 clientside scripting
+
+Weapons in `weapons/weapon<name>.txt` (GRAWP001 format) and script classes in
+`scripts/<name>.txt` get their `//#CLIENTSIDE` half compiled to GS2 bytecode at
+boot and served to clients on `PLI_UPDATESCRIPT` / `PLI_UPDATECLASS`:
+
+- **Compiler**: the real GServer-v2 `gs2test` binary, found via `$GS2TEST_BIN`,
+  the sibling `reborn-protocol/tests/tools/gs2test`, or `PATH`. Compiled output
+  is cached beside the source as `<name>.gs2bc`, which doubles as a
+  precompiled-input path when no compiler is installed.
+- **No compiler, no `.gs2bc`**: scripts simply have no bytecode and the server
+  keeps serving classic GS1 text exactly as before.
+- **Serverside** stays Python/GS1 — only the clientside half is compiled.
+
+`cd pyReborn && python -m game_tester --gs2` exercises this end to end.
 
 ## Protocol Support
 

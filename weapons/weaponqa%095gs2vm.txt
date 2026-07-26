@@ -1,0 +1,43 @@
+GRAWP001
+REALNAME qa_gs2vm
+IMAGE qa.png
+SCRIPT
+//#CLIENTSIDE
+function onCreated() {
+  this.count = 0;
+  this.created = 1;
+  showimg(200, "qa_gs2.png", 30, 30);
+  settimer(0.05);
+}
+
+function onTimeout() {
+  this.count++;
+  if (this.count < 3) {
+    settimer(0.05);
+  }
+}
+
+function onActionqa2relay(a, b) {
+  this.relay = a @ "-" @ b;
+}
+
+function qaSend(x, y) {
+  triggeraction(x, y, "qa2relay", "ping");
+}
+
+function qaJoinHelper(n) {
+  join("qa_gs2vmclass");
+  return qaDouble(n);
+}
+
+
+
+
+
+
+
+
+
+
+
+SCRIPTEND

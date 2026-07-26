@@ -57,3 +57,8 @@ tests/gs1_corpus/
 
 # runtime player accounts (created at login)
 accounts/*.json
+
+# GS2 bytecode compiled from weapons/*.txt and scripts/*.txt at boot; a
+# checked-in .gs2bc is a deliberate precompiled input, not build output.
+weapons/*.gs2bc
+scripts/*.gs2bc

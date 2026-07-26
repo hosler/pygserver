@@ -199,3 +199,44 @@ def test_gear_images_round_trip_through_the_account(tmp_path):
 
     assert (fresh.sword_power, fresh.sword_image) == (4, "blade.png")
     assert (fresh.shield_power, fresh.shield_image) == (2, "buckler.png")
+
+
+def test_weapons_survive_a_server_restart(tmp_path):
+    """account.weapons was serialised to JSON and read back, but never exchanged
+    with the player, so a weapon lasted exactly one session - and the login-time
+    GS2 announce (complete_login -> announce_weapons) had nothing to announce."""
+    from pygserver.account import AccountManager
+
+    manager = AccountManager(MagicMock(), str(tmp_path))
+    account = manager.create_account("hosler")
+    _server, player = make_player()
+    player.add_weapon("qa_gs2vm")
+
+    manager.save_player_to_account(player, account)
+    manager._save_executor.shutdown()   # drain the single writer thread
+
+    # A second manager reads the JSON back off disk, as a restart does.
+    restarted = AccountManager(MagicMock(), str(tmp_path))
+    reloaded = restarted.get_account("hosler")
+    _server, fresh = make_player()
+    restarted.load_player_from_account(fresh, reloaded)
+
+    assert reloaded.weapons == ["qa_gs2vm"]
+    assert fresh.weapons == ["qa_gs2vm"]
+
+
+def test_the_players_weapon_list_is_not_shared_with_the_account(tmp_path):
+    """_save_account snapshots to_dict() on the caller's thread but writes on
+    the executor thread, so the player must never hold the same list object the
+    pending write is about to serialise."""
+    from pygserver.account import AccountManager
+
+    manager = AccountManager(MagicMock(), str(tmp_path))
+    account = manager.create_account("hosler")
+    account.weapons = ["bow"]
+    _server, player = make_player()
+
+    manager.load_player_from_account(player, account)
+    player.add_weapon("bomb")
+
+    assert account.weapons == ["bow"]

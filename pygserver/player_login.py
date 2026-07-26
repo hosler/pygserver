@@ -138,6 +138,10 @@ class LoginService:
         if listserver:
             await listserver.add_player(player)
 
+        gs2 = getattr(player.server, 'gs2_manager', None)
+        if gs2 is not None:
+            await gs2.announce_weapons(player)
+
         config = player.server.config
         await player.warp(config.start_level, config.start_x, config.start_y)
 

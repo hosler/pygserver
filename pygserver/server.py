@@ -82,11 +82,8 @@ class GameServer:
         # Profile manager
         self.profile_manager = None
 
-        # Class manager for NPC classes
-        self.class_manager = None
-
-        # Weapon manager
-        self.weapon_manager = None
+        # GS2 clientside bytecode (compiled weapons/classes)
+        self.gs2_manager = None
 
         # List server client
         self.listserver = None
@@ -177,6 +174,11 @@ class GameServer:
         # from_server_dir sets base_dir (e.g. ../funtimes); fall back to cwd.
         base_path = getattr(self.config, 'base_dir', None) or "."
         self.filesystem = FileSystem(self, base_path)
+
+        # GS2 clientside bytecode
+        from .gs2 import GS2ScriptManager
+        self.gs2_manager = GS2ScriptManager(self, base_path)
+        self.gs2_manager.load()
 
         # Account system
         from .account import AccountManager, ProfileManager
@@ -529,6 +531,8 @@ class GameServer:
             if len(params) >= 1:
                 weapon_name = params[0]
                 player.add_weapon(weapon_name)
+                if self.gs2_manager is not None:
+                    await self.gs2_manager.announce_weapon(player, weapon_name)
 
         elif action_type == "removeweapon":
             # Format: serverside,removeweapon,name

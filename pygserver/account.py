@@ -480,6 +480,10 @@ class AccountManager:
         player.ap = account.ap
         player.flags = account.flags.copy()
         player.gattribs = {i: v for i, v in enumerate(account.gattribs) if v}
+        # Weapons must be on the player before complete_login runs, which is
+        # what announces each owned GS2 weapon to the client
+        # (player_login.complete_login -> GS2ScriptManager.announce_weapons).
+        player.weapons = account.weapons.copy()
 
         # Set position if saved
         if account.level_name:
@@ -512,6 +516,7 @@ class AccountManager:
         account.mp = player.mp
         account.ap = player.ap
         account.flags = player.flags.copy()
+        account.weapons = player.weapons.copy()
 
         # Save gattribs
         for i, v in player.gattribs.items():
