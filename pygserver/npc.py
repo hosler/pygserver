@@ -88,6 +88,7 @@ class NPC:
         # execution in gs1_host.run_npc_event, so it is deliberately NOT
         # given a slot here (see memory: gs1-python-port, upstream d6c78ef3).
         self.gs1_program: Optional[Any] = None
+        self.gs1_source = ""
         self.gs1_scopes: Dict[str, dict] = {"this": {}, "thiso": {}}
 
         # Server-owned GS1 showimg layers. Only indices 0..199 belong here;
@@ -583,6 +584,7 @@ class NPCManager:
         if prog is None:
             return
         npc.gs1_program = prog
+        npc.gs1_source = code
         run_npc_event(npc, 'created', self.server, None)
 
     def _fire_gs1(self, npc: NPC, event: str, player: Optional['Player'] = None,

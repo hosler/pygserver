@@ -41,6 +41,7 @@ def make_npc(code):
     npc = NPC(1, "t")
     npc.level = FakeLevel()
     npc.gs1_program = compile_gs1(code)
+    npc.gs1_source = code
     return npc
 
 
@@ -52,25 +53,23 @@ def test_created_initialises_npc_state():
     assert npc._dirty is True
 
 
-def test_showcharacter_fills_defaults_and_clears_image():
-    # showcharacter was a no-op; classic NPC scripts (e.g. chicken_house1.nw)
-    # rely on it to switch the NPC from a raw image sheet to a
-    # player-style body/gani character.
+def test_showcharacter_sets_only_the_character_marker_and_zero_shape():
     npc = make_npc("if (created) { setimg statue.png; showcharacter; }")
+    npc.body_image = "custombody.png"
+    npc.gani = "custom"
     run_npc_event(npc, "created", None, None)
-    assert npc.image == ""
-    assert npc.body_image == "body.png"
-    assert npc.gani == "idle"
+    assert npc.image == "#c#"
+    assert npc.shape == (0, 0)
+    assert npc.body_image == "custombody.png"
+    assert npc.gani == "custom"
     assert npc._dirty is True
 
 
-def test_showcharacter_does_not_clobber_existing_body_and_gani():
-    npc = make_npc("if (created) { setani custom; showcharacter; }")
-    npc.body_image = "custombody.png"  # e.g. already set by an account/script
+def test_showcharacter_does_not_invent_body_or_gani_defaults():
+    npc = make_npc("if (created) { showcharacter; }")
     run_npc_event(npc, "created", None, None)
-    assert npc.body_image == "custombody.png"
-    assert npc.gani == "custom"
-    assert npc.image == ""
+    assert npc.body_image == ""
+    assert npc.gani == ""
 
 
 def test_touch_mutates_npc_and_player():

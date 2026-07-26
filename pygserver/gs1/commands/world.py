@@ -58,18 +58,20 @@ def _c_toweapons(self, a, npc, player, ctx):
     if player is None or npc is None or not a:
         return
     name = to_str(a[0])
+    gs2 = getattr(self.server, "gs2_manager", None)
+    if gs2 is None:
+        return
+    gs2.upsert_classic_weapon(
+        name,
+        to_str(getattr(npc, "image", "")),
+        to_str(getattr(npc, "gs1_source", "")),
+    )
     if hasattr(player, "add_weapon"):
         player.add_weapon(name)
-    if hasattr(player, "send_raw"):
-        try:
-            from ...protocol.packets import build_npc_weapon_add
-            _schedule(player.send_raw(build_npc_weapon_add(
-                weapon_name=name,
-                image=to_str(getattr(npc, "image", "")),
-                script="",
-            )))
-        except Exception:
-            logger.debug("toweapons send failed for %s", name, exc_info=True)
+    try:
+        _schedule(gs2.announce_weapon(player, name))
+    except Exception:
+        logger.debug("toweapons send failed for %s", name, exc_info=True)
 
 def _c_updateboard(self, a, npc, player, ctx):
     # updateboard x,y,width,height — re-broadcast a region of the level board

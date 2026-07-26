@@ -34,6 +34,7 @@ from .protocol.packets import (
     build_load_gani,
     build_load_script_bytecode,
     build_load_script_header,
+    build_npc_weapon_add,
     build_npc_weapon_add_scripted,
     build_npc_weapon_script,
     build_raw_data_announcement,
@@ -193,6 +194,7 @@ class GS2Script:
     kind: str                       # 'weapon' or 'class'
     name: str
     image: str = ''
+    source: str = ''
     clientside: str = ''
     bytecode: bytes = b''
     des_key: str = ''
@@ -355,7 +357,8 @@ class GS2ScriptManager:
             name, image, script_source = path.stem, '', source
 
         _, clientside = split_clientside(script_source)
-        script = GS2Script(kind=kind, name=name, image=image, clientside=clientside)
+        script = GS2Script(kind=kind, name=name, image=image,
+                           source=script_source, clientside=clientside)
         script.build_headers(script_source)
         script.bytecode = self._bytecode_for(path, clientside, name) or b''
 
@@ -382,6 +385,42 @@ class GS2ScriptManager:
 
     def get_weapon(self, name: str) -> Optional[GS2Script]:
         return self.weapons.get(name.lower())
+
+    def upsert_classic_weapon(self, name: str, image: str,
+                              source: str) -> GS2Script:
+        """Create/update a persistent classic weapon from an NPC script."""
+        weapon = self.get_weapon(name)
+        if weapon is not None and weapon.source == source:
+            return weapon
+
+        _, clientside = split_clientside(source)
+        weapon = GS2Script(kind="weapon", name=name, image=image,
+                           source=source,
+                           clientside=clientside)
+        weapon.build_headers(source)
+        self.weapons[name.lower()] = weapon
+        self._save_classic_weapon(weapon, source)
+        return weapon
+
+    def _save_classic_weapon(self, weapon: GS2Script, source: str):
+        directory = Path(getattr(self.server.config, "weapons_dir", None)
+                         or "weapons")
+        encoded = ''.join(
+            char if char.isascii() and (char.isalnum() or char == '.')
+            else f"%{ord(char):03d}"
+            for char in f"weapon{weapon.name}.txt"
+        )
+        lines = ["GRAWP001", f"REALNAME {weapon.name}",
+                 f"IMAGE {weapon.image}"]
+        if source:
+            lines.extend(("SCRIPT", source, "SCRIPTEND"))
+        try:
+            directory.mkdir(parents=True, exist_ok=True)
+            (directory / encoded).write_text(
+                '\n'.join(lines) + '\n', encoding='latin-1',
+                errors='replace')
+        except OSError as exc:
+            logger.warning("Could not save weapon %s: %s", weapon.name, exc)
 
     def get_class(self, name: str) -> Optional[GS2Script]:
         return self.classes.get(name.lower())
@@ -473,8 +512,12 @@ class GS2ScriptManager:
         image and joined-class list, then the PLO_LOADSCRIPT header. The client
         pulls the bytecode itself with PLI_UPDATESCRIPT."""
         script = self.get_weapon(name)
-        if script is None or not script.bytecode:
+        if script is None:
             return False
+        if not script.bytecode:
+            await player.send_raw(build_npc_weapon_add(
+                script.name, script.image, script.clientside))
+            return True
         await player.send_raw(build_npc_weapon_add_scripted(
             script.name, script.image, script.joined_classes))
         await player.send_raw(build_load_script_header(script.header_with_crc))

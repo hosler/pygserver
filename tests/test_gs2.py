@@ -233,7 +233,7 @@ def test_load_compiles_the_shipped_fixtures(tmp_path):
 
 @pytest.mark.skipif(GS2Compiler().available is False,
                     reason="gs2test compiler not built")
-def test_a_gs1_weapon_loads_without_bytecode_and_is_never_served(tmp_path):
+def test_a_gs1_weapon_loads_without_bytecode_and_is_served_as_text(tmp_path):
     (tmp_path / "weapons").mkdir()
     (tmp_path / "weapons" / "weapongs1only.txt").write_text(
         "GRAWP001\nREALNAME gs1only\nIMAGE w.png\nSCRIPT\n//#CLIENTSIDE\n"
@@ -245,8 +245,8 @@ def test_a_gs1_weapon_loads_without_bytecode_and_is_never_served(tmp_path):
 
     assert manager.get_weapon("gs1only").bytecode == b""
     assert run(manager.send_weapon_bytecode(player, "gs1only")) is False
-    assert run(manager.announce_weapon(player, "gs1only")) is False
-    assert player.sent == []
+    assert run(manager.announce_weapon(player, "gs1only")) is True
+    assert b"if (playerenters)" in player.sent[0]
 
 
 def test_precompiled_bytecode_is_used_when_no_compiler_is_available(tmp_path):

@@ -75,6 +75,7 @@ def make_npc(code, level=None):
     npc = NPC(1, "t")
     npc.level = level or FakeLevel()
     npc.gs1_program = compile_gs1(code)
+    npc.gs1_source = code
     return npc
 
 
@@ -415,6 +416,47 @@ def test_addweapon_adds_and_sends_packet():
         await asyncio.sleep(0)  # let the scheduled send_raw run
         assert "bow" in p.weapons
         assert len(p.sent) == 1  # weapon packet pushed to client
+
+    asyncio.run(main())
+
+
+def test_toweapons_stores_and_serves_the_npc_image_and_script(tmp_path):
+    from pygserver.gs2 import GS2ScriptManager
+
+    class Config:
+        weapons_dir = str(tmp_path / "weapons")
+
+    class Server:
+        config = Config()
+
+    async def main():
+        server = Server()
+        server.gs2_manager = GS2ScriptManager(server, str(tmp_path))
+        source = (
+            "if (created) { setimg wand.png; } "
+            "if (playertouchsme) { toweapons magicwand; } "
+            "//#CLIENTSIDE\nif (weaponfired) { setani cast; }"
+        )
+        npc = make_npc(source)
+        player = FakePlayer()
+
+        run_npc_event(npc, "created", server, None)
+        run_npc_event(npc, "playertouchsme", server, player)
+        await asyncio.sleep(0)
+
+        weapon = server.gs2_manager.get_weapon("magicwand")
+        assert weapon is not None
+        assert weapon.image == "wand.png"
+        assert weapon.source == source
+        assert weapon.clientside == "if (weaponfired) { setani cast; }"
+        assert "magicwand" in player.weapons
+        assert len(player.sent) == 1
+        assert b"wand.png" in player.sent[0]
+        assert b"if (weaponfired) { setani cast; }" in player.sent[0]
+
+        saved = (tmp_path / "weapons" / "weaponmagicwand.txt").read_text(
+            encoding="latin-1")
+        assert source in saved
 
     asyncio.run(main())
 
