@@ -13,6 +13,7 @@ import asyncio
 
 import pytest
 
+from pygserver.audience import Audience
 from pygserver.baddy import BaddyManager, BaddyType
 from pygserver.combat import Arrow, Bomb, CombatManager
 from pygserver.horse import HorseManager
@@ -79,6 +80,7 @@ class FakeServer:
         self.baddy_manager = BaddyManager(self)
         self.combat_manager = CombatManager(self)
         self.horse_manager = HorseManager(self)
+        self.audience = Audience(self)
         self._players = {}
         self.broadcasts = []
 

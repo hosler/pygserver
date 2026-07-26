@@ -9,6 +9,8 @@ import logging
 from typing import TYPE_CHECKING, Optional, Dict, Tuple, List
 from pathlib import Path
 
+from reborn_protocol import coords
+
 from .level import Level, LevelManager
 
 if TYPE_CHECKING:
@@ -126,11 +128,8 @@ class GMap:
         Returns:
             (local_x, local_y, grid_x, grid_y)
         """
-        import math
-        grid_x = math.floor(world_x / 64)
-        grid_y = math.floor(world_y / 64)
-        local_x = world_x % 64
-        local_y = world_y % 64
+        local_x, local_y = coords.world_to_local(world_x, world_y)
+        grid_x, grid_y = coords.segment_at(world_x, world_y)
         return (local_x, local_y, grid_x, grid_y)
 
     def local_to_world(self, local_x: float, local_y: float,
@@ -141,9 +140,7 @@ class GMap:
         Returns:
             (world_x, world_y)
         """
-        world_x = local_x + grid_x * 64
-        world_y = local_y + grid_y * 64
-        return (world_x, world_y)
+        return coords.local_to_world(local_x, local_y, grid_x, grid_y)
 
 
 class World:

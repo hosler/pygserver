@@ -14,6 +14,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, List, Dict, Tuple, Callable
 from enum import IntEnum
 
+from .audience import BOMB_BLAST_BADDIES, Audience
 from .protocol.constants import PLO, BDPROP, BDMODE
 from .protocol.packets import PacketBuilder, build_baddy_props, build_baddy_hurt
 
@@ -272,11 +273,7 @@ class BaddyManager:
         nearest_player = None
         nearest_distance = float('inf')
 
-        for player_id in level.get_player_ids():
-            player = self.server.get_player(player_id)
-            if not player:
-                continue
-
+        for player in self.server.audience.players_on_level(level.name):
             dx = player.x - baddy.x
             dy = player.y - baddy.y
             distance = math.sqrt(dx * dx + dy * dy)
@@ -596,27 +593,25 @@ class BaddyManager:
         if level_name not in self._baddies:
             return
 
-        for baddy_id, baddy in list(self._baddies[level_name].items()):
-            if baddy.dead:
-                continue
-
+        alive = [b for b in self._baddies[level_name].values() if not b.dead]
+        for baddy in Audience.entities_near(alive, x, y, radius,
+                                            BOMB_BLAST_BADDIES):
             dx = baddy.x - x
             dy = baddy.y - y
             distance = math.sqrt(dx * dx + dy * dy)
 
-            if distance < radius:
-                # Apply damage
-                baddy.health -= damage
-                if baddy.health <= 0:
-                    await self.handle_baddy_death(baddy, None)
-                else:
-                    # Knockback
-                    knockback = 2.0 * (1 - distance / radius)
-                    baddy.x += (dx / max(0.1, distance)) * knockback
-                    baddy.y += (dy / max(0.1, distance)) * knockback
-                    baddy.mode = BDMODE.HURT
-                    baddy.hurt_timer = 0.5
-                    await self._broadcast_baddy_props(baddy)
+            # Apply damage
+            baddy.health -= damage
+            if baddy.health <= 0:
+                await self.handle_baddy_death(baddy, None)
+            else:
+                # Knockback
+                knockback = 2.0 * (1 - distance / radius)
+                baddy.x += (dx / max(0.1, distance)) * knockback
+                baddy.y += (dy / max(0.1, distance)) * knockback
+                baddy.mode = BDMODE.HURT
+                baddy.hurt_timer = 0.5
+                await self._broadcast_baddy_props(baddy)
 
     async def check_arrow_hit(self, level_name: str, x: float, y: float,
                                damage: int, player_id: int) -> bool:

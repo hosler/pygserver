@@ -20,12 +20,16 @@ import math
 import re
 import time
 
+from reborn_protocol.coords import (
+    LEVEL_SIZE, LEVEL_TILE_COUNT, level_index, segment_index,
+)
 from reborn_protocol.gs1.runtime import Host, UNSET, VarStore, Context
 from reborn_protocol.gs1.interp import Interpreter
 from reborn_protocol.gs1.parser import parse
 from reborn_protocol.gs1.values import to_num, to_str
 
 from . import tiletypes
+from .audience import GS1_EXPLOSION_PLAYERS, contains
 from .combat import CarryObjectSprite
 
 logger = logging.getLogger(__name__)
@@ -184,118 +188,25 @@ class GS1Host(Host):
 
     # -- built-in attribute access ----------------------------------------
     def get_builtin(self, name, indices, ctx):
+        """Read a GS1 built-in variable.
+
+        Registry-driven like call_command: `_BUILTINS` maps every name to its
+        reader, and the two plain attribute tables (PLAYER_ATTR / NPC_ATTR) are
+        consulted afterwards. UNSET means "not a built-in here" and sends the
+        interpreter on to the ordinary flag/var lookup -- which is also what a
+        reader returns when its gate (a player / an NPC) is missing.
+        """
         player = ctx.player
         npc = ctx.this_obj
-        if name == "tiles":
-            resolved = self._resolve_tile(indices, ctx)
-            if resolved is None:
-                return 0.0
-            level, x, y = resolved
-            return float(level.get_tile(x, y))
-        if name == "board":
-            level = getattr(npc, "level", None) if npc is not None else None
-            if level is None or not hasattr(level, "get_tile"):
-                return 0.0
-            if not indices:
-                return [float(level.get_tile(i % 64, i // 64)) for i in range(4096)]
-            index = int(to_num(indices[0]))
-            if index < 0 or index >= 4096:
-                return 0.0
-            return float(level.get_tile(index % 64, index // 64))
-        if name == "tokenscount":   # number of tokens from the last `tokenize`
-            # (GS1Commands.cpp:3138 sets this on tokenize; mirrors the
-            # client host's implementation in pyreborn.gs1_client)
-            return float(len(getattr(ctx, "tokenize_tokens", []) or []))
-        if name == "timevar2":
-            # Serverside timevar2 is the Unix timestamp (seconds).
-            return float(int(time.time()))
-        if name == "playerfreezetime":
-            if player is None or not getattr(player, "is_frozen", False):
-                return -1.0
-            deadline = getattr(player, "_gs1_freeze_until", None)
-            if deadline is None:  # freezeplayer2 has no timed expiry.
-                return 0.0
-            remaining = max(0.0, deadline - time.monotonic())
-            if remaining == 0.0:
-                player.is_frozen = False
-                player._gs1_freeze_until = None
-                return -1.0
-            return remaining
+        reader = _BUILTINS.get(name)
+        if reader is not None:
+            return reader(self, name, indices, ctx, npc, player)
         if name in PLAYER_ATTR and player is not None:
             value = getattr(player, PLAYER_ATTR[name], 0)
             # The player wire/state scale is 0/2/3; NPC glove power is 0/1/2.
             return self._coerce(value)
-        if name == "playerlevel" and player is not None:
-            lvl = getattr(player, "level", None)
-            return getattr(lvl, "name", "") if lvl else ""
-        if name == "playeronline":
-            return 1.0 if player is not None else 0.0
-        if name == "isweapon":
-            return 0.0
-        if name == "playerswimming":
-            return 1.0 if player is not None and self._player_is_swimming(player) else 0.0
-        if name == "carrying":
-            return 1.0 if player is not None and int(getattr(player, "carrysprite", 0) or 0) != 0 else 0.0
-        carry_flags = {
-            "carriesbush": CarryObjectSprite.BUSH,
-            "carriesstone": CarryObjectSprite.STONE,
-            "carriesvase": CarryObjectSprite.VASE,
-            "carriessign": CarryObjectSprite.SIGN,
-            "carriesblackstone": CarryObjectSprite.BLACKSTONE,
-        }
-        if name in carry_flags:
-            sprite = int(getattr(player, "carrysprite", 0) or 0) if player is not None else 0
-            return 1.0 if sprite == int(carry_flags[name]) else 0.0
-        if name == "carriesnpc":
-            carried_npc = (getattr(player, "carryNPC", 0) or
-                           getattr(player, "carry_npc", 0) or
-                           getattr(player, "npc_id", 0)) if player is not None else 0
-            return 1.0 if carried_npc else 0.0
         if name in NPC_ATTR and npc is not None:
             return self._coerce(getattr(npc, NPC_ATTR[name], 0))
-        if name == "sprite" and npc is not None:
-            return self._coerce(npc.flags.get("sprite", 0)) if hasattr(npc, "flags") else 0.0
-        if name == "timeout" and npc is not None:
-            end = getattr(npc, "_timer_end", 0.0)
-            return max(0.0, end - time.time()) if end else 0.0
-        # -- nw* clock variables (Server.cpp:178-185, upstream ac3adf01) --
-        if name in _NW_CLOCK_FIELDS:
-            return _nw_clock_value(name)
-        # -- hit-source flags: WASSHOT only (GS1Flags.cpp:136-138); washit
-        # has no equivalent source flags upstream.
-        if name in _SHOTBY_SOURCE:
-            if ctx.active_event != "wasshot":
-                return 0.0
-            return 1.0 if getattr(ctx, "hit_source", None) == _SHOTBY_SOURCE[name] else 0.0
-        if name in _PELTWITH_TYPE:
-            if ctx.active_event != "waspelt":
-                return 0.0
-            return 1.0 if getattr(ctx, "carryobject_type", None) == _PELTWITH_TYPE[name] else 0.0
-        # -- player flags with real pygserver-side backing state
-        if name == "weaponsenabled" and player is not None:
-            return 0.0 if getattr(player, "weapons_disabled", False) else 1.0
-        if name == "playeronhorse" and player is not None:
-            hm = getattr(self.server, "horse_manager", None) if self.server is not None else None
-            pid = getattr(player, "id", None)
-            return 1.0 if hm is not None and pid is not None and hm.is_mounted(pid) else 0.0
-        if name in ("playerismale", "playerisfemale") and player is not None:
-            # player.gender only ever exists if a GS1 script set it
-            # (_c_setgender/_c_setchargender) - pygserver has no other
-            # gender source. 0 = male by the same raw-int convention those
-            # commands already use (classic GraalScript "sex" 0/1); unset
-            # defaults to male, matching upstream's PLSTATUS_MALE-set default.
-            is_male = int(to_num(getattr(player, "gender", 0))) == 0
-            return 1.0 if is_male == (name == "playerismale") else 0.0
-        if name == "isleader" and player is not None:
-            leader = self._leader_player(ctx)
-            return 1.0 if leader is not None and leader is player else 0.0
-        # -- NPC/level flags (GS1Flags.cpp setNPCFlags/setLevelFlags) --
-        if name == "visible" and npc is not None:
-            return 1.0 if getattr(npc, "visible", True) else 0.0
-        if name == "isonmap":
-            return 1.0 if self._gmap_info(ctx) is not None else 0.0
-        if name == "compsdead":
-            return 1.0 if self._all_baddies_dead(ctx) else 0.0
         return UNSET
 
     def set_builtin(self, name, value, indices, ctx) -> bool:
@@ -335,19 +246,23 @@ class GS1Host(Host):
         y = max(0, int(to_num(indices[1])))
 
         # GServer checks the adjacent segment before reducing the coordinates
-        # to the selected level's dimensions.
+        # to the selected level's dimensions. The `> LEVEL_SIZE` (not `>=`)
+        # bound is upstream's: tilesCheckForAdjacent tests
+        # `tileX > subLevelTiles.width()` (GS1Variables.cpp:400), so tiles[64,y]
+        # reads column 0 of the CURRENT level rather than the next segment.
         world = getattr(self.server, "world", None) if self.server is not None else None
-        if world is not None and (x > 64 or y > 64):
+        if world is not None and (x > LEVEL_SIZE or y > LEVEL_SIZE):
             info = world.get_gmap_for_level(getattr(level, "name", ""))
             if info is not None:
                 gmap, gx, gy = info
-                target_name = gmap.get_level_at(gx + x // 64, gy + y // 64)
+                target_name = gmap.get_level_at(gx + segment_index(x),
+                                                gy + segment_index(y))
                 target = world.get_level(target_name) if target_name else None
                 if target is not None:
                     level = target
 
-        width = int(getattr(level, "WIDTH", 64))
-        height = int(getattr(level, "HEIGHT", 64))
+        width = int(getattr(level, "WIDTH", LEVEL_SIZE))
+        height = int(getattr(level, "HEIGHT", LEVEL_SIZE))
         if width <= 0 or height <= 0:
             return None
         x = max(0, min(width - 1, x % width))
@@ -358,7 +273,7 @@ class GS1Host(Host):
         if self.server is None or not hasattr(level, "_tiles"):
             return
         tiles = bytearray()
-        level_width = int(getattr(level, "WIDTH", 64))
+        level_width = int(getattr(level, "WIDTH", LEVEL_SIZE))
         for row in range(y, y + height):
             start = (row * level_width + x) * 2
             tiles += bytes(level._tiles[start:start + width * 2])
@@ -586,15 +501,7 @@ class GS1Host(Host):
 
     def _players_on_level(self, ctx):
         """All logged-in Player objects on the script's level (nearest-* helpers)."""
-        lvl = self._level_of(ctx)
-        if lvl is None or self.server is None or not hasattr(lvl, "get_player_ids"):
-            return []
-        out = []
-        for pid in lvl.get_player_ids():
-            p = self.server.get_player(pid)
-            if p is not None:
-                out.append(p)
-        return out
+        return players_on_level_for(self.server, self._level_of(ctx))
 
     def _player_is_swimming(self, player):
         level = getattr(player, "level", None)
@@ -751,6 +658,212 @@ class GS1Host(Host):
         return all(getattr(b, "dead", False) for b in baddies)
 
 
+# ---------------------------------------------------------------------------
+# get_builtin readers. Same shape as the _COMMANDS table below: module-level
+# functions in an explicit name -> reader dict, so grep finds every built-in
+# variable this host answers. Each takes (self, name, indices, ctx, npc,
+# player) and returns UNSET when its gate (a player / an NPC) is missing --
+# GS1Host.get_builtin then falls back to PLAYER_ATTR / NPC_ATTR and finally to
+# the plain flag lookup.
+# ---------------------------------------------------------------------------
+
+#: carry*-flag name -> the carrysprite value it tests.
+_CARRY_SPRITE = {
+    "carriesbush": CarryObjectSprite.BUSH,
+    "carriesstone": CarryObjectSprite.STONE,
+    "carriesvase": CarryObjectSprite.VASE,
+    "carriessign": CarryObjectSprite.SIGN,
+    "carriesblackstone": CarryObjectSprite.BLACKSTONE,
+}
+
+
+def _b_tiles(self, name, indices, ctx, npc, player):
+    resolved = self._resolve_tile(indices, ctx)
+    if resolved is None:
+        return 0.0
+    level, x, y = resolved
+    return float(level.get_tile(x, y))
+
+
+def _b_board(self, name, indices, ctx, npc, player):
+    level = getattr(npc, "level", None) if npc is not None else None
+    if level is None or not hasattr(level, "get_tile"):
+        return 0.0
+    # board[i] is the flat level_index() offset, so read it back the other way.
+    if not indices:
+        return [float(level.get_tile(i % LEVEL_SIZE, i // LEVEL_SIZE))
+                for i in range(LEVEL_TILE_COUNT)]
+    index = int(to_num(indices[0]))
+    if index < 0 or index >= LEVEL_TILE_COUNT:
+        return 0.0
+    return float(level.get_tile(index % LEVEL_SIZE, index // LEVEL_SIZE))
+
+
+def _b_tokenscount(self, name, indices, ctx, npc, player):
+    # number of tokens from the last `tokenize` (GS1Commands.cpp:3138 sets this
+    # on tokenize; mirrors the client host's implementation in
+    # pyreborn.gs1_client)
+    return float(len(getattr(ctx, "tokenize_tokens", []) or []))
+
+
+def _b_timevar2(self, name, indices, ctx, npc, player):
+    # Serverside timevar2 is the Unix timestamp (seconds).
+    return float(int(time.time()))
+
+
+def _b_playerfreezetime(self, name, indices, ctx, npc, player):
+    if player is None or not getattr(player, "is_frozen", False):
+        return -1.0
+    deadline = getattr(player, "_gs1_freeze_until", None)
+    if deadline is None:  # freezeplayer2 has no timed expiry.
+        return 0.0
+    remaining = max(0.0, deadline - time.monotonic())
+    if remaining == 0.0:
+        player.is_frozen = False
+        player._gs1_freeze_until = None
+        return -1.0
+    return remaining
+
+
+def _b_playerlevel(self, name, indices, ctx, npc, player):
+    if player is None:
+        return UNSET
+    lvl = getattr(player, "level", None)
+    return getattr(lvl, "name", "") if lvl else ""
+
+
+def _b_playeronline(self, name, indices, ctx, npc, player):
+    return 1.0 if player is not None else 0.0
+
+
+def _b_isweapon(self, name, indices, ctx, npc, player):
+    return 0.0
+
+
+def _b_playerswimming(self, name, indices, ctx, npc, player):
+    return 1.0 if player is not None and self._player_is_swimming(player) else 0.0
+
+
+def _b_carrying(self, name, indices, ctx, npc, player):
+    return 1.0 if player is not None and int(getattr(player, "carrysprite", 0) or 0) != 0 else 0.0
+
+
+def _b_carries_object(self, name, indices, ctx, npc, player):
+    sprite = int(getattr(player, "carrysprite", 0) or 0) if player is not None else 0
+    return 1.0 if sprite == int(_CARRY_SPRITE[name]) else 0.0
+
+
+def _b_carriesnpc(self, name, indices, ctx, npc, player):
+    carried_npc = (getattr(player, "carryNPC", 0) or
+                   getattr(player, "carry_npc", 0) or
+                   getattr(player, "npc_id", 0)) if player is not None else 0
+    return 1.0 if carried_npc else 0.0
+
+
+def _b_sprite(self, name, indices, ctx, npc, player):
+    if npc is None:
+        return UNSET
+    return self._coerce(npc.flags.get("sprite", 0)) if hasattr(npc, "flags") else 0.0
+
+
+def _b_timeout(self, name, indices, ctx, npc, player):
+    if npc is None:
+        return UNSET
+    end = getattr(npc, "_timer_end", 0.0)
+    return max(0.0, end - time.time()) if end else 0.0
+
+
+def _b_nw_clock(self, name, indices, ctx, npc, player):
+    # nw* clock variables (Server.cpp:178-185, upstream ac3adf01)
+    return _nw_clock_value(name)
+
+
+def _b_shotby(self, name, indices, ctx, npc, player):
+    # hit-source flags: WASSHOT only (GS1Flags.cpp:136-138); washit has no
+    # equivalent source flags upstream.
+    if ctx.active_event != "wasshot":
+        return 0.0
+    return 1.0 if getattr(ctx, "hit_source", None) == _SHOTBY_SOURCE[name] else 0.0
+
+
+def _b_peltwith(self, name, indices, ctx, npc, player):
+    if ctx.active_event != "waspelt":
+        return 0.0
+    return 1.0 if getattr(ctx, "carryobject_type", None) == _PELTWITH_TYPE[name] else 0.0
+
+
+# -- player flags with real pygserver-side backing state
+
+def _b_weaponsenabled(self, name, indices, ctx, npc, player):
+    if player is None:
+        return UNSET
+    return 0.0 if getattr(player, "weapons_disabled", False) else 1.0
+
+
+def _b_playeronhorse(self, name, indices, ctx, npc, player):
+    if player is None:
+        return UNSET
+    hm = getattr(self.server, "horse_manager", None) if self.server is not None else None
+    pid = getattr(player, "id", None)
+    return 1.0 if hm is not None and pid is not None and hm.is_mounted(pid) else 0.0
+
+
+def _b_player_gender(self, name, indices, ctx, npc, player):
+    # player.gender only ever exists if a GS1 script set it
+    # (_c_setgender/_c_setchargender) - pygserver has no other gender source.
+    # 0 = male by the same raw-int convention those commands already use
+    # (classic script "sex" 0/1); unset defaults to male, matching upstream's
+    # PLSTATUS_MALE-set default.
+    if player is None:
+        return UNSET
+    is_male = int(to_num(getattr(player, "gender", 0))) == 0
+    return 1.0 if is_male == (name == "playerismale") else 0.0
+
+
+def _b_isleader(self, name, indices, ctx, npc, player):
+    if player is None:
+        return UNSET
+    leader = self._leader_player(ctx)
+    return 1.0 if leader is not None and leader is player else 0.0
+
+
+# -- NPC/level flags (GS1Flags.cpp setNPCFlags/setLevelFlags)
+
+def _b_visible(self, name, indices, ctx, npc, player):
+    if npc is None:
+        return UNSET
+    return 1.0 if getattr(npc, "visible", True) else 0.0
+
+
+def _b_isonmap(self, name, indices, ctx, npc, player):
+    return 1.0 if self._gmap_info(ctx) is not None else 0.0
+
+
+def _b_compsdead(self, name, indices, ctx, npc, player):
+    return 1.0 if self._all_baddies_dead(ctx) else 0.0
+
+
+_BUILTINS = {
+    "tiles": _b_tiles, "board": _b_board,
+    "tokenscount": _b_tokenscount, "timevar2": _b_timevar2,
+    "playerfreezetime": _b_playerfreezetime, "playerlevel": _b_playerlevel,
+    "playeronline": _b_playeronline, "isweapon": _b_isweapon,
+    "playerswimming": _b_playerswimming,
+    "carrying": _b_carrying, "carriesnpc": _b_carriesnpc,
+    "sprite": _b_sprite, "timeout": _b_timeout,
+    "weaponsenabled": _b_weaponsenabled, "playeronhorse": _b_playeronhorse,
+    "playerismale": _b_player_gender, "playerisfemale": _b_player_gender,
+    "isleader": _b_isleader, "visible": _b_visible,
+    "isonmap": _b_isonmap, "compsdead": _b_compsdead,
+    **{n: _b_carries_object for n in _CARRY_SPRITE},
+    **{n: _b_nw_clock for n in _NW_CLOCK_FIELDS},
+    **{n: _b_shotby for n in _SHOTBY_SOURCE},
+    **{n: _b_peltwith for n in _PELTWITH_TYPE},
+}
+
+# A name in both a reader table and a plain attribute table would be
+# unreachable in the attribute table (readers are consulted first).
+assert not (set(_BUILTINS) & (set(PLAYER_ATTR) | set(NPC_ATTR)))
 # -- command handlers -------------------------------------------------------
 def _c_setimg(self, a, npc, player, ctx):
     if npc is not None and a:
@@ -1171,13 +1284,13 @@ def _c_updateboard(self, a, npc, player, ctx):
         return
     x = max(0, int(to_num(a[0])))
     y = max(0, int(to_num(a[1])))
-    w = max(0, min(64 - x, int(to_num(a[2]))))
-    h = max(0, min(64 - y, int(to_num(a[3]))))
+    w = max(0, min(LEVEL_SIZE - x, int(to_num(a[2]))))
+    h = max(0, min(LEVEL_SIZE - y, int(to_num(a[3]))))
     if w == 0 or h == 0:
         return
     tiles = bytearray()
     for row in range(y, y + h):
-        start = (row * 64 + x) * 2
+        start = level_index(x, row) * 2
         tiles += bytes(lvl._tiles[start:start + w * 2])
     try:
         from .protocol.packets import build_board_modify, build_board_modify2
@@ -1298,6 +1411,21 @@ def _c_putbomb(self, a, npc, player, ctx):
         logger.debug("putbomb failed", exc_info=True)
 
 
+def _explosion_targets(players, x, y, radius):
+    """Those of `players` inside a putexplosion blast centred on (x, y).
+
+    The hitbox is audience.GS1_EXPLOSION_PLAYERS: a BOX (unlike the bomb path's
+    CIRCLE) with an INCLUSIVE boundary, so a player standing exactly `radius`
+    tiles out is hit -- reading it as strict drops the blast's whole outer ring.
+    tests/test_gs1_audience.py pins both the boundary and the shape policy.
+    """
+    return [
+        p for p in players
+        if contains(GS1_EXPLOSION_PLAYERS, x, y, radius,
+                    to_num(getattr(p, "x", 0)), to_num(getattr(p, "y", 0)))
+    ]
+
+
 def _explode(self, ctx, radius, power, x, y):
     lvl = self._level_of(ctx)
     if lvl is None or self.server is None:
@@ -1316,9 +1444,8 @@ def _explode(self, ctx, radius, power, x, y):
         dtype = DamageType.BOMB
     except Exception:
         dtype = None
-    for p in self._players_on_level(ctx):
-        if abs(to_num(getattr(p, "x", 0)) - x) <= radius and abs(to_num(getattr(p, "y", 0)) - y) <= radius:
-            _schedule(cm.apply_damage(p, power * 2, 0, 0, dtype))
+    for p in _explosion_targets(self._players_on_level(ctx), x, y, radius):
+        _schedule(cm.apply_damage(p, power * 2, 0, 0, dtype))
 
 
 def _c_putexplosion(self, a, npc, player, ctx):
@@ -1752,6 +1879,32 @@ for _name in _NOOP_COMMANDS:
     _COMMANDS.setdefault(_name, _c_noop)
 
 
+def players_on_level_for(server, level):
+    """Everyone attached to `level`, via the server's Audience.
+
+    Audience.players_on_level resolves a level NAME through world.get_level, so
+    a level the world does not hold - a detached level, and every level a unit
+    test hands this host directly - would come back empty where the old inline
+    loop worked. Those fall back to the level's own player set, which is the
+    same source the audience reads (audience.py:110).
+    """
+    if server is None or level is None or not hasattr(level, "get_player_ids"):
+        return []
+    name = getattr(level, "name", None)
+    audience = getattr(server, "audience", None)
+    world = getattr(server, "world", None)
+    if (audience is not None and name and world is not None
+            and getattr(world, "get_level", None) is not None
+            and world.get_level(name) is level):
+        return audience.players_on_level(name)
+    out = []
+    for pid in level.get_player_ids():
+        p = server.get_player(pid)
+        if p is not None:
+            out.append(p)
+    return out
+
+
 def leader_player_for_level(server, level):
     """First player on `level` (GS1Flags.cpp isleader / Level::isPlayerLeader),
     used as the triggering-player context for NPC events that have no
@@ -1766,18 +1919,14 @@ def leader_player_for_level(server, level):
     later reads it from an unrelated NPC's `timeout` (e.g. a mountain guard
     that should unblock once `drunkguard` is set).
 
-    Same "first player" lookup as GS1Host._leader_player - Level._players is
-    insertion-ordered, so iterating level.get_player_ids() genuinely yields
-    join order. Returns None (matching prior behaviour) if the level has no
-    players.
+    Same "first player" lookup as GS1Host._leader_player, and it goes through
+    players_on_level_for so level membership has one definition: Level._players
+    is insertion-ordered and the audience preserves that order, so element 0 is
+    genuinely "first to join and still present". Returns None (matching prior
+    behaviour) if the level has no players.
     """
-    if level is None or server is None or not hasattr(level, "get_player_ids"):
-        return None
-    for pid in level.get_player_ids():
-        p = server.get_player(pid)
-        if p is not None:
-            return p
-    return None
+    players = players_on_level_for(server, level)
+    return players[0] if players else None
 
 
 # -- script binding / event firing -----------------------------------------

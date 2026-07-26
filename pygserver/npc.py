@@ -47,6 +47,13 @@ class NPC:
         self.body_image = ""
         self.sword_image = ""
         self.shield_image = ""
+        # NPCPROP_SWORDIMAGE/SHIELDIMAGE carry a power AND the image name
+        # (GServer-v2 NPC.h:591-592 maps both to PropertySwordPower/
+        # PropertyShieldPower). Default 1 = the weakest visible weapon, so an
+        # NPC given only an image still shows one; power 0 makes the reference
+        # client treat the NPC as unarmed.
+        self.sword_power = 1
+        self.shield_power = 1
         self.horse_image = ""
         self.colors = [0, 0, 0, 0, 0]
 
@@ -164,9 +171,10 @@ class NPC:
             NPCPROP.X: self.x,
             NPCPROP.Y: self.y,
             # High-precision position (pixel-accurate), sent alongside X/Y for
-            # compat. Dict order matters here: the client parses props
-            # sequentially and applies each as it's read, so X2/Y2 must come
-            # after X/Y for the high-precision value to win.
+            # compat. The client applies each prop as it reads it, so X2/Y2
+            # (75/76) must arrive after X/Y (2/3) for the high-precision value
+            # to win - which the ascending-id order build_npc_props writes in
+            # guarantees, independently of this dict's insertion order.
             NPCPROP.X2: self.x,
             NPCPROP.Y2: self.y,
             # SPRITE carries the facing direction in its low 2 bits. direction
@@ -185,9 +193,9 @@ class NPC:
         if self.body_image:
             props[NPCPROP.BODYIMAGE] = self.body_image
         if self.sword_image:
-            props[NPCPROP.SWORDIMAGE] = self.sword_image
+            props[NPCPROP.SWORDIMAGE] = (self.sword_power, self.sword_image)
         if self.shield_image:
-            props[NPCPROP.SHIELDIMAGE] = self.shield_image
+            props[NPCPROP.SHIELDIMAGE] = (self.shield_power, self.shield_image)
         if self.horse_image:
             props[NPCPROP.HORSEIMAGE] = self.horse_image
         if getattr(self, 'imagepart', None):

@@ -9,6 +9,8 @@ import logging
 from typing import TYPE_CHECKING, Optional, List, Dict, Tuple
 from pathlib import Path
 
+from reborn_protocol.coords import LEVEL_SIZE, in_level_bounds, level_index
+
 if TYPE_CHECKING:
     from .player import Player
     from .npc import NPC
@@ -41,8 +43,8 @@ class Level:
     """
 
     # Level dimensions
-    WIDTH = 64
-    HEIGHT = 64
+    WIDTH = LEVEL_SIZE
+    HEIGHT = LEVEL_SIZE
     TILE_COUNT = WIDTH * HEIGHT  # 4096 tiles
     BOARD_SIZE = TILE_COUNT * 2  # 8192 bytes (2 bytes per tile)
 
@@ -177,8 +179,8 @@ class Level:
             for y in range(64):
                 if y in board_rows:
                     row_tiles = board_rows[y]
-                    for x, tile_id in enumerate(row_tiles[:64]):
-                        idx = (y * 64 + x) * 2
+                    for x, tile_id in enumerate(row_tiles[:LEVEL_SIZE]):
+                        idx = level_index(x, y) * 2
                         self._tiles[idx] = tile_id & 0xFF
                         self._tiles[idx + 1] = (tile_id >> 8) & 0xFF
 
@@ -279,15 +281,15 @@ class Level:
 
     def get_tile(self, x: int, y: int) -> int:
         """Get tile ID at position."""
-        if 0 <= x < self.WIDTH and 0 <= y < self.HEIGHT:
-            idx = (y * self.WIDTH + x) * 2
+        if in_level_bounds(x, y):
+            idx = level_index(x, y) * 2
             return self._tiles[idx] | (self._tiles[idx + 1] << 8)
         return 0
 
     def set_tile(self, x: int, y: int, tile_id: int):
         """Set tile ID at position."""
-        if 0 <= x < self.WIDTH and 0 <= y < self.HEIGHT:
-            idx = (y * self.WIDTH + x) * 2
+        if in_level_bounds(x, y):
+            idx = level_index(x, y) * 2
             self._tiles[idx] = tile_id & 0xFF
             self._tiles[idx + 1] = (tile_id >> 8) & 0xFF
 

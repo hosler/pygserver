@@ -10,6 +10,7 @@ import asyncio
 
 import pytest
 
+from pygserver.audience import Audience
 from pygserver.combat import CombatManager
 from pygserver.level import Level
 
@@ -46,6 +47,7 @@ class FakeServer:
     def __init__(self):
         self.world = FakeWorld()
         self.combat_manager = CombatManager(self)
+        self.audience = Audience(self)
         self._players = {}
         self.broadcasts = []
 

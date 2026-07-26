@@ -9,12 +9,30 @@ Based on GServer-v2 packet formats.
 
 import logging
 from typing import Dict, Any, Optional, List, Tuple
+from reborn_protocol.props import (
+    COLORS_NEWWORLD,
+    NPC_PROPS,
+    PLAYER_PROPS,
+    StreamPolicy,
+    encode_value,
+    parse_prop_stream,
+    preset_power_image,
+    with_gif_fallback,
+)
+
 from .constants import (
-    PLO, PLI, PLPROP, NPCPROP, BDPROP, BDMODE, LevelItemType,
+    PLO, PLI, PLPROP, BDPROP, BDMODE, LevelItemType,
     PLSTATUS, PLPERM, NPCVISFLAG, NPCBLOCKFLAG
 )
 
 logger = logging.getLogger(__name__)
+
+# GATTRIB prop ids, derived from the descriptor table rather than assumed to be
+# the contiguous 37..74 range: ATTACHNPC/GMAPLEVELX/GMAPLEVELY/Z (42-45) and
+# JOINLEAVELVL/DISCONNECT/LANGUAGE/PLAYERLISTSTATUS (50-53) sit inside it, and
+# reading those as length-prefixed strings desynced the rest of the packet.
+_GATTRIB_IDS = frozenset(
+    pid for pid, desc in PLAYER_PROPS.items() if desc.name.startswith('GATTRIB'))
 
 
 class PacketReader:
@@ -280,145 +298,121 @@ def parse_login_packet(data: bytes) -> dict:
     return result
 
 
-def parse_player_props(data: bytes, start_pos: int = 0) -> dict:
+def _store_power_image(prop_id: int, image_key: str, prefix: str,
+                       gif_fallback: bool):
+    """SWORDPOWER/SHIELDPOWER handler mirroring GServer-v2's account-side reader
+    (PropertySwordPower::deserialize, PropertySerializers.cpp:89, and
+    PropertyShieldPower::deserialize, :147): the power is already de-biased by
+    the shared decoder, and a bare power gets the reference server's synthesised
+    default image name. pyReborn deliberately does NOT synthesise one - a client
+    wants to know whether an image was really on the wire.
+
+    The 1.41-client quirk PropertyShieldPower::deserialize:171 tolerates (a
+    biased power with no image bytes at all) decodes as image None here, which
+    lands on the same empty-image path.
+    """
+    def handler(props, value):
+        power, image = value
+        props[prop_id] = power
+        if image is None:
+            props[image_key] = preset_power_image(prefix, power)
+        else:
+            props[image_key] = with_gif_fallback(image) if gif_fallback else image
+    return handler
+
+
+def _store(prop_id: int):
+    return lambda props, value: props.__setitem__(prop_id, value)
+
+
+def _store_half_tiles(prop_id: int):
+    """X/Y stay in the raw half-tile units callers already divide by 2."""
+    return lambda props, value: props.__setitem__(prop_id, int(value * 2))
+
+
+def _store_chat(props, value):
+    # An empty CURCHAT decodes as None (a length-prefixed string can't tell
+    # "empty" from "absent"), but for chat the difference matters: the client
+    # clears its bubble by sending an empty one, so it is surfaced as '' via the
+    # stream policy's handle_empty. Dropping it left Player.chat stale and never
+    # relayed the clear.
+    props[PLPROP.CURCHAT] = value or ''
+
+
+def _store_head_image(props, value):
+    # Only a custom image name is surfaced; a preset id would change the type
+    # callers (Player.head_image) expect. Routing it through the descriptor is
+    # still what fixes the width - HEADGIF is not a plain length-prefixed
+    # string, so reading it as one desynced every following prop.
+    if isinstance(value, str):
+        props[PLPROP.HEADIMAGE] = value
+
+
+# Inbound client props (PLI_PLAYERPROPS). Keys are the numeric prop ids, plus
+# 'sword_image'/'shield_image'. Only what Player._handle_player_props and the
+# GS1 host consume is surfaced; everything else is still stepped over at its
+# real width from the descriptor table.
+_INBOUND_PROP_HANDLERS = {
+    PLPROP.NICKNAME: _store(PLPROP.NICKNAME),
+    PLPROP.MAXPOWER: _store(PLPROP.MAXPOWER),
+    PLPROP.CURPOWER: _store(PLPROP.CURPOWER),
+    PLPROP.RUPEESCOUNT: _store(PLPROP.RUPEESCOUNT),
+    PLPROP.ARROWSCOUNT: _store(PLPROP.ARROWSCOUNT),
+    PLPROP.BOMBSCOUNT: _store(PLPROP.BOMBSCOUNT),
+    PLPROP.GLOVEPOWER: _store(PLPROP.GLOVEPOWER),
+    PLPROP.BOMBPOWER: _store(PLPROP.BOMBPOWER),
+    PLPROP.SWORDPOWER: _store_power_image(
+        PLPROP.SWORDPOWER, 'sword_image', 'sword', gif_fallback=True),
+    PLPROP.SHIELDPOWER: _store_power_image(
+        PLPROP.SHIELDPOWER, 'shield_image', 'shield', gif_fallback=False),
+    PLPROP.GANI: _store(PLPROP.GANI),
+    PLPROP.HEADIMAGE: _store_head_image,
+    PLPROP.CURCHAT: _store_chat,
+    PLPROP.COLORS: _store(PLPROP.COLORS),
+    PLPROP.X: _store_half_tiles(PLPROP.X),
+    PLPROP.Y: _store_half_tiles(PLPROP.Y),
+    # SPRITE and DIRECTION are the same prop id (17).
+    PLPROP.SPRITE: _store(PLPROP.SPRITE),
+    PLPROP.STATUS: _store(PLPROP.STATUS),
+    PLPROP.CARRYSPRITE: _store(PLPROP.CARRYSPRITE),
+    PLPROP.CURLEVEL: _store(PLPROP.CURLEVEL),
+    PLPROP.CARRYNPC: _store(PLPROP.CARRYNPC),
+    PLPROP.MAGICPOINTS: _store(PLPROP.MAGICPOINTS),
+    PLPROP.ALIGNMENT: _store(PLPROP.ALIGNMENT),
+    PLPROP.ACCOUNTNAME: _store(PLPROP.ACCOUNTNAME),
+    PLPROP.BODYIMAGE: _store(PLPROP.BODYIMAGE),
+    PLPROP.OSTYPE: _store(PLPROP.OSTYPE),
+    PLPROP.TEXTCODEPAGE: _store(PLPROP.TEXTCODEPAGE),
+    PLPROP.X2: _store(PLPROP.X2),
+    PLPROP.Y2: _store(PLPROP.Y2),
+    PLPROP.Z2: _store(PLPROP.Z2),
+    **{pid: _store(pid) for pid in _GATTRIB_IDS},
+}
+
+# Client->server prop streams carry no ordering promise, so unlike the client's
+# reader this does not use ascending ids to detect a desync; it just stops at an
+# id outside the enum, as it always has.
+_INBOUND_STREAM = StreamPolicy(table=PLAYER_PROPS, max_prop_id=100,
+                               handle_empty=frozenset({PLPROP.CURCHAT}))
+
+
+def parse_player_props(data: bytes, start_pos: int = 0,
+                       colors_len: int = COLORS_NEWWORLD) -> dict:
     """
     Parse player properties from packet data.
 
-    Returns dict of property values.
+    Returns dict of property values, keyed by numeric prop id.
+
+    colors_len is PLPROP_COLORS' wire width, a server-wide mode switch on the
+    reference server (PropertyColors::getColorCount -> isNewWorldMode,
+    PropertySerializers.cpp:628-632) rather than anything derivable from the
+    client's version. It defaults to the new-world width so the reader matches
+    build_player_props' 8-byte writes; the classic width stays reachable by
+    passing reborn_protocol.props.COLORS_CLASSIC.
     """
-    props = {}
-    pos = start_pos
-
-    while pos < len(data):
-        prop_id = data[pos] - 32
-        pos += 1
-
-        if prop_id < 0 or prop_id > 100:
-            break
-
-        # String properties
-        if prop_id in [PLPROP.NICKNAME, PLPROP.GANI, PLPROP.HEADIMAGE,
-                       PLPROP.CURCHAT, PLPROP.CURLEVEL, PLPROP.BODYIMAGE,
-                       PLPROP.ACCOUNTNAME, PLPROP.OSTYPE]:
-            if pos < len(data):
-                str_len = data[pos] - 32
-                pos += 1
-                if str_len > 0 and pos + str_len <= len(data):
-                    props[prop_id] = data[pos:pos + str_len].decode('latin-1', errors='replace')
-                    pos += str_len
-
-        # GATTRIB properties (strings)
-        elif PLPROP.GATTRIB1 <= prop_id <= PLPROP.GATTRIB30:
-            if pos < len(data):
-                str_len = data[pos] - 32
-                pos += 1
-                if str_len > 0 and pos + str_len <= len(data):
-                    props[prop_id] = data[pos:pos + str_len].decode('latin-1', errors='replace')
-                    pos += str_len
-
-        # Single byte properties
-        elif prop_id in [PLPROP.MAXPOWER, PLPROP.CURPOWER, PLPROP.ARROWSCOUNT,
-                         PLPROP.BOMBSCOUNT, PLPROP.GLOVEPOWER, PLPROP.BOMBPOWER,
-                         PLPROP.SPRITE, PLPROP.X, PLPROP.Y, PLPROP.DIRECTION,
-                         PLPROP.STATUS, PLPROP.CARRYSPRITE,
-                         PLPROP.MAGICPOINTS, PLPROP.ALIGNMENT]:
-            if pos < len(data):
-                props[prop_id] = data[pos] - 32
-                pos += 1
-
-        # ID of the NPC currently carried by the player (3-byte GInt).
-        elif prop_id == PLPROP.CARRYNPC:
-            if pos + 2 < len(data):
-                b1 = data[pos] - 32
-                b2 = data[pos + 1] - 32
-                b3 = data[pos + 2] - 32
-                props[prop_id] = (b1 << 14) + (b2 << 7) + b3  # + not |: carry crosses bit 14 (see codec.read_gint3)
-                pos += 3
-
-        # Sword/Shield power (1 byte, or 1 + string if > threshold)
-        elif prop_id == PLPROP.SWORDPOWER:
-            if pos < len(data):
-                power = data[pos] - 32
-                pos += 1
-                if power > 4:
-                    str_len = data[pos] - 32 if pos < len(data) else 0
-                    pos += 1
-                    if str_len > 0 and pos + str_len <= len(data):
-                        props['sword_image'] = data[pos:pos + str_len].decode('latin-1', errors='replace')
-                        pos += str_len
-                props[prop_id] = power
-
-        elif prop_id == PLPROP.SHIELDPOWER:
-            if pos < len(data):
-                power = data[pos] - 32
-                pos += 1
-                if power > 3:
-                    str_len = data[pos] - 32 if pos < len(data) else 0
-                    pos += 1
-                    if str_len > 0 and pos + str_len <= len(data):
-                        props['shield_image'] = data[pos:pos + str_len].decode('latin-1', errors='replace')
-                        pos += str_len
-                props[prop_id] = power
-
-        # Colors (5 bytes)
-        elif prop_id == PLPROP.COLORS:
-            if pos + 4 < len(data):
-                props[prop_id] = [data[pos + i] - 32 for i in range(5)]
-                pos += 5
-
-        # Rupees (3 bytes gInt3)
-        elif prop_id == PLPROP.RUPEESCOUNT:
-            if pos + 2 < len(data):
-                b1 = data[pos] - 32
-                b2 = data[pos + 1] - 32
-                b3 = data[pos + 2] - 32
-                props[prop_id] = (b1 << 14) + (b2 << 7) + b3  # + not |: carry crosses bit 14 (see codec.read_gint3)
-                pos += 3
-
-        # Text codepage (3 bytes gInt3)
-        elif prop_id == PLPROP.TEXTCODEPAGE:
-            if pos + 2 < len(data):
-                b1 = data[pos] - 32
-                b2 = data[pos + 1] - 32
-                b3 = data[pos + 2] - 32
-                props[prop_id] = (b1 << 14) + (b2 << 7) + b3  # + not |: carry crosses bit 14 (see codec.read_gint3)
-                pos += 3
-
-        # High-precision position (2 bytes each)
-        elif prop_id == PLPROP.X2:
-            if pos + 1 < len(data):
-                b1 = data[pos] - 32
-                b2 = data[pos + 1] - 32
-                pos += 2
-                raw = (b1 << 7) | b2
-                pixels = raw >> 1
-                if raw & 1:
-                    pixels = -pixels
-                props[prop_id] = pixels / 16.0
-
-        elif prop_id == PLPROP.Y2:
-            if pos + 1 < len(data):
-                b1 = data[pos] - 32
-                b2 = data[pos + 1] - 32
-                pos += 2
-                raw = (b1 << 7) | b2
-                pixels = raw >> 1
-                if raw & 1:
-                    pixels = -pixels
-                props[prop_id] = pixels / 16.0
-
-        elif prop_id == PLPROP.Z2:
-            if pos + 1 < len(data):
-                b1 = data[pos] - 32
-                b2 = data[pos + 1] - 32
-                pos += 2
-                raw = (b1 << 7) | b2
-                props[prop_id] = raw
-
-        # Default: skip 1 byte
-        else:
-            pos += 1
-
+    props, _clean, _pos = parse_prop_stream(
+        data, start_pos, _INBOUND_STREAM.with_colors_len(colors_len),
+        _INBOUND_PROP_HANDLERS)
     return props
 
 
@@ -475,115 +469,33 @@ def build_player_props(props: dict) -> bytes:
     return builder.build()
 
 
-# Sword/shield power: a raw value below the threshold is a bare preset power; at
-# or above it the power is (raw - threshold) followed by an image string. Match
-# the v6.037 (new-world) client reader in pyReborn (_read_sword).
-_SWORD_THRESHOLD = 30
-_SHIELD_THRESHOLD = 10
+# Outbound props are for v6.037 (new-world) clients, so PLPROP_COLORS is 8 wide.
+_OUTBOUND_COLORS = COLORS_NEWWORLD
 
 
 def _write_player_prop(builder: 'PacketBuilder', prop_id: int, value) -> None:
     """Write a single player property (id + correctly-sized payload).
 
-    Unknown props are skipped WITHOUT writing the prop id, since a bare id with
-    no payload desyncs every following prop in the packet.
+    Widths come from reborn_protocol.props.PLAYER_PROPS, so the writer and the
+    reader above cannot disagree. A prop that cannot be encoded is skipped
+    WITHOUT writing its id, since a bare id with no payload desyncs every
+    following prop in the packet.
+
+    `value` is the natural Python form for the prop: tiles for X/Y/X2/Y2, an int
+    power or a (power, image) pair for SWORDPOWER/SHIELDPOWER, a preset int or a
+    name for HEADIMAGE, a sequence for COLORS.
     """
-    # String properties. HORSEGIF (21) is a plain PropertyString (GServer-v2
-    # server/include/object/Player.h PLAYERPROP_LIST + PropertySerializers.h
-    # PropertyString::serialize - length-prefixed, unlike the HEADGIF
-    # 100-offset form), so it belongs here rather than needing special-casing.
-    if prop_id in (PLPROP.NICKNAME, PLPROP.GANI,
-                   PLPROP.CURCHAT, PLPROP.CURLEVEL, PLPROP.BODYIMAGE,
-                   PLPROP.ACCOUNTNAME, PLPROP.HORSEGIF):
-        builder.write_gchar(prop_id)
-        builder.write_gstring(str(value))
-
-    # Head image (HEADGIF, prop 11): a preset id 0-99 is a bare gchar; a custom
-    # image string is gchar(100 + len) followed by the raw chars. Matches
-    # GServer-v2 PropertyHeadGif::serialize and the client _read_headgif.
-    elif prop_id == PLPROP.HEADIMAGE:
-        builder.write_gchar(prop_id)
-        if isinstance(value, int):
-            builder.write_gchar(min(99, value))
-        else:
-            name = str(value).encode('latin-1')
-            builder.write_gchar(100 + len(name))
-            builder.write_bytes(name)
-
-    # GATTRIB strings
-    elif PLPROP.GATTRIB1 <= prop_id <= PLPROP.GATTRIB30:
-        builder.write_gchar(prop_id)
-        builder.write_gstring(str(value))
-
-    # Single byte. HORSEBUSHES (22) is GServer-v2's PropertyNumeric<GBYTE1>
-    # (server/include/object/Player.h) - a plain gchar, independent of the
-    # direction-packed byte used on the wire in the PLI/PLO_HORSEADD packet.
-    elif prop_id in (PLPROP.MAXPOWER, PLPROP.CURPOWER, PLPROP.ARROWSCOUNT,
-                     PLPROP.BOMBSCOUNT, PLPROP.GLOVEPOWER, PLPROP.BOMBPOWER,
-                     PLPROP.SPRITE, PLPROP.DIRECTION, PLPROP.STATUS,
-                     PLPROP.MAGICPOINTS, PLPROP.ALIGNMENT, PLPROP.HORSEBUSHES):
-        builder.write_gchar(prop_id)
-        builder.write_gchar(int(value))
-
-    # Sword/shield power (bare gchar for preset powers; image form above threshold)
-    elif prop_id == PLPROP.SWORDPOWER:
-        builder.write_gchar(prop_id)
-        _write_sword_prop(builder, value, _SWORD_THRESHOLD)
-    elif prop_id == PLPROP.SHIELDPOWER:
-        builder.write_gchar(prop_id)
-        _write_sword_prop(builder, value, _SHIELD_THRESHOLD)
-
-    # Low-precision position (half-tiles)
-    elif prop_id == PLPROP.X:
-        builder.write_gchar(prop_id)
-        builder.write_gchar(int(value * 2))
-    elif prop_id == PLPROP.Y:
-        builder.write_gchar(prop_id)
-        builder.write_gchar(int(value * 2))
-
-    # High-precision position
-    elif prop_id == PLPROP.X2:
-        builder.write_gchar(prop_id)
-        builder.write_position2(float(value))
-    elif prop_id == PLPROP.Y2:
-        builder.write_gchar(prop_id)
-        builder.write_position2(float(value))
-
-    # Colors: v6.037 new-world expects 8 bytes (pad shorter lists with 0).
-    elif prop_id == PLPROP.COLORS:
-        builder.write_gchar(prop_id)
-        colors = list(value)[:8]
-        colors += [0] * (8 - len(colors))
-        for c in colors:
-            builder.write_gchar(int(c))
-
-    # Rupees (gInt3)
-    elif prop_id == PLPROP.RUPEESCOUNT:
-        builder.write_gchar(prop_id)
-        builder.write_gint3(int(value))
-
-    # Kills/deaths (GBYTE3 = gInt3, GServer-v2 server/include/object/Player.h
-    # PLAYERPROP_LIST); previously unhandled, so death/kill counters were
-    # silently dropped instead of reaching the client.
-    elif prop_id in (PLPROP.KILLSCOUNT, PLPROP.DEATHSCOUNT):
-        builder.write_gchar(prop_id)
-        builder.write_gint3(int(value))
-
-    else:
+    desc = PLAYER_PROPS.get(int(prop_id))
+    if desc is None:
         logger.warning("build_player_props: unhandled prop %s (skipped)", prop_id)
-
-
-def _write_sword_prop(builder: 'PacketBuilder', value, threshold: int) -> None:
-    """Write a SWORDPOWER/SHIELDPOWER payload.
-
-    `value` may be an int power (no image) or a (power, image) tuple.
-    """
-    if isinstance(value, (tuple, list)):
-        power, image = int(value[0]), str(value[1])
-        builder.write_gchar(threshold + power)
-        builder.write_gstring(image)
-    else:
-        builder.write_gchar(int(value))
+        return
+    try:
+        payload = encode_value(desc, value, _OUTBOUND_COLORS)
+    except (TypeError, ValueError) as exc:
+        logger.warning("build_player_props: prop %s (%s) value %r not encodable: %s",
+                       prop_id, desc.name, value, exc)
+        return
+    builder.write_gchar(int(prop_id)).write_bytes(payload)
 
 
 def build_other_player_props(player_id: int, props: dict) -> bytes:
@@ -601,57 +513,56 @@ def build_other_player_props(player_id: int, props: dict) -> bytes:
     return builder.build()
 
 
-# NPCProp string ids (length-prefixed strings), per GServer-v2 NPC.h + the
-# client parse_npc_props. IMAGE, SWORD/SHIELD image, GANI, MESSAGE, NICKNAME,
-# HORSEIMAGE, BODYIMAGE and all GATTRIBs.
-_NPC_STRING_PROPS = frozenset(
-    {0, 10, 11, 12, 15, 20, 21, 35} | set(range(36, 48)) | set(range(53, 74))
-)
-
-
 def build_npc_props(npc_id: int, props: dict) -> bytes:
     """Build PLO_NPCPROPS packet.
 
-    Encodings mirror GServer-v2 NPC props / the client parse_npc_props:
-    IMAGE/GANI/etc are length-prefixed strings, SCRIPT is a gshort-length string,
-    X/Y are half-tiles, HEADIMAGE uses the HEADGIF 100-offset form, everything
-    else is a single byte.
+    Widths and encodings come from reborn_protocol.props.NPC_PROPS, so this and
+    the client's parse_npc_props (which reads the same table) cannot disagree.
+    `value` is the natural Python form for the prop: tiles for X/Y/X2/Y2, an int
+    power or a (power, image) pair for SWORDIMAGE/SHIELDIMAGE, a preset int or a
+    name for HEADIMAGE, a sequence for COLORS.
+
+    The hand-rolled version this replaces wrote SWORDIMAGE/SHIELDIMAGE (ids
+    10/11) as plain gstrings, but GServer-v2 maps them to PropertySwordPower /
+    PropertyShieldPower (server/include/object/NPC.h:591-592) - a biased power
+    with the image name only after it. A gstring there decoded as a bare power
+    of 10 and left the length byte to be read as the next prop id, desyncing the
+    rest of that NPC's prop stream.
+
+    Ids are sorted for the same reason build_player_props sorts them: the
+    reference server emits NPCProp ids in ascending order (NPC.h's
+    FOR_LIST_OF_NPC_PROPS walked in enum order) and the client's parser ENDS THE
+    PARSE at the first descending id. Emitting in dict-insertion order meant
+    NPC.build_props_packet's natural grouping (image, x, y, x2, y2, sprite, ...)
+    stopped the client dead at `sprite`, so every NPC arrived with only its
+    image and position - no gani, nickname, colors, gear or gattribs.
     """
     builder = PacketBuilder().write_gchar(PLO.NPCPROPS).write_gint3(npc_id)
 
-    for prop_id, value in props.items():
-        builder.write_gchar(prop_id)
-
-        if prop_id in _NPC_STRING_PROPS:
-            builder.write_gstring(str(value))
-        elif prop_id == NPCPROP.SCRIPT:  # gShort length + raw
-            encoded = str(value).encode('latin-1', errors='replace')
-            builder.write_gshort(len(encoded)).write_bytes(encoded)
-        elif prop_id in (NPCPROP.X, NPCPROP.Y):
-            builder.write_gchar(int(value * 2))
-        elif prop_id in (NPCPROP.X2, NPCPROP.Y2):  # high-precision position (gshort, pixels/16)
-            builder.write_position2(float(value))
-        elif prop_id == NPCPROP.HEADIMAGE:  # HEADGIF 100-offset string
-            name = str(value).encode('latin-1')
-            builder.write_gchar(100 + len(name)).write_bytes(name)
-        elif prop_id == NPCPROP.COLORS:  # 8 colors, each written as a gchar (client reads byte-32)
-            colors = list(value)[:8]
-            colors += [0] * (8 - len(colors))
-            for c in colors:
-                builder.write_gchar(int(c) & 0xFF)
-        elif prop_id == NPCPROP.RUPEES:
-            builder.write_gint3(int(value))
-        elif prop_id == NPCPROP.IMAGEPART:
-            # PropertyImagePart: gushort x, gushort y, gchar w, gchar h -
-            # sub-rect of the NPC image sheet (GS1 setimgpart)
-            px, py, pw, ph = (int(v) for v in value)
-            builder.write_gshort(px).write_gshort(py)
-            builder.write_gchar(pw).write_gchar(ph)
-        else:
-            builder.write_gchar(int(value) if isinstance(value, (int, float)) else 0)
+    for prop_id, value in sorted(props.items()):
+        _write_npc_prop(builder, prop_id, value)
 
     builder.write_byte(ord('\n'))
     return builder.build()
+
+
+def _write_npc_prop(builder: 'PacketBuilder', prop_id: int, value) -> None:
+    """Write a single NPC property (id + correctly-sized payload).
+
+    A prop that cannot be encoded is skipped WITHOUT writing its id, since a
+    bare id with no payload desyncs every following prop in the packet.
+    """
+    desc = NPC_PROPS.get(int(prop_id))
+    if desc is None:
+        logger.warning("build_npc_props: unhandled prop %s (skipped)", prop_id)
+        return
+    try:
+        payload = encode_value(desc, value, _OUTBOUND_COLORS)
+    except (TypeError, ValueError) as exc:
+        logger.warning("build_npc_props: prop %s (%s) value %r not encodable: %s",
+                       prop_id, desc.name, value, exc)
+        return
+    builder.write_gchar(int(prop_id)).write_bytes(payload)
 
 
 def build_chat(player_id: int, message: str) -> bytes:
@@ -1893,47 +1804,12 @@ def parse_verify_want_send(data: bytes) -> Tuple[int, str]:
     return checksum, filename
 
 
-def parse_npc_props(data: bytes) -> Tuple[int, dict]:
-    """Parse PLI_NPCPROPS packet.
-
-    Returns:
-        Tuple of (npc_id, props_dict)
-    """
-    reader = PacketReader(data)
-    npc_id = reader.read_gint3()
-    props = {}
-
-    while reader.has_data():
-        prop_id = reader.read_gchar()
-        if prop_id >= NPCPROP_COUNT:
-            break
-
-        if prop_id == NPCPROP.IMAGE:
-            props[prop_id] = reader.read_gstring()
-        elif prop_id == NPCPROP.SCRIPT:
-            props[prop_id] = reader.read_gstring_short()
-        elif prop_id in [NPCPROP.X, NPCPROP.Y]:
-            props[prop_id] = reader.read_gchar() / 2.0
-        elif prop_id in [NPCPROP.X2, NPCPROP.Y2]:
-            raw = reader.read_gshort()
-            pixels = raw >> 1
-            if raw & 1:
-                pixels = -pixels
-            props[prop_id] = pixels / 16.0
-        elif prop_id == NPCPROP.COLORS:
-            props[prop_id] = [reader.read_byte() for _ in range(5)]
-        elif prop_id == NPCPROP.ID:
-            props[prop_id] = reader.read_gint3()
-        elif prop_id == NPCPROP.RUPEES:
-            props[prop_id] = reader.read_gint3()
-        elif prop_id in [NPCPROP.MESSAGE, NPCPROP.NICKNAME, NPCPROP.GANI,
-                         NPCPROP.SWORDIMAGE, NPCPROP.SHIELDIMAGE, NPCPROP.BODYIMAGE,
-                         NPCPROP.HEADIMAGE, NPCPROP.HORSEIMAGE]:
-            props[prop_id] = reader.read_gstring()
-        else:
-            props[prop_id] = reader.read_gchar()
-
-    return npc_id, props
+# There is deliberately no inbound PLI_NPCPROPS parser here: the reference server
+# refuses that packet outright when it owns the NPCs and pygserver always does,
+# so the packet id is left unregistered (see handlers/entities.py's module
+# docstring for the oracle). The parser this replaces was unreachable code that
+# also still read NPCPROP ids 10/11 as plain gstrings instead of the
+# PropertySwordPower/ShieldPower form build_npc_props writes.
 
 
 # =============================================================================
@@ -1982,7 +1858,3 @@ def build_profile(account: str, profile: dict, online_time: str = '') -> bytes:
     builder.write_gstring(online_time)
     builder.write_newline()
     return builder.build()
-
-
-# Re-export NPCPROP_COUNT for parser
-from .constants import NPCPROP_COUNT

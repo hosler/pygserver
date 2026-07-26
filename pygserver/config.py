@@ -57,6 +57,12 @@ class ServerConfig:
     max_players: int = 100
     heartbeat_interval: float = 5.0  # seconds
 
+    # Gear power limits. Names and defaults are GServer-v2's own server options
+    # (SettingCache declarations, server/include/Server.h:156-158).
+    sword_limit: int = 3
+    shield_limit: int = 3
+    heal_swords: bool = False
+
     # Ambient world population: number of wandering VillagerNPCs to spawn on
     # the start level at boot (0 disables). See npcs/villager.py.
     villager_count: int = 8
@@ -142,10 +148,40 @@ class ServerConfig:
                             config.max_players = int(value)
                         elif key == 'gmaps':
                             config.gmaps = [g.strip() for g in value.split(',') if g.strip()]
+                        elif key == 'swordlimit':
+                            config.sword_limit = int(value)
+                        elif key == 'shieldlimit':
+                            config.shield_limit = int(value)
+                        elif key == 'healswords':
+                            config.heal_swords = value.lower() == 'true'
         except FileNotFoundError:
             pass  # Use defaults
 
         return config
+
+    # -- gear limits ----------------------------------------------------------
+    #
+    # A client is free to claim any sword/shield power in PLI_PLAYERPROPS, so the
+    # value has to be clamped before it is stored. The reference server does that
+    # in props::Limits (server/src/utilities/PropertySerializers.cpp:652-664),
+    # driven by these options rather than by the hard Limits::MaxSwordPower /
+    # MaxShieldPower constants (which applySwordPower/applyShieldPower never
+    # consult). Clamping belongs here and not in the wire parser: the parse of
+    # bare powers 1..4 and of the biased power+30 / power+10 forms has to stay
+    # faithful for the packet to stay aligned.
+
+    def apply_sword_power(self, power: int) -> int:
+        """Clamp a claimed sword power to `swordlimit`.
+
+        The floor is 0 unless `healswords` is on, which allows negative powers
+        down to -swordlimit (a sword that heals instead of damaging).
+        """
+        minimum = -self.sword_limit if self.heal_swords else 0
+        return max(minimum, min(int(power), self.sword_limit))
+
+    def apply_shield_power(self, power: int) -> int:
+        """Clamp a claimed shield power to `shieldlimit` (floor 0)."""
+        return max(0, min(int(power), self.shield_limit))
 
     def to_file(self, path: str):
         """Save configuration to file."""

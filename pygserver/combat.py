@@ -13,6 +13,12 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, List, Dict, Tuple, Set
 from enum import IntEnum
 
+from .audience import (
+    ARROW_HIT_PLAYERS,
+    BOMB_BLAST_NPCS,
+    BOMB_BLAST_PLAYERS,
+    FIRESPY_HIT_PLAYERS,
+)
 from .protocol.constants import PLO, PLPROP
 from .protocol.packets import (
     PacketBuilder,
@@ -344,24 +350,18 @@ class CombatManager:
         await self.server.broadcast_to_level(bomb.level_name, packet)
 
         # Damage players in radius
-        for player_id in level.get_player_ids():
-            player = self.server.get_player(player_id)
-            if not player:
-                continue
-
-            # Calculate distance
+        for player in self.server.audience.players_near(
+                bomb.level_name, bomb.x, bomb.y, radius, BOMB_BLAST_PLAYERS):
             dx = player.x - bomb.x
             dy = player.y - bomb.y
             distance = (dx * dx + dy * dy) ** 0.5
-
-            if distance < radius:
-                # Apply damage with knockback away from explosion
-                knockback_x = dx / (distance + 0.1) * 2  # Prevent division by zero
-                knockback_y = dy / (distance + 0.1) * 2
-                await self.apply_damage(
-                    player, damage, knockback_x, knockback_y,
-                    DamageType.BOMB, bomb.player_id
-                )
+            # Apply damage with knockback away from explosion
+            knockback_x = dx / (distance + 0.1) * 2  # Prevent division by zero
+            knockback_y = dy / (distance + 0.1) * 2
+            await self.apply_damage(
+                player, damage, knockback_x, knockback_y,
+                DamageType.BOMB, bomb.player_id
+            )
 
         # Damage baddies in radius
         if hasattr(self.server, 'baddy_manager'):
@@ -377,18 +377,13 @@ class CombatManager:
             attacker = None
             if hasattr(self.server, 'get_player'):
                 attacker = self.server.get_player(bomb.player_id)
-            for npc in npc_mgr.get_npcs_on_level(level):
-                if not getattr(npc, 'visible', True):
-                    continue
-                dx = npc.x - bomb.x
-                dy = npc.y - bomb.y
-                distance = (dx * dx + dy * dy) ** 0.5
-                if distance < radius:
-                    npc.hearts = max(0.0, npc.hearts - damage / 2.0)
-                    if hasattr(npc, 'mark_dirty'):
-                        npc.mark_dirty()
-                    if hasattr(npc_mgr, 'on_npc_exploded'):
-                        await npc_mgr.on_npc_exploded(npc, attacker)
+            for npc in self.server.audience.npcs_near(
+                    level, bomb.x, bomb.y, radius, BOMB_BLAST_NPCS):
+                npc.hearts = max(0.0, npc.hearts - damage / 2.0)
+                if hasattr(npc, 'mark_dirty'):
+                    npc.mark_dirty()
+                if hasattr(npc_mgr, 'on_npc_exploded'):
+                    await npc_mgr.on_npc_exploded(npc, attacker)
 
         logger.debug(f"Bomb detonated at ({bomb.x}, {bomb.y}) with radius {radius}")
 
@@ -507,32 +502,23 @@ class CombatManager:
                 self._arrows[arrow.level_name].pop(arrow.id, None)
             return
 
-        # Check player collision
-        for player_id in level.get_player_ids():
-            if player_id == arrow.player_id:
-                continue  # Don't hit self
+        # Check player collision (a ~1-tile box around the arrow; the shooter
+        # is excluded so an arrow can't hit its own owner)
+        for player in self.server.audience.players_near(
+                arrow.level_name, arrow.x, arrow.y, 1.0, ARROW_HIT_PLAYERS,
+                exclude={arrow.player_id}):
+            # Hit! Apply damage and remove arrow
+            knockback_x = dx * 2
+            knockback_y = dy * 2
+            await self.apply_damage(
+                player, self.arrow_damage, knockback_x, knockback_y,
+                DamageType.ARROW, arrow.player_id
+            )
 
-            player = self.server.get_player(player_id)
-            if not player:
-                continue
-
-            # Check if arrow hits player (within ~1 tile)
-            dist_x = abs(player.x - arrow.x)
-            dist_y = abs(player.y - arrow.y)
-
-            if dist_x < 1.0 and dist_y < 1.0:
-                # Hit! Apply damage and remove arrow
-                knockback_x = dx * 2
-                knockback_y = dy * 2
-                await self.apply_damage(
-                    player, self.arrow_damage, knockback_x, knockback_y,
-                    DamageType.ARROW, arrow.player_id
-                )
-
-                # Remove arrow
-                if arrow.level_name in self._arrows:
-                    self._arrows[arrow.level_name].pop(arrow.id, None)
-                return
+            # Remove arrow
+            if arrow.level_name in self._arrows:
+                self._arrows[arrow.level_name].pop(arrow.id, None)
+            return
 
         # Check baddy collision
         arrow_consumed = False
@@ -739,23 +725,14 @@ class CombatManager:
         packet = build_fire_spy(x, y)
         await self.server.broadcast_to_level(player.level.name, packet)
 
-        # Damage players at position
-        for player_id in player.level.get_player_ids():
-            if player_id == player.id:
-                continue
-
-            other = self.server.get_player(player_id)
-            if not other:
-                continue
-
-            dist_x = abs(other.x - x)
-            dist_y = abs(other.y - y)
-
-            if dist_x < 1.5 and dist_y < 1.5:
-                await self.apply_damage(
-                    other, 2, 0, 0,
-                    DamageType.FIRE, player.id
-                )
+        # Damage players at position (1.5-tile box, sender excluded)
+        for other in self.server.audience.players_near(
+                player.level.name, x, y, 1.5, FIRESPY_HIT_PLAYERS,
+                exclude={player.id}):
+            await self.apply_damage(
+                other, 2, 0, 0,
+                DamageType.FIRE, player.id
+            )
 
     async def handle_throw_carried(self, player: 'Player', direction: int,
                                     carrysprite: int):

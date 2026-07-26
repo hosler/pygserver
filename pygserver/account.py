@@ -460,6 +460,12 @@ class AccountManager:
         """
         player.head_image = account.head_image
         player.body_image = account.body_image
+        # Gear images travel with their power (both halves of NPCPROP/PLPROP
+        # SWORDPOWER): the account already persisted these two fields, but
+        # neither side of the load/save pair used them, so a gear change was
+        # reduced to its power number on reconnect.
+        player.sword_image = account.sword_image
+        player.shield_image = account.shield_image
         player.colors = account.colors.copy()
         player.max_hearts = account.max_hearts
         # Don't let player spawn dead - restore to max hearts if saved with 0
@@ -492,6 +498,8 @@ class AccountManager:
         """
         account.head_image = player.head_image
         account.body_image = player.body_image
+        account.sword_image = player.sword_image
+        account.shield_image = player.shield_image
         account.colors = player.colors.copy()
         account.max_hearts = player.max_hearts
         account.hearts = player.hearts

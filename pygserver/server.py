@@ -12,6 +12,7 @@ import time
 from typing import Dict, Optional, Set, List
 from pathlib import Path
 
+from .audience import Audience
 from .config import ServerConfig
 from .player import Player
 from .level import Level
@@ -42,6 +43,10 @@ class GameServer:
 
         # World/level management
         self.world = World(self)
+
+        # "Who is affected by this event" - the one spatial/level query service
+        # (see audience.py for the shape policies).
+        self.audience = Audience(self)
 
         # NPC management
         self.npc_manager = NPCManager(self)
@@ -422,12 +427,7 @@ class GameServer:
             packet: Packet data to send
             exclude: Set of player IDs to exclude
         """
-        exclude = exclude or set()
-        # snapshot: send_raw awaits, during which a disconnect can mutate players
-        for player in list(self.players.values()):
-            if player.logged_in and player.level and player.level.name == level_name:
-                if player.id not in exclude:
-                    await player.send_raw(packet)
+        await self.audience.broadcast_to_level(level_name, packet, exclude)
 
     async def broadcast_to_all(self, packet: bytes, exclude: Optional[Set[int]] = None):
         """Broadcast packet to all logged-in players."""
@@ -460,10 +460,7 @@ class GameServer:
 
     def get_players_on_level(self, level_name: str) -> List[Player]:
         """Get all players on a level."""
-        return [
-            p for p in self.players.values()
-            if p.logged_in and p.level and p.level.name == level_name
-        ]
+        return self.audience.players_on_level(level_name)
 
     def get_all_players(self) -> List[Player]:
         """Get all logged-in players."""

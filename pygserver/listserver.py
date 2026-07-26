@@ -18,6 +18,7 @@ from reborn_protocol import (
     PacketBuilder, PacketReader, Gen1Codec, Gen2Codec,
     CompressionType
 )
+from reborn_protocol.props import PLAYER_PROPS, encode_value
 
 if TYPE_CHECKING:
     from .server import GameServer
@@ -521,7 +522,15 @@ class ServerListClient:
         await self._send_packet(packet.build())
 
     async def send_players(self):
-        """Send current player list to list server."""
+        """Send current player list to list server.
+
+        The filter is `logged_in`: `player.loaded` never existed on Player, so
+        this raised AttributeError on the first player. It went unnoticed
+        because it only fires on a (re)connection made while somebody is
+        already online - at startup the loop body never runs - and _connect()'s
+        broad `except Exception` then swallowed it and logged the mismatch as
+        "Failed to connect to list server".
+        """
         if not self.connected:
             return
 
@@ -531,12 +540,22 @@ class ServerListClient:
         await self._send_packet(packet.build())
 
         # Add each player
-        for player in self.server.players.values():
-            if player.loaded:
+        for player in list(self.server.players.values()):
+            if player.logged_in:
                 await self.add_player(player)
 
     async def add_player(self, player: 'Player'):
-        """Add a player to the list server."""
+        """Add a player to the list server.
+
+        Format (graal-serverlist ServerConnection::msgSVI_PLYRADD, new_protocol
+        branch, server/src/ServerConnection.cpp:935): {GUSHORT player id}
+        {GUCHAR client type}{raw PlayerProp stream}, which the list server hands
+        to ServerPlayer::setProps - a prop-by-prop reader, so this subset does not
+        have to be in ascending id order the way a client-facing packet does.
+        Widths come from the shared descriptor table; PLPROP_IPADDR in particular
+        is a GBYTE5 there (ServerPlayer.cpp:60 reads it with readGInt5), not the
+        single byte this used to write.
+        """
         if not self.connected:
             return
 
@@ -545,32 +564,17 @@ class ServerListClient:
         packet.write_gshort(player.id)
         packet.write_gchar(player.connection_type)
 
-        # Add player properties
-        packet.write_gchar(PLPROP.ACCOUNTNAME)
-        packet.write_gchar(len(player.account_name))
-        packet.write_bytes(player.account_name.encode('latin1'))
-
-        packet.write_gchar(PLPROP.NICKNAME)
-        packet.write_gchar(len(player.nickname))
-        packet.write_bytes(player.nickname.encode('latin1'))
-
-        packet.write_gchar(PLPROP.CURLEVEL)
-        level_name = player.level.name if player.level else ""
-        packet.write_gchar(len(level_name))
-        packet.write_bytes(level_name.encode('latin1'))
-
-        packet.write_gchar(PLPROP.X)
-        packet.write_gchar(int(player.x * 2))
-
-        packet.write_gchar(PLPROP.Y)
-        packet.write_gchar(int(player.y * 2))
-
-        packet.write_gchar(PLPROP.ALIGNMENT)
-        packet.write_gchar(getattr(player, 'ap', 0))  # alignment points, default 0
-
-        # IP address (don't send actual IP for privacy)
-        packet.write_gchar(PLPROP.IPADDR)
-        packet.write_gchar(0)  # Empty IP
+        for prop_id, value in (
+            (PLPROP.ACCOUNTNAME, player.account_name),
+            (PLPROP.NICKNAME, player.nickname),
+            (PLPROP.CURLEVEL, player.level.name if player.level else ""),
+            (PLPROP.X, player.x),
+            (PLPROP.Y, player.y),
+            (PLPROP.ALIGNMENT, getattr(player, 'ap', 0)),
+            (PLPROP.IPADDR, 0),  # 0, not the real IP, for privacy
+        ):
+            packet.write_gchar(prop_id)
+            packet.write_bytes(encode_value(PLAYER_PROPS[prop_id], value))
 
         await self._send_packet(packet.build())
 

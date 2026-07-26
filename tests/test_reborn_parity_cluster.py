@@ -1,6 +1,7 @@
 import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
+from pygserver.audience import Audience
 from pygserver.baddy import Baddy, BaddyManager, BaddyType
 from pygserver.level import Level
 from pygserver.player import Player
@@ -127,6 +128,7 @@ class World:
 class LevelServer:
     def __init__(self, levels, gmap_levels=()):
         self.world = World(levels, gmap_levels)
+        self.audience = Audience(self)
         self.players = {}
         self.broadcast_to_level = AsyncMock()
         self.npc_manager = MagicMock()

@@ -1,40 +1,51 @@
 """
 pygserver.player - Player connection and state management
 
-Handles individual player connections, login, packet handling,
-and player state. Implements all PLI packet handlers.
+Player is the façade one connected client is reached through. The pieces behind
+it live in their own modules:
+
+- `player_session.PlayerSession` - socket, codec, framing buffer (transport);
+- `player_state` - Identity/Character/Inventory/Status state holders, exposed
+  under their historical flat names via `_STATE_ALIASES` below;
+- `player_login.LoginService` - the login handshake and the single idempotent
+  login-completion path both verification flows converge on;
+- `handlers/` - the PLI packet handlers, as domain mixins whose `@handles`
+  decorations build the dispatch table.
+
+What stays here: level membership and transitions (`warp`, `_send_level`), the
+connection lifecycle (`run`, `_cleanup`), the send helpers and the small
+player-data accessors the managers and NPC scripts use.
 """
 
 import asyncio
 import logging
-import struct
 import time
-from typing import TYPE_CHECKING, Optional, Dict, Any, List, Set
+from typing import TYPE_CHECKING, Optional, Dict, Any, Set, Tuple
 
-from .protocol.codec import ServerCodec, PacketBuffer
-from .protocol.constants import PLI, PLO, PLPROP, PLTYPE, PLPERM, BDPROP, BDMODE
+from .handlers import (
+    CombatHandlers,
+    CommunicationHandlers,
+    EntityHandlers,
+    FileHandlers,
+    ItemHandlers,
+    MiscHandlers,
+    MovementHandlers,
+    collect_handler_names,
+)
+from .player_login import LoginService
+from .player_session import PlayerSession
+from .player_state import Character, Identity, Inventory, Status
+from .protocol.constants import PLO, PLPROP
 from .protocol.packets import (
-    PacketReader,
     PacketBuilder,
-    parse_login_packet,
-    parse_player_props,
-    parse_level_warp,
-    parse_trigger_action,
-    build_trigger_action,
-    parse_npc_props,
     build_player_props,
     build_other_player_props,
     build_warp,
     build_warp2,
-    build_chat,
     build_player_left,
     build_level_name,
     build_raw_data_announcement,
-    build_private_message,
-    build_baddy_props,
     build_is_leader,
-    build_flag_set,
-    build_flag_del,
 )
 
 if TYPE_CHECKING:
@@ -44,7 +55,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-class Player:
+class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
+             CommunicationHandlers, FileHandlers, MiscHandlers):
     """
     Represents a connected player.
 
@@ -56,180 +68,33 @@ class Player:
                  reader: asyncio.StreamReader, writer: asyncio.StreamWriter):
         self.server = server
         self.id = player_id
-        self._reader = reader
-        self._writer = writer
 
-        # Connection state
-        self.connected = True
-        self.logged_in = False
-        self._codec: Optional[ServerCodec] = None
-        self._buffer = PacketBuffer()
-
-        # Connection type (CLIENT, RC, NC, NPCSERVER)
-        self.connection_type = PLTYPE.CLIENT
-
-        # Player identity
-        self.account_name = ""
-        self.nickname = ""
-        self.guild_name = ""
-        self.guild_nickname = ""
+        # Transport, state and login (see the module docstring). Every field on
+        # the state components is also reachable under its historical flat name
+        # on the player itself - _STATE_ALIASES installs those properties.
+        self.session = PlayerSession(reader, writer)
+        self.identity = Identity()
+        self.character = Character()
+        self.inventory = Inventory()
+        self.status = Status()
+        self.login_service = LoginService(self)
 
         # Current level
         self.level: Optional['Level'] = None
 
-        # Position (in tiles)
-        self.x = 0.0
-        self.y = 0.0
-        self.direction = 2  # Down
-        self.carrysprite = 0
-        # Retained until a carried-NPC throw consumes it.  Clients normally
-        # clear CARRYNPC separately from sending THROWCARRIED.
-        self.npc_id = 0
-
-        # Stats
-        self.hearts = 3.0
-        self.max_hearts = 3.0
-        self.rupees = 0
-        self.arrows = 10
-        self.bombs = 5
-        self.glove_power = 0
-        self.sword_power = 1
-        self.shield_power = 1
-
-        # Combat stats
-        self.kills = 0
-        self.deaths = 0
-
-        # Appearance
-        self.head_image = "head19.png"
-        self.body_image = "body.png"
-        self.sword_image = "sword1.png"
-        self.shield_image = "shield1.png"
-        self.colors = [0, 0, 0, 0, 0]  # Skin, coat, sleeve, shoe, belt
-
-        # MP/AP (PLPROP_MAGICPOINTS=26 / PLPROP_ALIGNMENT=32). Defaults match
-        # GServer-v2 (server/include/object/Character.h): mp starts at 0,
-        # ap starts at 50 (neutral on the 0-100 good/evil scale).
-        self.mp = 0
-        self.ap = 50
-
-        # Animation
-        self.gani = "idle"
-        self.sprite = 0
-
-        # Chat
-        self.chat = ""
-
-        # Flags
-        self.flags: Dict[str, str] = {}
-
-        # GATTRIBS (custom attributes)
-        self.gattribs: Dict[int, str] = {}
-
-        # Weapons
-        self.weapons: List[str] = []
-
-        # Status
-        self.is_frozen = False
-        self.is_ghost = False
-        self.is_muted = False
-
-        # Admin
-        self.admin_rights = 0
-
-        # Session timing
-        self.login_time = 0.0
-        self.last_packet_time = 0.0
-
-        # PLI Packet handlers
-        self._handlers = {
-            # Movement and position
-            PLI.LEVELWARP: self._handle_level_warp,
-            PLI.LEVELWARPMOD: self._handle_level_warp_mod,
-            PLI.PLAYERPROPS: self._handle_player_props,
-            PLI.ADJACENTLEVEL: self._handle_adjacent_level,
-
-            # Combat
-            PLI.BOMBADD: self._handle_bomb_add,
-            PLI.BOMBDEL: self._handle_bomb_del,
-            PLI.ARROWADD: self._handle_arrow_add,
-            PLI.FIRESPY: self._handle_fire_spy,
-            PLI.THROWCARRIED: self._handle_throw_carried,
-            PLI.HURTPLAYER: self._handle_hurt_player,
-            PLI.EXPLOSION: self._handle_explosion,
-            PLI.HITOBJECTS: self._handle_hit_objects,
-            PLI.SHOOT: self._handle_shoot,
-            PLI.SHOOT2: self._handle_shoot2,
-
-            # Items
-            PLI.ITEMADD: self._handle_item_add,
-            PLI.ITEMDEL: self._handle_item_del,
-            PLI.ITEMTAKE: self._handle_item_take,
-            PLI.OPENCHEST: self._handle_open_chest,
-
-            # Horse
-            PLI.HORSEADD: self._handle_horse_add,
-            PLI.HORSEDEL: self._handle_horse_del,
-
-            # Baddies
-            PLI.BADDYPROPS: self._handle_baddy_props,
-            PLI.BADDYHURT: self._handle_baddy_hurt,
-            PLI.BADDYADD: self._handle_baddy_add,
-
-            # NPCs
-            PLI.NPCPROPS: self._handle_npc_props,
-            PLI.PUTNPC: self._handle_put_npc,
-            PLI.NPCDEL: self._handle_npc_del,
-            PLI.NPCWEAPONDEL: self._handle_npc_weapon_del,
-
-            # Communication
-            PLI.TOALL: self._handle_chat,
-            PLI.PRIVATEMESSAGE: self._handle_private_message,
-            PLI.SHOWIMG: self._handle_show_img,
-
-            # Flags
-            PLI.FLAGSET: self._handle_flag_set,
-            PLI.FLAGDEL: self._handle_flag_del,
-
-            # Triggers
-            PLI.TRIGGERACTION: self._handle_trigger_action,
-
-            # Files
-            PLI.WANTFILE: self._handle_want_file,
-            PLI.UPDATEFILE: self._handle_update_file,
-            PLI.VERIFYWANTSEND: self._handle_verify_want_send,
-            PLI.UPDATEGANI: self._handle_update_gani,
-            PLI.UPDATESCRIPT: self._handle_update_script,
-            PLI.UPDATECLASS: self._handle_update_class,
-
-            # Weapons
-            PLI.WEAPONADD: self._handle_weapon_add,
-
-            # Board
-            PLI.BOARDMODIFY: self._handle_board_modify,
-            PLI.REQUESTUPDATEBOARD: self._handle_request_update_board,
-
-            # Profile
-            PLI.PROFILEGET: self._handle_profile_get,
-            PLI.PROFILESET: self._handle_profile_set,
-
-            # Server/misc
-            PLI.MAPINFO: self._handle_map_info,
-            PLI.SERVERWARP: self._handle_server_warp,
-            PLI.PACKETCOUNT: self._handle_packet_count,
-            PLI.LANGUAGE: self._handle_language,
-            PLI.MUTEPLAYER: self._handle_mute_player,
-            PLI.PROCESSLIST: self._handle_process_list,
-            PLI.CLAIMPKER: self._handle_claim_pker,
-            PLI.RAWDATA: self._handle_raw_data,
-
-            # Text/variables
-            PLI.REQUESTTEXT: self._handle_request_text,
-            PLI.SENDTEXT: self._handle_send_text,
-
-            # NPC Server query
-            PLI.NPCSERVERQUERY: self._handle_npc_server_query,
+        # PLI packet id -> bound handler, from the mixins' @handles decorations.
+        self._handlers: Dict[int, Any] = {
+            packet_id: getattr(self, name)
+            for packet_id, name in _HANDLER_NAMES.items()
         }
+
+        # Packet ids that reached neither a handler nor the RC/NC ranges. Kept
+        # so "the server ignored that" is visible instead of silent.
+        self._unhandled_packet_ids: Set[int] = set()
+
+    # =========================================================================
+    # Connection lifecycle
+    # =========================================================================
 
     async def run(self):
         """Main player loop - handle packets until disconnect."""
@@ -241,10 +106,7 @@ class Player:
             # Main packet loop
             while self.connected:
                 try:
-                    data = await asyncio.wait_for(
-                        self._reader.read(65536),
-                        timeout=300.0  # 5 minute timeout
-                    )
+                    data = await self.session.read(timeout=300.0)  # 5 minutes
                 except asyncio.TimeoutError:
                     logger.info(f"Player {self.id} timed out")
                     break
@@ -303,175 +165,30 @@ class Player:
             try:
                 packet = build_disc_message(message)
                 await self.send_raw(packet)
-            except:
+            except Exception:
                 pass
 
-        self.connected = False
-        try:
-            self._writer.close()
-            await self._writer.wait_closed()
-        except:
-            pass
+        await self.session.close()
+
+    # =========================================================================
+    # Login (see player_login.LoginService)
+    # =========================================================================
 
     async def _handle_login(self) -> bool:
         """Handle the initial login packet."""
-        try:
-            # Read login packet (plain zlib compressed)
-            data = await asyncio.wait_for(self._reader.read(65536), timeout=30.0)
-            if not data or len(data) < 2:
-                return False
-
-            # Extract length and packet
-            length = struct.unpack('>H', data[:2])[0]
-            packet_data = data[2:2 + length]
-
-            # Create codec with no encryption key yet
-            self._codec = ServerCodec(0)
-            decrypted = self._codec.decode_packet(packet_data)
-            if not decrypted:
-                logger.warning(f"Failed to decode login from {self.id}")
-                return False
-
-            # Parse login
-            login = parse_login_packet(decrypted)
-            logger.info(f"Login from {login.get('username', '?')}, protocol={login.get('protocol', '?')}")
-
-            # Verify protocol
-            protocol = login.get('protocol', '')
-            if protocol not in ['G3D0311C', 'G3D0511C', 'GNW03014']:
-                logger.warning(f"Unsupported protocol: {protocol}")
-
-            # Set encryption key
-            encryption_key = login.get('encryption_key', 0)
-            self._codec.set_key(encryption_key)
-
-            # Store account info
-            self.account_name = login.get('username', f'player_{self.id}')
-            self.nickname = self.account_name
-
-            # Load account data if available
-            logger.debug(f"Loading account data for {self.account_name}")
-            if hasattr(self.server, 'account_manager'):
-                account = self.server.account_manager.get_account(self.account_name)
-                if not account:
-                    account = self.server.account_manager.create_account(self.account_name)
-                self.server.account_manager.load_player_from_account(self, account)
-                self.admin_rights = account.admin_rights
-            logger.debug(f"Account data loaded for {self.account_name}")
-
-            # Check if banned
-            logger.debug(f"Checking ban status for {self.account_name}")
-            if hasattr(self.server, 'account_manager'):
-                account = self.server.account_manager.get_account(self.account_name)
-                if account and account.is_banned:
-                    await self.disconnect(f"You are banned: {account.ban_reason}")
-                    return False
-            logger.debug(f"Ban check passed for {self.account_name}")
-
-            # Verify login (skip if noverifylogin)
-            logger.debug(f"Verify login: {self.server.config.verify_login}")
-            if self.server.config.verify_login:
-                password = login.get('password', '')
-                if hasattr(self.server, 'account_manager'):
-                    if not self.server.account_manager.verify_password(self.account_name, password):
-                        await self.disconnect("Invalid password")
-                        return False
-            logger.debug(f"Login verification passed for {self.account_name}")
-
-            # Send login response (may be delayed if using listserver verification)
-            if self.server.config.verify_login and hasattr(self.server, 'listserver') and self.server.listserver:
-                # Use listserver for account verification
-                logger.debug(f"Requesting account verification from listserver for {self.account_name}")
-                await self.server.listserver.verify_account(self, password)
-                # send_login will be called by listserver on success
-                return True
-            else:
-                # Local verification or no verification
-                logger.debug(f"About to send login response for {self.account_name}")
-                await self._send_login_response()
-
-            self.logged_in = True
-            self.login_time = time.time()
-            logger.info(f"Player {self.id} logged in as {self.account_name}")
-
-            # Add player to listserver
-            if hasattr(self.server, 'listserver') and self.server.listserver:
-                await self.server.listserver.add_player(self)
-
-            # Warp to start level
-            logger.debug(f"Warping player {self.id} to {self.server.config.start_level}")
-            await self.warp(
-                self.server.config.start_level,
-                self.server.config.start_x,
-                self.server.config.start_y
-            )
-            logger.debug(f"Warp complete for player {self.id}")
-
-            return True
-
-        except asyncio.TimeoutError:
-            logger.warning(f"Login timeout for {self.id}")
-            return False
-        except Exception as e:
-            import traceback
-            logger.error(f"Login error for {self.id}: {e}")
-            logger.error(traceback.format_exc())
-            return False
+        return await self.login_service.handle_login()
 
     async def send_login(self):
-        """Send login data to player (called after verification)."""
-        await self._send_login_response()
-
-        # Mark as logged in
-        self.logged_in = True
-        self.login_time = time.time()
-        logger.info(f"Player {self.id} logged in as {self.account_name}")
-
-        # Add player to listserver
-        if hasattr(self.server, 'listserver') and self.server.listserver:
-            await self.server.listserver.add_player(self)
-
-        # Warp to start level
-        await self.warp(
-            self.server.config.start_level,
-            self.server.config.start_x,
-            self.server.config.start_y
-        )
+        """Finish login. Called by ServerListClient once it has verified us."""
+        await self.login_service.complete_login()
 
     async def _send_login_response(self):
         """Send the login response packet."""
-        logger.debug(f"Sending login response for player {self.id}")
+        await self.login_service.send_login_response()
 
-        # Add PLO_PLAYERPROPS with initial state
-        props = {
-            PLPROP.NICKNAME: self.nickname,
-            # MAXPOWER is FULL hearts on the wire (GServer-v2
-            # PlayerProps.cpp:171-186, LevelItem.cpp:148-151); only CURPOWER
-            # is in halves. Sending halves here doubled max hearts once the
-            # client decoded it reference-correctly.
-            PLPROP.MAXPOWER: int(self.max_hearts),
-            PLPROP.CURPOWER: int(self.hearts * 2),
-            PLPROP.RUPEESCOUNT: self.rupees,
-            PLPROP.ARROWSCOUNT: self.arrows,
-            PLPROP.BOMBSCOUNT: self.bombs,
-            PLPROP.GLOVEPOWER: self.glove_power,
-            PLPROP.SWORDPOWER: self.sword_power,
-            PLPROP.SHIELDPOWER: self.shield_power,
-            PLPROP.HEADIMAGE: self.head_image,
-            PLPROP.BODYIMAGE: self.body_image,
-            PLPROP.ACCOUNTNAME: self.account_name,
-            PLPROP.COLORS: self.colors,
-            PLPROP.MAGICPOINTS: self.mp,
-            PLPROP.ALIGNMENT: self.ap,
-        }
-
-        packet = build_player_props(props)
-        logger.debug(f"Built player props packet, length={len(packet)}")
-        encoded = self._codec.encode_packet(packet, is_login_response=True)
-        logger.debug(f"Encoded packet, length={len(encoded)}")
-        self._writer.write(encoded)
-        await self._writer.drain()
-        logger.debug(f"Login response sent for player {self.id}")
+    # =========================================================================
+    # Packet dispatch
+    # =========================================================================
 
     async def _process_data(self, data: bytes):
         """Process received data."""
@@ -534,957 +251,13 @@ class Player:
                     await self.server.nc_manager.handle_packet(self, packet_id, packet_body)
                 continue
 
-    # =========================================================================
-    # Movement/Position Handlers
-    # =========================================================================
-
-    async def _handle_level_warp(self, data: bytes):
-        """Handle PLI_LEVELWARP packet."""
-        reader = PacketReader(data)
-        x = reader.read_gchar() / 2.0
-        y = reader.read_gchar() / 2.0
-        level_name = reader.remaining().decode('latin-1', errors='replace').strip()
-
-        if level_name:
-            await self.warp(level_name, x, y)
-
-    async def _handle_level_warp_mod(self, data: bytes):
-        """Handle PLI_LEVELWARPMOD packet (modified warp).
-
-        Wire format (GServer-v2 msgPLI_LEVELWARP, PlayerClientPackets.cpp:
-        52-58): LEVELWARPMOD carries a leading GUINT5 modtime before the
-        x/y/level body that plain LEVELWARP has. Without consuming it first,
-        the 5 modtime bytes get read as x/y and the start of the level name,
-        corrupting every modified warp.
-        """
-        reader = PacketReader(data)
-        reader.read_gint5()  # modtime, unused
-        await self._handle_level_warp(reader.remaining())
-
-    async def _handle_player_props(self, data: bytes):
-        """Handle PLI_PLAYERPROPS packet."""
-        props = parse_player_props(data)
-
-        # Update position
-        if PLPROP.X2 in props:
-            self.x = props[PLPROP.X2]
-        elif PLPROP.X in props:
-            self.x = props[PLPROP.X] / 2.0
-
-        if PLPROP.Y2 in props:
-            self.y = props[PLPROP.Y2]
-        elif PLPROP.Y in props:
-            self.y = props[PLPROP.Y] / 2.0
-
-        if PLPROP.DIRECTION in props:
-            self.direction = props[PLPROP.DIRECTION]
-
-        if PLPROP.SPRITE in props:
-            self.sprite = props[PLPROP.SPRITE]
-
-        if PLPROP.CARRYSPRITE in props:
-            self.carrysprite = props[PLPROP.CARRYSPRITE]
-
-        if PLPROP.CARRYNPC in props:
-            # Unconditional like CARRYSPRITE: 0 means the carried NPC was
-            # released, so a stale id must not survive a drop-without-throw.
-            self.npc_id = props[PLPROP.CARRYNPC]
-
-        if PLPROP.GANI in props:
-            self.gani = props[PLPROP.GANI]
-
-        # Local level chat (PLPROP_CURCHAT, sent by Client.send_level_chat via
-        # PLI_PLAYERPROPS) fires the GS1 "playerchats" NPC event, e.g. the
-        # qa_tier3.nw fixture's unfreezeplayer-on-chat handler.
-        if PLPROP.CURCHAT in props:
-            self.chat = props[PLPROP.CURCHAT]
-            if self.level and getattr(self.server, 'npc_manager', None):
-                await self.server.npc_manager.on_player_chats(self, self.chat)
-
-        # Appearance updates
-        if PLPROP.HEADIMAGE in props:
-            self.head_image = props[PLPROP.HEADIMAGE]
-        if PLPROP.BODYIMAGE in props:
-            self.body_image = props[PLPROP.BODYIMAGE]
-
-        # Health: the client is authoritative for its own damage (e.g. baddies it
-        # drives as leader), reporting new hearts via CURPOWER (= hearts * 2). A
-        # transition to <= 0 means the player died, so kick off the death/respawn
-        # flow once (it would otherwise never fire for client-side damage).
-        if PLPROP.CURPOWER in props:
-            new_hearts = props[PLPROP.CURPOWER] / 2.0
-            was_alive = self.hearts > 0
-            self.hearts = new_hearts
-            if new_hearts <= 0 and was_alive and hasattr(self.server, 'combat_manager'):
-                await self.server.combat_manager.handle_player_death(self)
-
-        # Broadcast to other players on level. Previously this whitelist
-        # omitted CURCHAT/HEADIMAGE/BODYIMAGE/COLORS/SWORDPOWER/SHIELDPOWER,
-        # so other players never saw a player's chat bubble or an
-        # appearance/gear change made mid-session - only movement updated.
-        if self.level:
-            broadcast_props = {}
-            # Position: clients may send classic X/Y (15/16, half-tiles) OR
-            # X2/Y2 (78/79) - keying the relay on X2/Y2 alone silently
-            # dropped every movement update from classic-prop senders, so
-            # other players saw them frozen at their spawn position. Relay
-            # as X2/Y2 (self.x/y were normalized above) whichever arrived.
-            if PLPROP.X in props or PLPROP.X2 in props:
-                broadcast_props[PLPROP.X2] = self.x
-            if PLPROP.Y in props or PLPROP.Y2 in props:
-                broadcast_props[PLPROP.Y2] = self.y
-            for key in [PLPROP.DIRECTION, PLPROP.SPRITE,
-                        PLPROP.GANI, PLPROP.CURCHAT, PLPROP.HEADIMAGE,
-                        PLPROP.BODYIMAGE, PLPROP.COLORS, PLPROP.SWORDPOWER,
-                        PLPROP.SHIELDPOWER]:
-                if key in props:
-                    broadcast_props[key] = getattr(self, {
-                        PLPROP.DIRECTION: 'direction',
-                        PLPROP.SPRITE: 'sprite',
-                        PLPROP.GANI: 'gani',
-                        PLPROP.CURCHAT: 'chat',
-                        PLPROP.HEADIMAGE: 'head_image',
-                        PLPROP.BODYIMAGE: 'body_image',
-                        PLPROP.COLORS: 'colors',
-                        PLPROP.SWORDPOWER: 'sword_power',
-                        PLPROP.SHIELDPOWER: 'shield_power',
-                    }[key])
-
-            if broadcast_props:
-                packet = build_other_player_props(self.id, broadcast_props)
-                await self.server.broadcast_to_level(
-                    self.level.name, packet, exclude={self.id}
-                )
-
-            # Fire GS1 playertouchsme for NPCs the player has walked onto
-            if getattr(self.server, 'npc_manager', None):
-                await self.server.npc_manager.check_touches(self)
-
-    async def _handle_adjacent_level(self, data: bytes):
-        """Handle PLI_ADJACENTLEVEL - client preloading a neighbouring GMAP
-        segment. Send that level's name + board so the client can stitch the
-        world together; no warp and no player-add (the player stays put)."""
-        reader = PacketReader(data)
-        level_name = reader.remaining().decode('latin-1', errors='replace').strip()
-        if not level_name:
-            return
-        level = self.server.world.get_level(level_name)
-        if not level:
-            logger.debug(f"Adjacent level not found: {level_name}")
-            return
-
-        # Only the board — adjacent segments are for rendering. Their signs/links
-        # belong to that segment and are sent when the player actually warps in;
-        # sending them here leaks e.g. neighbouring signs into the current level.
-        level_name_pkt = build_level_name(level.name)
-        tile_data = level.get_board_packet()
-        board_packet = bytes([PLO.BOARDPACKET + 32]) + tile_data + b'\n'
-        announcement = build_raw_data_announcement(len(board_packet))
-        await self.send_raw(level_name_pkt + announcement + board_packet)
+            if packet_id not in self._unhandled_packet_ids:
+                self._unhandled_packet_ids.add(packet_id)
+                logger.debug(
+                    f"Player {self.id}: no handler for packet id {packet_id}")
 
     # =========================================================================
-    # Combat Handlers
-    # =========================================================================
-
-    async def _handle_bomb_add(self, data: bytes):
-        """Handle PLI_BOMBADD packet."""
-        if not self.level:
-            return
-        reader = PacketReader(data)
-        x = reader.read_gchar() / 2.0
-        y = reader.read_gchar() / 2.0
-        # {GCHAR player_power}{GCHAR timer}: power is bits 0-1, timer is
-        # 50ms increments (+50ms) - see GServer-v2 msgPLI_BOMBADD
-        power = (reader.read_gchar() & 0x03) if reader.remaining() else 1
-        time_left = (reader.read_gchar() * 0.05 + 0.05) if reader.remaining() else 3.0
-
-        if hasattr(self.server, 'combat_manager'):
-            await self.server.combat_manager.handle_bomb_add(self, x, y, power, time_left)
-
-    async def _handle_bomb_del(self, data: bytes):
-        """Handle PLI_BOMBDEL packet."""
-        if not self.level:
-            return
-        reader = PacketReader(data)
-        x = reader.read_gchar() / 2.0
-        y = reader.read_gchar() / 2.0
-
-        if hasattr(self.server, 'combat_manager'):
-            await self.server.combat_manager.handle_bomb_del(self, x, y)
-
-    async def _handle_arrow_add(self, data: bytes):
-        """Handle PLI_ARROWADD packet.
-
-        Wire format (GServer-v2 msgPLI_ARROWADD, PlayerClientPackets.cpp):
-            {GCHAR x*2}{GCHAR y*2}{GCHAR flags}{GCHAR sprite}{GCHAR power}
-        flags: bit0-1 direction, bit2 reflect, bit3 fromPlayer.
-        """
-        if not self.level:
-            return
-        reader = PacketReader(data)
-        x = reader.read_gchar() / 2.0
-        y = reader.read_gchar() / 2.0
-        flags = reader.read_gchar() if reader.remaining() else (int(self.direction) & 0x03)
-        sprite = reader.read_gchar() if reader.remaining() else 0
-        power = reader.read_gchar() if reader.remaining() else 1
-
-        if hasattr(self.server, 'combat_manager'):
-            await self.server.combat_manager.handle_arrow_add(self, x, y, flags, sprite, power)
-
-    async def _handle_fire_spy(self, data: bytes):
-        """Handle PLI_FIRESPY packet (fire from wand)."""
-        if not self.level:
-            return
-        reader = PacketReader(data)
-        x = reader.read_gchar() / 2.0
-        y = reader.read_gchar() / 2.0
-
-        if hasattr(self.server, 'combat_manager'):
-            await self.server.combat_manager.handle_fire_spy(self, x, y)
-
-    async def _handle_throw_carried(self, data: bytes):
-        """Handle the payload-less PLI_THROWCARRIED packet."""
-        if not self.level:
-            return
-
-        if hasattr(self.server, 'combat_manager'):
-            await self.server.combat_manager.handle_throw_carried(
-                self, direction=self.direction, carrysprite=self.carrysprite
-            )
-
-    async def _handle_hurt_player(self, data: bytes):
-        """Handle PLI_HURTPLAYER packet.
-
-        Wire format (GServer-v2 msgPLI_HURTPLAYER, PlayerClientPackets.cpp:
-        811-820):
-        - victim_id (gshort)
-        - hurt_dx (SIGNED gchar) - knockback X direction
-        - hurt_dy (SIGNED gchar) - knockback Y direction
-        - power (gchar) - damage amount
-        - npc_id (gint3) - optional
-        hurt_dx/hurt_dy must use the signed reader: the unsigned read_gchar()
-        clamps negative values to 0, silently dropping all left/up knockback.
-        """
-        reader = PacketReader(data)
-        target_id = reader.read_gshort()
-        hurt_dx = reader.read_gchar_signed()
-        hurt_dy = reader.read_gchar_signed()
-        power = reader.read_gchar() if reader.remaining() else 1
-        # npc_id = reader.read_gint3() if reader.remaining() else 0  # Not used yet
-
-        if hasattr(self.server, 'combat_manager'):
-            await self.server.combat_manager.handle_hurt_player(self, target_id, power, hurt_dx, hurt_dy)
-
-    async def _handle_explosion(self, data: bytes):
-        """Handle PLI_EXPLOSION packet.
-
-        Wire format (GServer-v2 msgPLI_EXPLOSION, PlayerClientPackets.cpp:
-        829-844): {GCHAR radius}{GCHAR x*2}{GCHAR y*2}{GCHAR power} - radius
-        comes first and is a raw byte (not a half-tile value). Previously
-        this read x/y before radius/power (wrong field order) and had no
-        `self.level` guard, so it raised AttributeError for any player not
-        currently on a level, and it broadcast back to the sender too.
-
-        The PLO_EXPLOSION relay GServer actually sends also prepends a
-        (short) owner id that build_explosion() here does not write; leave
-        that as-is since pyReborn's parser (pyReborn/pyreborn/packets.py
-        parse_explosion) expects [x][y][radius][power] with no owner id, and
-        the client side is owned by another team.
-        """
-        if not self.level:
-            return
-        reader = PacketReader(data)
-        radius = reader.read_gchar() if reader.remaining() else 4
-        x = reader.read_gchar() / 2.0 if reader.remaining() else self.x
-        y = reader.read_gchar() / 2.0 if reader.remaining() else self.y
-        power = reader.read_gchar() if reader.remaining() else 2
-
-        # Broadcast explosion effect
-        from .protocol.packets import build_explosion
-        packet = build_explosion(x, y, radius, power)
-        await self.server.broadcast_to_level(
-            self.level.name, packet, exclude={self.id}
-        )
-
-    async def _handle_hit_objects(self, data: bytes):
-        """Handle PLI_HITOBJECTS packet (client-detected sword hit at a
-        probe location - the real server-side "sword swing hit something"
-        report; see combat.handle_hit_objects for what happens with it).
-
-        Wire format (GServer-v2 msgPLI_HITOBJECTS, PlayerClientPackets.cpp:
-        1017-1026): {GCHAR power*2}{GCHAR x*2}{GCHAR y*2}[{GINT3 npc_id}].
-        Previously this read x,y,power (wrong order/scale) and then looped
-        reading gint3 "object ids" that the real client never sends -
-        PLI_HITOBJECTS carries a single probe location and an optional
-        trailing npc_id, not a pre-resolved list of hit object ids; the
-        server is the one that determines what's actually at that location.
-        """
-        if not self.level:
-            return
-        reader = PacketReader(data)
-        power = reader.read_gchar() / 2.0
-        x = reader.read_gchar() / 2.0
-        y = reader.read_gchar() / 2.0
-        npc_id = reader.read_gint3() if reader.remaining() else None
-
-        if hasattr(self.server, 'combat_manager'):
-            await self.server.combat_manager.handle_hit_objects(self, x, y, power, npc_id)
-
-    async def _handle_shoot(self, data: bytes):
-        """Handle PLI_SHOOT packet."""
-        if hasattr(self.server, 'combat_manager'):
-            await self.server.combat_manager.handle_shoot(self, data)
-
-    async def _handle_shoot2(self, data: bytes):
-        """Handle PLI_SHOOT2 packet."""
-        if hasattr(self.server, 'combat_manager'):
-            await self.server.combat_manager.handle_shoot2(self, data)
-
-    # =========================================================================
-    # Item Handlers
-    # =========================================================================
-
-    async def _handle_item_add(self, data: bytes):
-        """Handle PLI_ITEMADD packet."""
-        if not self.level:
-            return
-        reader = PacketReader(data)
-        x = reader.read_gchar() / 2.0
-        y = reader.read_gchar() / 2.0
-        item_type = reader.read_gchar() if reader.remaining() else 0
-
-        if hasattr(self.server, 'item_manager'):
-            from .protocol.constants import LevelItemType
-            await self.server.item_manager.spawn_item(
-                self.level, x, y, LevelItemType(item_type),
-                exclude_player_id=self.id,
-            )
-
-    async def _handle_item_del(self, data: bytes):
-        """Handle PLI_ITEMDEL packet."""
-        if not self.level:
-            return
-        reader = PacketReader(data)
-        x = reader.read_gchar() / 2.0
-        y = reader.read_gchar() / 2.0
-
-        if hasattr(self.server, 'item_manager'):
-            await self.server.item_manager.remove_item(self.level.name, x, y)
-
-    async def _handle_item_take(self, data: bytes):
-        """Handle PLI_ITEMTAKE packet."""
-        if not self.level:
-            return
-        reader = PacketReader(data)
-        x = reader.read_gchar() / 2.0
-        y = reader.read_gchar() / 2.0
-
-        if hasattr(self.server, 'item_manager'):
-            await self.server.item_manager.handle_item_take(self, x, y)
-
-    async def _handle_open_chest(self, data: bytes):
-        """Handle PLI_OPENCHEST packet."""
-        if not self.level:
-            return
-        reader = PacketReader(data)
-        x = reader.read_gchar()
-        y = reader.read_gchar()
-
-        if hasattr(self.server, 'item_manager'):
-            await self.server.item_manager.handle_open_chest(self, x, y)
-
-    # =========================================================================
-    # Horse Handlers
-    # =========================================================================
-
-    async def _handle_horse_add(self, data: bytes):
-        """Handle PLI_HORSEADD packet.
-
-        Wire format (GServer-v2 msgPLI_HORSEADD, PlayerClientPackets.cpp:
-        256-269): {GCHAR x*2}{GCHAR y*2}{GCHAR dir_bushes}{RAW image}.
-        dir_bushes packs direction in bits 0-1 and bush count in the rest of
-        the byte; image is a raw trailing string with no length prefix.
-        Previously this read direction/bushes as two separate gchars and a
-        length-prefixed image, which doesn't match what real clients send.
-        """
-        if not self.level:
-            return
-        reader = PacketReader(data)
-        x = reader.read_gchar() / 2.0
-        y = reader.read_gchar() / 2.0
-        dir_bushes = reader.read_gchar() if reader.remaining() else 0x0E  # dir=2, bushes=3
-        direction = dir_bushes & 0x03
-        bushes = dir_bushes >> 2
-        image = reader.remaining().decode('latin-1', errors='replace') if reader.remaining() else "horse.png"
-
-        if hasattr(self.server, 'horse_manager'):
-            await self.server.horse_manager.handle_horse_add_packet(
-                self, x, y, direction, bushes, image
-            )
-
-    async def _handle_horse_del(self, data: bytes):
-        """Handle PLI_HORSEDEL packet."""
-        if not self.level:
-            return
-        reader = PacketReader(data)
-        x = reader.read_gchar() / 2.0
-        y = reader.read_gchar() / 2.0
-
-        if hasattr(self.server, 'horse_manager'):
-            await self.server.horse_manager.handle_horse_del_packet(self, x, y)
-
-    # =========================================================================
-    # Baddy Handlers
-    # =========================================================================
-
-    async def _handle_baddy_props(self, data: bytes):
-        """Handle PLI_BADDYPROPS packet."""
-        if not self.level or not self.level.is_player_leader(self):
-            return
-
-        reader = PacketReader(data)
-        baddy_id = reader.read_gchar()
-        props = {}
-        while reader.has_data():
-            prop_id = reader.read_gchar()
-            if prop_id == BDPROP.ID:
-                props[prop_id] = reader.read_gchar()
-            elif prop_id in (BDPROP.X, BDPROP.Y):
-                props[prop_id] = reader.read_gchar() / 2.0
-            elif prop_id == BDPROP.TYPE:
-                props[prop_id] = reader.read_gchar()
-            elif prop_id == BDPROP.POWERIMAGE:
-                props[prop_id] = (reader.read_gchar(), reader.read_gstring())
-            elif prop_id == BDPROP.MODE:
-                props[prop_id] = reader.read_gchar()
-            elif prop_id in (BDPROP.ANI, BDPROP.DIR):
-                props[prop_id] = reader.read_gchar()
-            elif prop_id in (BDPROP.VERSESIGHT, BDPROP.VERSEHURT,
-                              BDPROP.VERSEATTACK):
-                props[prop_id] = reader.read_gstring()
-            else:
-                break
-
-        manager = getattr(self.server, 'baddy_manager', None)
-        baddy = manager.get_baddy(self.level.name, baddy_id) if manager else None
-        if not baddy:
-            return
-
-        if BDPROP.POWERIMAGE in props:
-            baddy.health = props[BDPROP.POWERIMAGE][0]
-        if props.get(BDPROP.MODE) == BDMODE.DEAD:
-            await manager.handle_baddy_death(baddy, self, exclude={self.id})
-        else:
-            await self.server.broadcast_to_level(
-                self.level.name, build_baddy_props(baddy_id, props),
-                exclude={self.id},
-            )
-
-    async def _handle_baddy_hurt(self, data: bytes):
-        """Handle PLI_BADDYHURT packet.
-
-        Wire format (GServer-v2 msgPLI_BADDYHURT, PlayerClientPackets.cpp:
-        523-539, commit e0cd07af9bb4be09c54c0335f222dd0eacb71c1):
-            [GUChar baddyId][GChar hurtDX][GChar hurtDY][GUChar damage,
-            half-hearts]
-        hurtDX/hurtDY are commented there as "midpoint: 64" - the same
-        recentering idiom as read_gchar_signed() (byte - 32) with an extra
-        -64 on top, i.e. value = read_gchar_signed() - 64 (mirrors GServer's
-        PropertyHurtDxDy<MidPoint>::deserialize: dx = readGChar() - MidPoint).
-        GServer-v2 itself treats these as a client-trust artifact and never
-        parses them server-side (it just relays the raw packet to the
-        baddy's leader) - pygserver is authoritative for baddy damage
-        (BaddyManager.handle_baddy_hurt already computes its own knockback
-        direction from baddy/player position), so hurt_dx/hurt_dy are parsed
-        here and intentionally dropped rather than fed into knockback.
-
-        Backward tolerance: older pyReborn builds sent the legacy 2-field
-        [baddy_id][damage] payload with no knockback fields - fall back to
-        that when the packet is too short for the 4-field format.
-        """
-        if not self.level:
-            return
-        reader = PacketReader(data)
-        if len(data) >= 4:
-            baddy_id = reader.read_gchar()
-            hurt_dx = reader.read_gchar_signed() - 64  # noqa: F841 (parsed, unused - see docstring)
-            hurt_dy = reader.read_gchar_signed() - 64  # noqa: F841
-            damage = reader.read_gchar()
-        else:
-            logger.debug(
-                f"PLI_BADDYHURT: {len(data)}-byte packet too short for the "
-                "4-field format, falling back to legacy [id][damage]"
-            )
-            baddy_id = reader.read_gchar()
-            damage = reader.read_gchar() if reader.remaining() else 1
-
-        if hasattr(self.server, 'baddy_manager'):
-            await self.server.baddy_manager.handle_baddy_hurt(self, baddy_id, damage)
-
-    async def _handle_baddy_add(self, data: bytes):
-        """Handle PLI_BADDYADD packet (admin adding baddy)."""
-        if not self.level:
-            return
-        if not self.admin_rights & PLPERM.SETATTRIBUTES:
-            return
-
-        reader = PacketReader(data)
-        x = reader.read_gchar() / 2.0
-        y = reader.read_gchar() / 2.0
-        baddy_type = reader.read_gchar() if reader.remaining() else 0
-
-        if hasattr(self.server, 'baddy_manager'):
-            from .baddy import BaddyType
-            await self.server.baddy_manager.add_baddy(
-                self.level, x, y, BaddyType(baddy_type)
-            )
-
-    # =========================================================================
-    # NPC Handlers
-    # =========================================================================
-
-    async def _handle_npc_props(self, data: bytes):
-        """Handle PLI_NPCPROPS packet."""
-        reader = PacketReader(data)
-        npc_id = reader.read_gint3()
-
-        npc = self.server.npc_manager.get_npc(npc_id)
-        if npc and npc.level == self.level:
-            # Process NPC prop updates from client
-            pass
-
-    async def _handle_put_npc(self, data: bytes):
-        """Handle PLI_PUTNPC packet (place NPC)."""
-        if not self.level:
-            return
-        # Usually requires admin rights
-        pass
-
-    async def _handle_npc_del(self, data: bytes):
-        """Handle PLI_NPCDEL packet."""
-        reader = PacketReader(data)
-        npc_id = reader.read_gint3()
-        # Usually requires admin rights
-        pass
-
-    async def _handle_npc_weapon_del(self, data: bytes):
-        """Handle PLI_NPCWEAPONDEL packet."""
-        reader = PacketReader(data)
-        weapon_name = reader.remaining().decode('latin-1', errors='replace')
-
-        if weapon_name in self.weapons:
-            self.weapons.remove(weapon_name)
-
-    # =========================================================================
-    # Communication Handlers
-    # =========================================================================
-
-    async def _handle_chat(self, data: bytes):
-        """Handle PLI_TOALL chat packet."""
-        reader = PacketReader(data)
-        # PLI_TOALL is gchar-length-prefixed then the raw message (client's
-        # build_chat matches GServer-v2 Player::msgPLI_TOALL readString(
-        # readGUChar())). Reading remaining() instead kept the length byte as
-        # the message's first char — every relayed line gained a leading
-        # chr(len+32) garbage character. (The QA chat test used a substring
-        # match, so it never caught this; a playtester saw it immediately.)
-        message = reader.read_gstring().strip()
-
-        if not message or self.is_muted:
-            return
-
-        self.chat = message
-        logger.info(f"[Chat] {self.nickname}: {message}")
-
-        # Broadcast to level
-        if self.level:
-            packet = build_chat(self.id, message)
-            await self.server.broadcast_to_level(self.level.name, packet)
-
-            # Trigger NPC events
-            await self.server.npc_manager.on_player_chats(self, message)
-
-    async def _handle_private_message(self, data: bytes):
-        """Handle PLI_PRIVATEMESSAGE packet.
-
-        Format: [gshort count][gshort player_id]*count[raw message].
-        """
-        if self.is_muted:
-            return
-
-        reader = PacketReader(data)
-        count = reader.read_gshort()
-        target_ids = [reader.read_gshort() for _ in range(count)]
-        message = reader.remaining().decode('latin-1', errors='replace')
-        is_mass = len(target_ids) > 1
-
-        for target_id in target_ids:
-            target = self.server.get_player(target_id)
-            if target:
-                packet = build_private_message(
-                    self.id, self.nickname, message, is_mass=is_mass
-                )
-                await target.send_raw(packet)
-
-    async def _handle_show_img(self, data: bytes):
-        """Handle PLI_SHOWIMG packet (used here for level chat).
-
-        The client parses PLO_SHOWIMG with the same layout as chat
-        (gshort id + message), so relay it via build_chat.
-        """
-        reader = PacketReader(data)
-        message = reader.remaining().decode('latin-1', errors='replace')
-
-        if self.level and not self.is_muted:
-            packet = build_chat(self.id, message)
-            await self.server.broadcast_to_level(self.level.name, packet)
-
-    # =========================================================================
-    # Flag Handlers
-    # =========================================================================
-
-    async def _handle_flag_set(self, data: bytes):
-        """Handle PLI_FLAGSET packet."""
-        reader = PacketReader(data)
-        flag_data = reader.remaining().decode('latin-1', errors='replace')
-        if '=' not in flag_data:
-            self.flags[flag_data.strip()] = True
-            return
-        name, value = flag_data.split('=', 1)
-        name = name.strip()
-        value = value.strip()
-        if value:
-            self.flags[name] = value
-        else:
-            self.flags.pop(name, None)
-
-    async def _handle_flag_del(self, data: bytes):
-        """Handle PLI_FLAGDEL packet."""
-        flag_name = data.decode('latin-1', errors='replace').strip()
-        self.flags.pop(flag_name, None)
-
-    # =========================================================================
-    # Trigger Handler
-    # =========================================================================
-
-    async def _handle_trigger_action(self, data: bytes):
-        """Handle PLI_TRIGGERACTION packet.
-
-        Wire format (GServer-v2 msgPLI_TRIGGERACTION, PlayerClientPackets.cpp):
-            {GUINT3 npc_id}{GCHAR x*2}{GCHAR y*2}{action CSV}
-        npc_id is a 3-byte GInt (readGUInt() == readGInt(), 3 bytes on the
-        wire, not 4) - it must be consumed before x/y or every triggeraction
-        parses garbage.
-        """
-        reader = PacketReader(data)
-        npc_id = reader.read_gint3()
-        x = reader.read_gchar() / 2.0
-        y = reader.read_gchar() / 2.0
-        action = reader.remaining().decode('latin-1', errors='replace').strip()
-
-        logger.debug(f"Trigger action at ({x}, {y}): {action}")
-
-        # Handle serverside triggers
-        if action.startswith("serverside"):
-            await self.server.handle_trigger_action(self, x, y, action)
-
-        # Relay to other players on the level (GServer-v2 msgPLI_TRIGGERACTION:
-        # sendPacketToOneLevelPart(..., { m_id }) when sendplayertriggers=true,
-        # the default; excludes the sender).
-        if self.level:
-            packet = build_trigger_action(self.id, npc_id, x, y, action)
-            await self.server.broadcast_to_level(self.level.name, packet, exclude={self.id})
-
-        # Notify NPC manager
-        await self.server.npc_manager.on_trigger_action(self, x, y, action)
-
-    # =========================================================================
-    # File Handlers
-    # =========================================================================
-
-    async def _handle_want_file(self, data: bytes):
-        """Handle PLI_WANTFILE packet."""
-        reader = PacketReader(data)
-        filename = reader.remaining().decode('latin-1', errors='replace')
-
-        if hasattr(self.server, 'filesystem'):
-            await self.server.filesystem.handle_want_file(self, filename)
-
-    async def _handle_update_file(self, data: bytes):
-        """Handle PLI_UPDATEFILE packet."""
-        reader = PacketReader(data)
-        filename = reader.remaining().decode('latin-1', errors='replace')
-
-        if hasattr(self.server, 'filesystem'):
-            await self.server.filesystem.handle_want_file(self, filename)
-
-    async def _handle_verify_want_send(self, data: bytes):
-        """Handle PLI_VERIFYWANTSEND packet."""
-        reader = PacketReader(data)
-        checksum = reader.read_gint5()
-        filename = reader.remaining().decode('latin-1', errors='replace')
-
-        if hasattr(self.server, 'filesystem'):
-            await self.server.filesystem.handle_verify_want_send(self, checksum, filename)
-
-    async def _handle_update_gani(self, data: bytes):
-        """Handle PLI_UPDATEGANI packet."""
-        reader = PacketReader(data)
-        filename = reader.remaining().decode('latin-1', errors='replace')
-
-        if hasattr(self.server, 'filesystem'):
-            await self.server.filesystem.handle_update_gani(self, filename)
-
-    async def _handle_update_script(self, data: bytes):
-        """Handle PLI_UPDATESCRIPT packet."""
-        reader = PacketReader(data)
-        filename = reader.remaining().decode('latin-1', errors='replace')
-
-        if hasattr(self.server, 'filesystem'):
-            await self.server.filesystem.handle_update_script(self, filename)
-
-    async def _handle_update_class(self, data: bytes):
-        """Handle PLI_UPDATECLASS packet."""
-        reader = PacketReader(data)
-        classname = reader.remaining().decode('latin-1', errors='replace')
-
-        if hasattr(self.server, 'filesystem'):
-            await self.server.filesystem.handle_update_class(self, classname)
-
-    # =========================================================================
-    # Weapon Handler
-    # =========================================================================
-
-    async def _handle_weapon_add(self, data: bytes):
-        """Handle PLI_WEAPONADD packet (client requesting to add weapon)."""
-        reader = PacketReader(data)
-        weapon_name = reader.remaining().decode('latin-1', errors='replace')
-
-        if weapon_name and weapon_name not in self.weapons:
-            self.weapons.append(weapon_name)
-
-    # =========================================================================
-    # Board Handlers
-    # =========================================================================
-
-    async def _handle_board_modify(self, data: bytes):
-        """Handle PLI_BOARDMODIFY packet."""
-        if not self.level:
-            return
-
-        # Parse modification data
-        reader = PacketReader(data)
-        x = reader.read_gchar()
-        y = reader.read_gchar()
-        w = reader.read_gchar()
-        h = reader.read_gchar()
-        tile_data = reader.remaining()
-
-        # Validate bounds
-        if x < 0 or y < 0 or w <= 0 or h <= 0:
-            return
-        if x + w > 64 or y + h > 64:
-            return
-
-        # Check permissions (require admin rights for permanent changes)
-        # For now, allow all players to modify tiles (temporary changes)
-        # Permanent changes would require: if not (self.admin_rights & PLPERM.UPDATELEVEL):
-
-        # Apply tile changes
-        expected_size = w * h * 2  # 2 bytes per tile
-        if len(tile_data) < expected_size:
-            return
-
-        idx = 0
-        for ty in range(y, y + h):
-            for tx in range(x, x + w):
-                if idx + 1 < len(tile_data):
-                    tile_id = tile_data[idx] | (tile_data[idx + 1] << 8)
-                    self.level.set_tile(tx, ty, tile_id)
-                    idx += 2
-
-        # Broadcast modification to other players on level
-        from .protocol.packets import build_board_modify, build_board_modify2
-        gmap_info = self.server.world.get_gmap_for_level(self.level.name)
-        if gmap_info:
-            _, map_x, map_y = gmap_info
-            packet = build_board_modify2(
-                map_x, map_y, x, y, w, h, tile_data[:expected_size]
-            )
-        else:
-            packet = build_board_modify(
-                x, y, w, h, tile_data[:expected_size]
-            )
-        await self.server.broadcast_to_level(
-            self.level.name, packet, exclude={self.id}
-        )
-
-    async def _handle_request_update_board(self, data: bytes):
-        """Handle PLI_REQUESTUPDATEBOARD packet."""
-        if self.level:
-            # Resend level board
-            await self._send_level(self.level)
-
-    # =========================================================================
-    # Profile Handlers
-    # =========================================================================
-
-    async def _handle_profile_get(self, data: bytes):
-        """Handle PLI_PROFILEGET packet (request another player's profile).
-
-        Payload is the raw target account name, no length prefix (see
-        build_profile_get in pyReborn). GServer-v2 just forwards this to the
-        list server as SVO_GETPROF and relays whatever SVI_PROFILE comes
-        back; pygserver has no such external profile service, so it answers
-        from the locally-persisted account profile fields instead (see
-        ProfileManager).
-        """
-        reader = PacketReader(data)
-        account_name = reader.remaining().decode('latin-1', errors='replace')
-
-        if hasattr(self.server, 'profile_manager'):
-            profile = self.server.profile_manager.get_profile(account_name)
-            if not profile:
-                return
-            from .protocol.packets import build_profile
-            packet = build_profile(profile['account'], profile, profile.get('online_time', ''))
-            await self.send_raw(packet)
-
-    async def _handle_profile_set(self, data: bytes):
-        """Handle PLI_PROFILESET packet (update our own profile).
-
-        Payload: {GCHAR len}{account} then 9 free-text fields. GServer-v2
-        (Player.cpp msgPLI_PROFILESET) rejects the packet outright if the
-        embedded account name isn't the sender's own - mirror that here
-        before persisting anything.
-        """
-        from .protocol.packets import parse_profile
-        profile_data = parse_profile(data)
-
-        if profile_data.get('account') != self.account_name:
-            return
-
-        if hasattr(self.server, 'profile_manager'):
-            self.server.profile_manager.set_profile(self, profile_data)
-
-    # =========================================================================
-    # Server/Misc Handlers
-    # =========================================================================
-
-    async def _handle_map_info(self, data: bytes):
-        """Handle PLI_MAPINFO packet.
-
-        PLI_MAPINFO (39) is defined in GServer-v2's own packet enum
-        (dependencies/gs2lib/include/IEnums.h) but is never wired to a
-        handler there either (absent from IPacketHandler.h's
-        FOR_INPUT_PACKETS list) - the reference server silently drops it
-        too. True no-op, not a missing feature.
-        """
-        pass
-
-    async def _handle_server_warp(self, data: bytes):
-        """Handle PLI_SERVERWARP packet (warp to another server).
-
-        GServer-v2 (PlayerClientPackets.cpp msgPLI_SERVERWARP) just forwards
-        this to the connected list server as SVO_SERVERINFO ({GUSHORT player
-        id}{raw server name}); the list server looks up the named server and
-        replies with SVI_SERVERINFO, which is relayed back to the client
-        verbatim as PLO_SERVERWARP (see ServerListClient.request_server_info
-        / _handle_server_info). A single pygserver instance has no server
-        directory of its own to consult, so without a live list server
-        connection there's nowhere to look this up - log and drop.
-        """
-        reader = PacketReader(data)
-        server_name = reader.remaining().decode('latin-1', errors='replace')
-
-        listserver = getattr(self.server, 'listserver', None)
-        if listserver is not None and listserver.connected:
-            await listserver.request_server_info(self.id, server_name)
-        else:
-            logger.info(
-                f"{self.account_name} requested serverwarp to '{server_name}' "
-                f"but no list server connection is available"
-            )
-
-    async def _handle_packet_count(self, data: bytes):
-        """Handle PLI_PACKETCOUNT packet."""
-        # Client reporting packet count - used for sync checking
-        pass
-
-    async def _handle_language(self, data: bytes):
-        """Handle PLI_LANGUAGE packet."""
-        reader = PacketReader(data)
-        language = reader.remaining().decode('latin-1', errors='replace')
-        logger.debug(f"Player {self.id} language: {language}")
-
-    async def _handle_mute_player(self, data: bytes):
-        """Handle PLI_MUTEPLAYER packet.
-
-        Format (IEnums.h comment): {GSHORT playerId}{GBYTE 1/0}. GServer-v2
-        lists this in FOR_INPUT_PACKETS for packet-name tracing but never
-        assigns it a handler function - muting is purely a client-side
-        playerlist feature (it filters chat locally), so the server has
-        nothing to do besides not choke on the bytes. Parse for
-        observability only; true no-op otherwise.
-        """
-        reader = PacketReader(data)
-        target_id = reader.read_gshort()
-        muted = bool(reader.read_gchar())
-        logger.debug(f"{self.account_name} {'muted' if muted else 'unmuted'} player id {target_id} (client-local only)")
-
-    async def _handle_process_list(self, data: bytes):
-        """Handle PLI_PROCESSLIST packet.
-
-        GServer-v2 (PlayerClientPackets.cpp msgPLI_PROCESSLIST) detokenizes
-        the client's process list and discards it without acting on it -
-        this is the same no-op, just with the parse for observability.
-        """
-        reader = PacketReader(data)
-        processes = reader.remaining().decode('latin-1', errors='replace')
-        logger.debug(f"{self.account_name} process list: {processes!r}")
-
-    async def _handle_claim_pker(self, data: bytes):
-        """Handle PLI_CLAIMPKER packet."""
-        # PK claim system
-        pass
-
-    async def _handle_raw_data(self, data: bytes):
-        """Handle PLI_RAWDATA packet."""
-        reader = PacketReader(data)
-        size = reader.read_gint3()
-        # Raw data follows
-
-    async def _handle_request_text(self, data: bytes):
-        """Handle PLI_REQUESTTEXT packet (get server variable)."""
-        reader = PacketReader(data)
-        var_name = reader.remaining().decode('latin-1', errors='replace')
-
-        # Get server variable
-        value = ""
-        if hasattr(self.server, 'server_flags'):
-            value = self.server.server_flags.get(var_name, "")
-
-        from .protocol.packets import build_server_text
-        packet = build_server_text(var_name, value)
-        await self.send_raw(packet)
-
-    async def _handle_send_text(self, data: bytes):
-        """Handle PLI_SENDTEXT packet (set server variable)."""
-        reader = PacketReader(data)
-        var_data = reader.remaining().decode('latin-1', errors='replace')
-
-        if '=' in var_data:
-            var_name, value = var_data.split('=', 1)
-            if hasattr(self.server, 'server_flags'):
-                self.server.server_flags[var_name.strip()] = value.strip()
-
-    async def _handle_npc_server_query(self, data: bytes):
-        """Handle PLI_NPCSERVERQUERY packet."""
-        # Query about NPC server capabilities
-        pass
-
-    # =========================================================================
-    # Public Methods
+    # Level transitions
     # =========================================================================
 
     async def warp(self, level_name: str, x: float, y: float):
@@ -1626,25 +399,20 @@ class Player:
         if level.is_player_leader(self) or gmap_info:
             await self.send_raw(build_is_leader())
 
-        # Send other players on level
-        for other_id in level.get_player_ids():
-            if other_id != self.id:
-                other = self.server.get_player(other_id)
-                if other:
-                    await self.send_raw(other.build_props_packet())
-                    await other.send_raw(self.build_props_packet())
+        # Exchange props with everyone else already on the level (see
+        # audience.Audience for the one definition of who that is).
+        for other in self.server.audience.players_on_level(
+                level.name, exclude={self.id}):
+            await self.send_raw(other.build_props_packet())
+            await other.send_raw(self.build_props_packet())
+
+    # =========================================================================
+    # Sending
+    # =========================================================================
 
     async def send_raw(self, data: bytes):
         """Send raw packet data (will be encoded)."""
-        if not self.connected or not self._codec:
-            return
-        try:
-            encoded = self._codec.encode_packet(data)
-            self._writer.write(encoded)
-            await self._writer.drain()
-        except Exception as e:
-            logger.error(f"Send error: {e}")
-            self.connected = False
+        await self.session.send(data)
 
     async def send_packet(self, packet_id: int, data: bytes = b""):
         """Send a packet with given ID and data."""
@@ -1665,6 +433,10 @@ class Player:
             PLPROP.DIRECTION: self.direction,
             PLPROP.SPRITE: self.sprite,
             PLPROP.GANI: self.gani,
+            # (power, image): the biased form is the only one that carries the
+            # gear's image name, which is what the other client renders.
+            PLPROP.SWORDPOWER: (self.sword_power, self.sword_image),
+            PLPROP.SHIELDPOWER: (self.shield_power, self.shield_image),
             PLPROP.HEADIMAGE: self.head_image,
             PLPROP.BODYIMAGE: self.body_image,
             PLPROP.CURLEVEL: self.level.name if self.level else "",
@@ -1677,6 +449,10 @@ class Player:
     def build_leave_packet(self) -> bytes:
         """Build PLO_PLAYERLEFT packet."""
         return build_player_left(self.id)
+
+    # =========================================================================
+    # Player data accessors (used by the managers and NPC scripts)
+    # =========================================================================
 
     def get_flag(self, name: str) -> str:
         """Get player flag value."""
@@ -1699,3 +475,97 @@ class Player:
         """Remove a weapon from player."""
         if name in self.weapons:
             self.weapons.remove(name)
+
+
+# =============================================================================
+# State-component aliases
+#
+# Player attribute name -> (component attribute on Player, field on it). The
+# state lives on the components in player_state.py / player_session.py; each
+# entry below installs a get/set property so every historical flat name still
+# works - server.py, every manager, the GS1 host, account persistence and the
+# test suite read and write these directly. Adding state means adding it to a
+# component AND listing it here.
+# =============================================================================
+
+_STATE_ALIASES: Dict[str, Tuple[str, str]] = {
+    # --- transport ----------------------------------------------------------
+    'connected': ('session', 'connected'),
+    '_codec': ('session', 'codec'),
+    '_buffer': ('session', 'buffer'),
+    '_reader': ('session', 'reader'),
+    '_writer': ('session', 'writer'),
+
+    # --- identity -----------------------------------------------------------
+    'account_name': ('identity', 'account_name'),
+    'nickname': ('identity', 'nickname'),
+    'guild_name': ('identity', 'guild_name'),
+    'guild_nickname': ('identity', 'guild_nickname'),
+    'connection_type': ('identity', 'connection_type'),
+
+    # --- character ----------------------------------------------------------
+    'x': ('character', 'x'),
+    'y': ('character', 'y'),
+    'direction': ('character', 'direction'),
+    'carrysprite': ('character', 'carrysprite'),
+    'npc_id': ('character', 'npc_id'),
+    'hearts': ('character', 'hearts'),
+    'max_hearts': ('character', 'max_hearts'),
+    'rupees': ('character', 'rupees'),
+    'arrows': ('character', 'arrows'),
+    'bombs': ('character', 'bombs'),
+    'glove_power': ('character', 'glove_power'),
+    'sword_power': ('character', 'sword_power'),
+    'shield_power': ('character', 'shield_power'),
+    'kills': ('character', 'kills'),
+    'deaths': ('character', 'deaths'),
+    'head_image': ('character', 'head_image'),
+    'body_image': ('character', 'body_image'),
+    'sword_image': ('character', 'sword_image'),
+    'shield_image': ('character', 'shield_image'),
+    'colors': ('character', 'colors'),
+    'mp': ('character', 'mp'),
+    'ap': ('character', 'ap'),
+    'gani': ('character', 'gani'),
+    'sprite': ('character', 'sprite'),
+    'chat': ('character', 'chat'),
+
+    # --- inventory ----------------------------------------------------------
+    'weapons': ('inventory', 'weapons'),
+    'flags': ('inventory', 'flags'),
+    'gattribs': ('inventory', 'gattribs'),
+
+    # --- status -------------------------------------------------------------
+    'logged_in': ('status', 'logged_in'),
+    'is_frozen': ('status', 'is_frozen'),
+    'is_ghost': ('status', 'is_ghost'),
+    'is_muted': ('status', 'is_muted'),
+    'admin_rights': ('status', 'admin_rights'),
+    'login_time': ('status', 'login_time'),
+    'last_packet_time': ('status', 'last_packet_time'),
+}
+
+
+def _state_alias(component: str, field: str) -> property:
+    """Build the Player property that reads/writes component.field."""
+
+    def getter(self):
+        return getattr(getattr(self, component), field)
+
+    def setter(self, value):
+        setattr(getattr(self, component), field, value)
+
+    return property(getter, setter,
+                    doc="Alias of self.%s.%s." % (component, field))
+
+
+for _alias_name, (_alias_component, _alias_field) in _STATE_ALIASES.items():
+    if hasattr(Player, _alias_name):
+        raise RuntimeError(
+            "state alias %r would shadow an existing Player attribute"
+            % _alias_name)
+    setattr(Player, _alias_name, _state_alias(_alias_component, _alias_field))
+
+
+# PLI id -> handler method name, built once from the mixins' @handles marks.
+_HANDLER_NAMES: Dict[int, str] = collect_handler_names(Player)
