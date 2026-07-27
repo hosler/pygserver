@@ -59,6 +59,18 @@ def _b_tokenscount(self, name, indices, ctx, npc, player):
     return tokens_count(ctx)
 
 
+def _b_save(self, name, indices, ctx, npc, player):
+    if npc is None:
+        return UNSET
+    slots = ctx.vars.scopes["this"].setdefault("save", [0.0] * 10)
+    index = int(to_num(indices[0])) if indices else 0
+    return float(slots[index]) if 0 <= index < len(slots) else 0.0
+
+
+def _b_playerscount(self, name, indices, ctx, npc, player):
+    return float(len(self._players_on_level(ctx)))
+
+
 def _b_timevar2(self, name, indices, ctx, npc, player):
     # Serverside timevar2 is the Unix timestamp (seconds).
     return float(int(time.time()))
@@ -198,7 +210,8 @@ def _b_compsdead(self, name, indices, ctx, npc, player):
 
 _BUILTINS = {
     "tiles": _b_tiles, "board": _b_board,
-    "tokenscount": _b_tokenscount, "timevar2": _b_timevar2,
+    "tokenscount": _b_tokenscount, "save": _b_save,
+    "playerscount": _b_playerscount, "timevar2": _b_timevar2,
     "playerfreezetime": _b_playerfreezetime, "playerlevel": _b_playerlevel,
     "playeronline": _b_playeronline, "isweapon": _b_isweapon,
     "playerswimming": _b_playerswimming,

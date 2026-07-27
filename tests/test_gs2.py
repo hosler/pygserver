@@ -89,11 +89,11 @@ def test_split_keeps_only_the_clientside_half():
     assert clientside == "function onCreated() { x = 1; }"
 
 
-def test_split_without_marker_has_no_clientside():
+def test_split_without_marker_is_whole_clientside():
     serverside, clientside = split_clientside("function onCreated() { x = 1; }\n")
 
-    assert serverside == "function onCreated() { x = 1; }"
-    assert clientside == ""
+    assert serverside == ""
+    assert clientside == "function onCreated() { x = 1; }"
 
 
 def test_split_marker_on_the_last_line_yields_empty_clientside():

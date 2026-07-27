@@ -206,6 +206,12 @@ class GS1Host(Host):
     def set_builtin(self, name, value, indices, ctx) -> bool:
         player = ctx.player
         npc = ctx.this_obj
+        if name == "save" and indices and npc is not None:
+            slots = ctx.vars.scopes["this"].setdefault("save", [0.0] * 10)
+            index = int(to_num(indices[0]))
+            if 0 <= index < len(slots):
+                slots[index] = float(min(220, max(0, int(to_num(value)))))
+            return True
         if name == "tiles":
             resolved = self._resolve_tile(indices, ctx)
             if resolved is not None:

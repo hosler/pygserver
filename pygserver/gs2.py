@@ -106,7 +106,7 @@ def split_clientside(source: str) -> Tuple[str, str]:
     minified = minify(source)
     sep = minified.find(CLIENTSIDE_MARKER)
     if sep == -1:
-        return minified, ''
+        return '', minified
     end_of_line = minified.find('\n', sep)
     if end_of_line == -1:
         return minified[:sep].strip(), ''

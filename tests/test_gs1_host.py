@@ -157,6 +157,39 @@ def test_predicate_builtins_are_bools_and_work_in_bare_conditions(
     assert npc.gs1_scopes["this"]["hit"] is expected
 
 
+def test_bare_save_aliases_this_save_in_same_event():
+    npc = make_npc(
+        "if (created) { save[0]=1; this.first=save[0];"
+        " this.save[1]=2; this.second=save[1]; }"
+    )
+
+    run_npc_event(npc, "created", None, None)
+
+    assert npc.gs1_scopes["this"]["save"][:2] == [1.0, 2.0]
+    assert npc.gs1_scopes["this"]["first"] == 1.0
+    assert npc.gs1_scopes["this"]["second"] == 2.0
+
+
+def test_playerscount_is_current_level_population():
+    level = FakeLevel()
+    level._player_ids.update({1, 2})
+    players = {1: FakePlayer(1), 2: FakePlayer(2)}
+
+    class Server:
+        @staticmethod
+        def get_player(pid):
+            return players.get(pid)
+
+    npc = make_npc(
+        "if (created) { if (playerscount==2) { this.ready=true; } }",
+        level,
+    )
+
+    run_npc_event(npc, "created", Server(), players[1])
+
+    assert npc.gs1_scopes["this"]["ready"] is True
+
+
 # -- setcharprop (NPC appearance) ------------------------------------------
 def test_setcharprop_equipment_codes():
     npc = make_npc(
@@ -457,6 +490,35 @@ def test_toweapons_stores_and_serves_the_npc_image_and_script(tmp_path):
         saved = (tmp_path / "weapons" / "weaponmagicwand.txt").read_text(
             encoding="latin-1")
         assert source in saved
+
+    asyncio.run(main())
+
+
+def test_toweapons_markerless_script_sends_the_whole_script(tmp_path):
+    from pygserver.gs2 import GS2ScriptManager
+
+    class Config:
+        weapons_dir = str(tmp_path / "weapons")
+
+    class Server:
+        config = Config()
+
+    async def main():
+        server = Server()
+        server.gs2_manager = GS2ScriptManager(server, str(tmp_path))
+        source = (
+            "if (playertouchsme) { toweapons magicwand; } "
+            "if (weaponfired) { setani cast; }"
+        )
+        npc = make_npc(source)
+        player = FakePlayer()
+
+        run_npc_event(npc, "playertouchsme", server, player)
+        await asyncio.sleep(0)
+
+        weapon = server.gs2_manager.get_weapon("magicwand")
+        assert weapon.clientside == source
+        assert source.encode("latin-1") in player.sent[0]
 
     asyncio.run(main())
 
