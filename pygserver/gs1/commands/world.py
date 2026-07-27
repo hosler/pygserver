@@ -19,11 +19,18 @@ def _spawn_item(self, ctx, code, x, y):
     lvl = self._level_of(ctx)
     if im is None or lvl is None or not hasattr(im, "spawn_item"):
         return
+    from ...protocol.constants import LevelItemType
+    # scripts say `lay bombs` — the arg is the item NAME; numeric form kept
+    # for scripts that pass an index
     try:
-        from ...protocol.constants import LevelItemType
-        item_type = LevelItemType(int(to_num(code)))
-    except Exception:
-        return
+        item_type = LevelItemType[str(code).strip().upper()]
+    except KeyError:
+        # strict numeric parse only — the lenient to_num turns every
+        # unknown word into 0 = greenrupee, which was the original bug
+        try:
+            item_type = LevelItemType(int(float(str(code).strip())))
+        except (ValueError, TypeError):
+            return
     _schedule(im.spawn_item(lvl, to_num(x), to_num(y), item_type))
 
 def _c_lay(self, a, npc, player, ctx):
