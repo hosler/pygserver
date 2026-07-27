@@ -83,13 +83,14 @@ def test_handler_table_is_bound_methods_named_after_the_packet():
     assert handlers[PLI.BADDYHURT] == player._handle_baddy_hurt
 
 
-def test_npc_edit_packets_are_not_registered():
-    """PLI_NPCPROPS/PUTNPC/NPCDEL are refused outright by GServer-v2 when the
-    server runs its own NPC server (PlayerClientPackets.cpp:191-193, 755-757,
-    784-786). They used to be registered as handlers that parsed the packet and
-    then did nothing, which made the table claim coverage it did not have."""
-    for packet_id in (PLI.NPCPROPS, PLI.PUTNPC, PLI.NPCDEL):
+def test_unsupported_npc_edit_packets_are_not_registered():
+    for packet_id in (PLI.NPCPROPS, PLI.NPCDEL):
         assert packet_id not in _HANDLER_NAMES
+
+
+def test_client_entity_creation_packets_are_registered():
+    assert _HANDLER_NAMES[PLI.PUTNPC] == '_handle_putnpc'
+    assert _HANDLER_NAMES[PLI.BADDYADD] == '_handle_baddy_add'
 
 
 def test_unhandled_packet_ids_are_recorded():

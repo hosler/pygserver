@@ -62,6 +62,9 @@ class ServerConfig:
     sword_limit: int = 3
     shield_limit: int = 3
     heal_swords: bool = False
+    # Client PLI_PUTNPC is opt-in, matching the reference server's
+    # get<bool>(...).value_or(false).
+    putnpc_enabled: bool = False
 
     # Ambient world population: number of wandering VillagerNPCs to spawn on
     # the start level at boot (0 disables). See npcs/villager.py.
@@ -154,6 +157,8 @@ class ServerConfig:
                             config.shield_limit = int(value)
                         elif key == 'healswords':
                             config.heal_swords = value.lower() == 'true'
+                        elif key == 'putnpcenabled':
+                            config.putnpc_enabled = value.lower() == 'true'
         except FileNotFoundError:
             pass  # Use defaults
 

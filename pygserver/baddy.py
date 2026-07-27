@@ -130,6 +130,7 @@ class Baddy:
 
     # Respawn settings
     respawn_time: float = 60.0
+    respawn_enabled: bool = True
     dead: bool = False
     death_time: float = 0.0
 
@@ -243,7 +244,7 @@ class BaddyManager:
             for baddy_id, baddy in list(baddies.items()):
                 # Handle dead baddies
                 if baddy.dead:
-                    if self.baddy_respawn_enabled:
+                    if self.baddy_respawn_enabled and baddy.respawn_enabled:
                         if current_time - baddy.death_time >= baddy.respawn_time:
                             await self._respawn_baddy(baddy)
                     continue
@@ -411,7 +412,10 @@ class BaddyManager:
 
     async def add_baddy(self, level: 'Level', x: float, y: float,
                         baddy_type: BaddyType,
-                        verses: Optional[List[str]] = None) -> Baddy:
+                        verses: Optional[List[str]] = None,
+                        respawn_enabled: bool = True,
+                        power: Optional[int] = None,
+                        image: str = "") -> Baddy:
         """
         Add a baddy to a level.
 
@@ -436,8 +440,13 @@ class BaddyManager:
             x=x,
             y=y,
             respawn_time=self.default_respawn_time,
+            respawn_enabled=respawn_enabled,
             verses=list(verses) if verses else [],
+            image=image,
         )
+        if power is not None:
+            baddy.health = int(power)
+            baddy.max_health = int(power)
 
         if level.name not in self._baddies:
             self._baddies[level.name] = {}

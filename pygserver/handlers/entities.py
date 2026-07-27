@@ -1,19 +1,9 @@
-"""Baddies, the player's weapon list, and the NPC packets we deliberately drop.
-
-PLI_NPCPROPS (3), PLI_PUTNPC (21) and PLI_NPCDEL (22) are NOT registered here.
-GServer-v2 refuses all three outright when the server has an NPC server of its
-own - each handler's first statement is `if (m_server->hasNPCServer()) return;`
-(PlayerClientPackets.cpp:191-193, 755-757, 784-786), because a client must not
-be able to edit NPCs the server's own scripting engine owns. pygserver always
-runs its NPCManager, so the reference behaviour is "never accept these", and
-they are left unregistered rather than kept as handlers that parse a packet and
-fall through to `pass` - which made the dispatch table claim coverage it did not
-have.
-"""
+"""Baddies, client-created level NPCs, and the player's weapon list."""
 
 import logging
+from pathlib import Path
 
-from ..protocol.constants import PLI, PLPERM, BDPROP, BDMODE
+from ..protocol.constants import PLI, BDPROP, BDMODE
 from ..protocol.packets import PacketReader, build_baddy_props
 from .registry import handles
 
@@ -111,22 +101,53 @@ class EntityHandlers:
 
     @handles(PLI.BADDYADD)
     async def _handle_baddy_add(self, data: bytes):
-        """Handle PLI_BADDYADD packet (admin adding baddy)."""
+        """Handle {x*2}{y*2}{type}{power in half-hearts}{image=rest}."""
         if not self.level:
-            return
-        if not self.admin_rights & PLPERM.SETATTRIBUTES:
             return
 
         reader = PacketReader(data)
         x = reader.read_gchar() / 2.0
         y = reader.read_gchar() / 2.0
-        baddy_type = reader.read_gchar() if reader.remaining() else 0
+        baddy_type = reader.read_gchar()
+        power = min(reader.read_gchar(), 12)
+        image = reader.remaining().decode('latin-1', errors='replace')
+        if image and not Path(image).suffix:
+            image += ".gif"
 
         if hasattr(self.server, 'baddy_manager'):
             from ..baddy import BaddyType
-            await self.server.baddy_manager.add_baddy(
-                self.level, x, y, BaddyType(baddy_type)
+            baddy = await self.server.baddy_manager.add_baddy(
+                self.level, x, y, BaddyType(baddy_type),
+                respawn_enabled=False,
+                power=power,
+                image=image,
             )
+
+    @handles(PLI.PUTNPC)
+    async def _handle_putnpc(self, data: bytes):
+        """Create a level NPC from {image}{scriptfile}{x*2}{y*2}."""
+        if not self.level or not getattr(self.server.config, 'putnpc_enabled', False):
+            return
+
+        reader = PacketReader(data)
+        image = reader.read_gstring()
+        scriptfile = reader.read_gstring()
+        x = reader.read_gchar() / 2.0
+        y = reader.read_gchar() / 2.0
+
+        filesystem = getattr(self.server, 'filesystem', None)
+        manager = getattr(self.server, 'npc_manager', None)
+        script_path = filesystem._find_file(scriptfile) if filesystem else None
+        if script_path is None or manager is None:
+            return
+
+        code = script_path.read_text(encoding='latin-1').replace('\r', '')
+        npc = manager.create_npc(level=self.level, x=x, y=y)
+        npc.image = image
+        manager.attach_gs1(npc, code)
+        await self.server.broadcast_to_level(
+            self.level.name, npc.build_props_packet()
+        )
 
     @handles(PLI.NPCWEAPONDEL)
     async def _handle_npc_weapon_del(self, data: bytes):

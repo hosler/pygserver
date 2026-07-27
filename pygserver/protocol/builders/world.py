@@ -171,7 +171,9 @@ def build_npc_weapon_add(weapon_name: str, image: str, script: str) -> bytes:
     builder.write_gchar(0)  # NPCProp.IMAGE
     builder.write_gstring(image)
     builder.write_gchar(1)  # NPCProp.SCRIPT
-    builder.write_gstring_short(script)
+    # GS1 wire format joins script lines with 0xa7 — without this, the
+    # newline-framed packet truncates the script at its first line
+    builder.write_gstring_short(script.replace("\n", "\xa7"))
     builder.write_newline()
     return builder.build()
 
