@@ -205,29 +205,26 @@ class MiscHandlers:
 
     @handles(PLI.REQUESTTEXT)
     async def _handle_request_text(self, data: bytes):
-        """Handle PLI_REQUESTTEXT packet (get server variable)."""
-        reader = PacketReader(data)
-        var_name = reader.remaining().decode('latin-1', errors='replace')
+        """Handle PLI_REQUESTTEXT packet.
 
-        # Get server variable
-        value = ""
-        if hasattr(self.server, 'server_flags'):
-            value = self.server.server_flags.get(var_name, "")
-
-        from ..protocol.packets import build_server_text
-        packet = build_server_text(var_name, value)
-        await self.send_raw(packet)
+        Payload is gtokenized `weapon,texttype,textoption[,params...]` (the
+        client engine prepends the calling weapon's name; GServer-v2
+        PlayerRequestText.cpp msgPLI_REQUESTTEXT). A prior revision here
+        implemented a "get server variable" protocol that matched no oracle.
+        """
+        text = data.decode('latin-1', errors='replace')
+        irc = getattr(self.server, 'irc_manager', None)
+        if irc is not None:
+            await irc.handle_request_text(self, text)
 
     @handles(PLI.SENDTEXT)
     async def _handle_send_text(self, data: bytes):
-        """Handle PLI_SENDTEXT packet (set server variable)."""
-        reader = PacketReader(data)
-        var_data = reader.remaining().decode('latin-1', errors='replace')
-
-        if '=' in var_data:
-            var_name, value = var_data.split('=', 1)
-            if hasattr(self.server, 'server_flags'):
-                self.server.server_flags[var_name.strip()] = value.strip()
+        """Handle PLI_SENDTEXT packet (same wire shape as REQUESTTEXT; the
+        command half of the text-op surface - irc login/join/part/privmsg)."""
+        text = data.decode('latin-1', errors='replace')
+        irc = getattr(self.server, 'irc_manager', None)
+        if irc is not None:
+            await irc.handle_send_text(self, text)
 
     @handles(PLI.NPCSERVERQUERY)
     async def _handle_npc_server_query(self, data: bytes):

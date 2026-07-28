@@ -208,7 +208,7 @@ def _c_hitcompu(self, a, npc, player, ctx):
         to_num(a[2]), to_num(a[3])))
 
 def _c_hurt(self, a, npc, player, ctx):
-    # hurt <halfhearts> — C++ fn_hurt (GS1Commands.cpp:1346) floors the
+    # hurt <halfhearts> — C++ fn_hurt (GS1Commands.cpp:1423) floors the
     # argument to an int and hits the acting player for that many
     # HALF-hearts (hitPlayer power), so `hurt 1` removes 0.5 hearts.
     #

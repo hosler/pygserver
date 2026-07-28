@@ -329,6 +329,29 @@ def test_matching_class_checksum_sends_nothing(tmp_path):
     assert len(player.sent) == 1
 
 
+def test_classic_class_is_sent_as_source_with_empty_cache(tmp_path):
+    (tmp_path / "weapons").mkdir()
+    scripts = tmp_path / "scripts"
+    scripts.mkdir()
+    source = 'if (created) { this.answer = 42; }\n'
+    path = scripts / "classicclass.txt"
+    path.write_text(source, encoding="latin-1")
+    cache = path.with_suffix(".gs2bc")
+    cache.write_bytes(b"")
+    import os
+    os.utime(cache, (path.stat().st_mtime + 1,) * 2)
+    manager = make_manager(tmp_path, compiler_available=False)
+    manager.load()
+    player = FakePlayer()
+
+    run(manager.send_class_bytecode(player, "classicclass", 0))
+
+    packet = player.sent[0][ANNOUNCEMENT_SIZE:]
+    body = strip_frame(packet, PLO.LOADSCRIPT)
+    header_len = body[0] - 32
+    assert body[1 + header_len:] == source.strip().encode("latin-1")
+
+
 def test_announce_weapon_sends_the_add_then_the_header(tmp_path):
     write_fixtures(tmp_path)
     (tmp_path / "weapons" / "weaponqa%095gs2vm.gs2bc").write_bytes(BINARY_BYTECODE)

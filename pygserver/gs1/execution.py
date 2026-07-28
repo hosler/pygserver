@@ -54,7 +54,7 @@ class _PendingGS1Sleep:
     (task requirement: resume with the SAME player the suspended execution
     started with, even if the level leader changed mid-sleep).
     """
-    __slots__ = ("resumable", "ctx", "vars", "player", "this_obj",
+    __slots__ = ("resumable", "ctx", "vars", "player", "this_obj", "level",
                  "hit_source", "charprop_source", "tokenize_tokens")
 
     def __init__(self, resumable, ctx):
@@ -63,6 +63,7 @@ class _PendingGS1Sleep:
         self.vars = ctx.vars
         self.player = ctx.player
         self.this_obj = ctx.this_obj
+        self.level = getattr(ctx.this_obj, "level", None)
         self.hit_source = ctx.hit_source
         self.charprop_source = ctx.charprop_source
         self.tokenize_tokens = ctx.tokenize_tokens
@@ -72,6 +73,8 @@ class _PendingGS1Sleep:
         ctx.vars = self.vars
         ctx.player = self.player
         ctx.this_obj = self.this_obj
+        if self.this_obj is not None:
+            self.this_obj.level = self.level
         ctx.hit_source = self.hit_source
         ctx.charprop_source = self.charprop_source
         ctx.tokenize_tokens = self.tokenize_tokens
@@ -99,7 +102,7 @@ def _ensure_gs1_ctx(npc, host):
 
 
 def _bind_fresh_gs1_call(ctx, npc, server, player, event, source,
-                         carryobject_type=None):
+                         carryobject_type=None, params=None):
     """(Re)configure the NPC's persistent ctx for a brand-new top-level
     firing (as opposed to resuming a pending sleep). Rebuilds `ctx.vars` from
     scratch exactly like the pre-resumable code used to build a whole new
@@ -131,13 +134,15 @@ def _bind_fresh_gs1_call(ctx, npc, server, player, event, source,
     ctx.carryobject_type = (int(carryobject_type)
                             if carryobject_type is not None else None)
     ctx.active_event = event
+    ctx.action_params = list(params or ())
     ctx.tokenize_tokens = []
     ctx.charprop_source = None
     ctx.steps = 0
+    ctx.written_players = {}
 
 
 def run_npc_event(npc, event: str, server=None, player=None, source=None,
-                  carryobject_type=None):
+                  carryobject_type=None, params=None):
     """Fire a GS1 event handler (`if (<event>) {...}`) on an NPC.
 
     Always runs through reborn_protocol's resumable API (Interpreter.
@@ -189,37 +194,48 @@ def run_npc_event(npc, event: str, server=None, player=None, source=None,
     if event == "timeout" and pending is not None:
         ctx = pending.ctx
         pending.apply()
+        ctx.written_players = {}
         try:
             pending.resumable.resume()
         except Exception as e:
             from .host import _report_gs1_error
             _report_gs1_error(f"event timeout resume on npc {getattr(npc, 'id', '?')}", e)
             npc._gs1_pending = None
-            _flush_player_props(pending.player)
+            _flush_event_players(ctx, pending.player)
             return ctx
         if pending.resumable.done:
             npc._gs1_pending = None
         elif hasattr(npc, "set_timer"):
             npc.set_timer(pending.resumable.pending_sleep)
-        _flush_player_props(pending.player)
+        _flush_event_players(ctx, pending.player)
         return ctx
 
     ctx = _ensure_gs1_ctx(npc, host)
     _bind_fresh_gs1_call(ctx, npc, server, player, event, source,
-                         carryobject_type)
+                         carryobject_type, params)
     try:
         resumable = Interpreter(ctx).run_event_resumable(prog, event)
     except Exception as e:
         from .host import _report_gs1_error
         _report_gs1_error(f"event {event} on npc {getattr(npc, 'id', '?')}", e)
-        _flush_player_props(player)
+        _flush_event_players(ctx, player)
         return ctx
     if not resumable.done:
         npc._gs1_pending = _PendingGS1Sleep(resumable, ctx)
         if hasattr(npc, "set_timer"):
             npc.set_timer(resumable.pending_sleep)
-    _flush_player_props(player)
+    _flush_event_players(ctx, player)
     return ctx
+
+
+def _flush_event_players(ctx, acting_player):
+    """Flush every player mutated during this execution slice."""
+    players = dict(getattr(ctx, "written_players", {}) or {})
+    if acting_player is not None:
+        players[id(acting_player)] = acting_player
+    ctx.written_players = {}
+    for player in players.values():
+        _flush_player_props(player)
 
 
 def _flush_player_props(player):

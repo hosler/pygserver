@@ -82,6 +82,9 @@ class GameServer:
         # Profile manager
         self.profile_manager = None
 
+        # Server-local serverlist-chat / IRC channels
+        self.irc_manager = None
+
         # GS2 clientside bytecode (compiled weapons/classes)
         self.gs2_manager = None
 
@@ -192,6 +195,10 @@ class GameServer:
 
         # Profile manager
         self.profile_manager = ProfileManager(self)
+
+        # Server-local serverlist-chat / IRC channels
+        from .irc import IrcManager
+        self.irc_manager = IrcManager(self)
 
         # List server client
         from .listserver import ServerListClient
@@ -380,6 +387,11 @@ class GameServer:
         if player.id in self.players:
             del self.players[player.id]
 
+        # Part chat channels + roster pushes (after the players-dict removal
+        # so the parted player gets no roster traffic)
+        if self.irc_manager:
+            await self.irc_manager.remove_player(player)
+
         # Notify other players on same level
         if player.level:
             await self.broadcast_to_level(
@@ -501,23 +513,54 @@ class GameServer:
             action: Action string (e.g., "serverside,action,param1,param2")
         """
         # Parse action
-        parts = action.split(',')
+        from .gs2 import parse_csv_tolerant
+        parts = parse_csv_tolerant(action)
         if len(parts) < 2:
-            return
+            return False
 
-        action_type = parts[1] if len(parts) > 1 else ""
+        carrier = parts[0].strip().lower()
+        action_type = parts[1].strip()
         params = parts[2:] if len(parts) > 2 else []
 
         logger.debug(f"Serverside trigger: {action_type} with params {params}")
+
+        if carrier == "serverside" and self.gs2_manager is not None:
+            weapon = self.gs2_manager.get_weapon(action_type)
+            runtime = getattr(weapon, "server_runtime", None)
+            if runtime is not None:
+                from .gs1_host import run_npc_event
+                runtime.level = player.level
+                run_npc_event(runtime, "actionserverside", self, player,
+                              params=params)
+                return True
+
+        if carrier == "servernpc":
+            target = next((
+                npc for npc in self.npc_manager._npcs.values()
+                if npc.name.lower() == action_type.lower()
+            ), None)
+            if target is None:
+                return False
+            from .gs1_host import run_npc_event
+            run_npc_event(target, "actionserverside", self, player,
+                          params=params)
+            return True
+
+        if carrier != "serverside":
+            return False
 
         # Handle common triggers
         if action_type == "warp":
             # Format: serverside,warp,level,x,y
             if len(params) >= 3:
                 level_name = params[0]
-                dest_x = float(params[1])
-                dest_y = float(params[2])
+                try:
+                    dest_x = float(params[1])
+                    dest_y = float(params[2])
+                except ValueError:
+                    return False
                 await player.warp(level_name, dest_x, dest_y)
+                return True
 
         elif action_type == "setflag":
             # Format: serverside,setflag,name,value
@@ -525,6 +568,7 @@ class GameServer:
                 flag_name = params[0]
                 flag_value = params[1]
                 player.set_flag(flag_name, flag_value)
+                return True
 
         elif action_type == "addweapon":
             # Format: serverside,addweapon,name
@@ -533,24 +577,34 @@ class GameServer:
                 player.add_weapon(weapon_name)
                 if self.gs2_manager is not None:
                     await self.gs2_manager.announce_weapon(player, weapon_name)
+                return True
 
         elif action_type == "removeweapon":
             # Format: serverside,removeweapon,name
             if len(params) >= 1:
                 weapon_name = params[0]
                 player.remove_weapon(weapon_name)
+                return True
 
         elif action_type == "giverupees":
             # Format: serverside,giverupees,amount
             if len(params) >= 1:
-                amount = int(params[0])
+                try:
+                    amount = int(params[0])
+                except ValueError:
+                    return False
                 player.rupees = min(9999, player.rupees + amount)
+                return True
 
         elif action_type == "heal":
             # Format: serverside,heal,amount
             if len(params) >= 1:
-                amount = float(params[0])
+                try:
+                    amount = float(params[0])
+                except ValueError:
+                    return False
                 player.hearts = min(player.max_hearts, player.hearts + amount)
+                return True
 
         elif action_type == "setlevel":
             # Format: serverside,setlevel,flag,value
@@ -559,9 +613,8 @@ class GameServer:
                 flag_value = params[1]
                 # Set level-specific flag
                 pass
-
-        # Let NPCs handle their own triggers
-        await self.npc_manager.on_trigger_action(player, x, y, action)
+                return True
+        return False
 
     def register_rc_session(self, player: Player) -> bool:
         """

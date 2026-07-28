@@ -27,7 +27,7 @@ import tempfile
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
-from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from .protocol.packets import (
     build_gani_script,
@@ -182,6 +182,53 @@ def to_csv(fields: List[str]) -> str:
     return ','.join(parts)
 
 
+def parse_csv_tolerant(value: str) -> List[str]:
+    """Decode the wire CSV dialect, falling back to a raw comma split.
+
+    Quoted fields double embedded quotes and backslashes.  A malformed quoted
+    field is ordinary raw trigger text, never a reason to drop the trigger.
+    """
+    fields: List[str] = []
+    pos = 0
+    while pos <= len(value):
+        if pos == len(value):
+            fields.append("")
+            break
+        if value[pos] != '"':
+            end = value.find(",", pos)
+            if end < 0:
+                fields.append(value[pos:])
+                break
+            fields.append(value[pos:end])
+            pos = end + 1
+            continue
+
+        pos += 1
+        field: List[str] = []
+        while pos < len(value):
+            char = value[pos]
+            if char in ('"', '\\') and pos + 1 < len(value) \
+                    and value[pos + 1] == char:
+                field.append(char)
+                pos += 2
+                continue
+            if char == '"':
+                pos += 1
+                if pos == len(value):
+                    fields.append("".join(field))
+                    return fields
+                if value[pos] != ",":
+                    return value.split(",")
+                fields.append("".join(field))
+                pos += 1
+                break
+            field.append(char)
+            pos += 1
+        else:
+            return value.split(",")
+    return fields
+
+
 def _gint5(value: int) -> str:
     return ''.join(chr(((value >> shift) & 0x7F) + 32)
                    for shift in (28, 21, 14, 7, 0))
@@ -202,6 +249,8 @@ class GS2Script:
     header: str = ''
     header_with_crc: str = ''
     joined_classes: str = ''
+    server_program: Optional[Any] = None
+    server_runtime: Optional[Any] = None
 
     def build_headers(self, source: str):
         """Derive the DES key, CRC32 and CSV headers from the full source.
@@ -356,9 +405,20 @@ class GS2ScriptManager:
         else:
             name, image, script_source = path.stem, '', source
 
-        _, clientside = split_clientside(script_source)
+        serverside, clientside = split_clientside(script_source)
         script = GS2Script(kind=kind, name=name, image=image,
                            source=script_source, clientside=clientside)
+        if kind == 'weapon' and serverside:
+            from .gs1_host import compile_gs1
+            from .npc import NPC
+            script.server_program = compile_gs1(serverside)
+            if script.server_program is not None:
+                script.server_runtime = NPC(0, name)
+                script.server_runtime.gs1_program = script.server_program
+                script.server_runtime.gs1_source = serverside
+                manager = getattr(self.server, "npc_manager", None)
+                if manager is not None:
+                    manager.register_weapon_runtime(script.server_runtime)
         script.build_headers(script_source)
         script.bytecode = self._bytecode_for(path, clientside, name) or b''
 
@@ -393,10 +453,21 @@ class GS2ScriptManager:
         if weapon is not None and weapon.source == source:
             return weapon
 
-        _, clientside = split_clientside(source)
+        serverside, clientside = split_clientside(source)
         weapon = GS2Script(kind="weapon", name=name, image=image,
                            source=source,
                            clientside=clientside)
+        if serverside:
+            from .gs1_host import compile_gs1
+            from .npc import NPC
+            weapon.server_program = compile_gs1(serverside)
+            if weapon.server_program is not None:
+                weapon.server_runtime = NPC(0, name)
+                weapon.server_runtime.gs1_program = weapon.server_program
+                weapon.server_runtime.gs1_source = serverside
+                manager = getattr(self.server, "npc_manager", None)
+                if manager is not None:
+                    manager.register_weapon_runtime(weapon.server_runtime)
         weapon.build_headers(source)
         self.weapons[name.lower()] = weapon
         self._save_classic_weapon(weapon, source)
@@ -478,16 +549,19 @@ class GS2ScriptManager:
         unchanged one gets nothing (the client's copy is current).
         """
         script = self.get_class(name)
-        if script is None or not script.bytecode:
+        if script is None:
             stub = to_csv(['class', name, '1', _ZERO_KEY, _ZERO_CRC])
             await player.send_raw(build_npc_weapon_script(stub, b''))
             return
         if checksum == script.checksum:
             return
-        packet = build_load_script_bytecode(script.header, script.bytecode)
+        payload = (script.bytecode if script.bytecode
+                   else script.clientside.encode('latin-1'))
+        packet = build_load_script_bytecode(script.header, payload)
         await player.send_raw(build_raw_data_announcement(len(packet)) + packet)
-        logger.debug(f"GS2: sent class {script.name} bytecode "
-                     f"({len(script.bytecode)} bytes) to player {player.id}")
+        kind = "bytecode" if script.bytecode else "source"
+        logger.debug(f"GS2: sent class {script.name} {kind} "
+                     f"({len(payload)} bytes) to player {player.id}")
 
     async def send_gani(self, player: 'Player', name: str, checksum: int = 0):
         """Answer PLI_UPDATEGANI: the compiled script as PLO_GANISCRIPT when

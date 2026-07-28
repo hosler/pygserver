@@ -190,6 +190,91 @@ def test_playerscount_is_current_level_population():
     assert npc.gs1_scopes["this"]["ready"] is True
 
 
+def test_with_getplayer_writes_the_live_player():
+    level = FakeLevel()
+    level._player_ids.add(1)
+    player = FakePlayer(1)
+
+    class Server:
+        @staticmethod
+        def get_player(pid):
+            return player if pid == 1 else None
+
+    npc = make_npc(
+        "if (created) { with (getplayer(hosler)) { x=25; hearts=4; } }",
+        level,
+    )
+    run_npc_event(npc, "created", Server(), player)
+    assert (player.x, player.hearts) == (25.0, 4.0)
+
+
+def test_with_missing_object_skips_the_block():
+    npc = make_npc(
+        "if (created) { with (getnpc(missing)) { x=17; } }")
+    run_npc_event(npc, "created", None, None)
+    assert npc.x != 17.0
+
+
+def test_with_getplayer_bare_flag_falls_through_and_timeout_stays_npc_owned():
+    level = FakeLevel()
+    level._player_ids.add(1)
+    player = FakePlayer(1)
+
+    class Server:
+        @staticmethod
+        def get_player(pid):
+            return player if pid == 1 else None
+
+    npc = make_npc(
+        "if (created) { set myflag; with (getplayer(hosler)) {"
+        " if (myflag) { this.inside = 1; } timeout = .5; } }",
+        level,
+    )
+    run_npc_event(npc, "created", Server(), player)
+
+    assert npc.gs1_scopes["this"]["inside"] == 1.0
+    assert npc._timer_end > 0
+    assert not hasattr(player, "timeout")
+
+
+def test_with_getplayer_flushes_non_acting_player_props():
+    level = FakeLevel()
+    level._player_ids.update((1, 2))
+    acting, other = FakePlayer(1), FakePlayer(2)
+    other.account_name = "bob"
+
+    class Server:
+        @staticmethod
+        def get_player(pid):
+            return {1: acting, 2: other}.get(pid)
+
+    npc = make_npc(
+        "if (created) { with (getplayer(bob)) { hearts = 1; } }", level)
+    run_npc_event(npc, "created", Server(), acting)
+
+    assert other.hearts == 1.0
+    assert other._gs1_dirty_props == {}
+
+
+def test_makevar_accepts_runtime_namespace_aliases():
+    player = FakePlayer()
+    npc = make_npc(
+        'if (created) { clientr.answer = 7; serverr.answer = 9;'
+        ' this.a = makevar("clientr.answer");'
+        ' this.b = makevar("serverr.answer"); }')
+    run_npc_event(npc, "created", object(), player)
+
+    assert npc.gs1_scopes["this"]["a"] == 7.0
+    assert npc.gs1_scopes["this"]["b"] == 9.0
+
+
+def test_savelog2_emits_a_server_log_record(caplog):
+    npc = make_npc('if (created) { savelog2 "audit","hello"; }')
+    with caplog.at_level("INFO", logger="pygserver.gs1.script"):
+        run_npc_event(npc, "created", None, None)
+    assert any("hello" in record.getMessage() for record in caplog.records)
+
+
 # -- setcharprop (NPC appearance) ------------------------------------------
 def test_setcharprop_equipment_codes():
     npc = make_npc(
@@ -220,7 +305,7 @@ def test_setcharprop_colors():
     assert npc.colors[1] == 0   # "9" is not a colour name -> 0
 
 
-# -- #C0-#C7 READ side (GS1MessageCodes.cpp handleCharacterBasedMessageCode +
+# -- #C0-#C7 READ side (GS1MessageCodes.cpp mc_CharacterProperty +
 #    mc_C: the value of a #C code is the classic colour NAME of the slot) ----
 def test_color_read_bare_copy_idiom_is_npc_self_roundtrip():
     # the real-corpus idiom `setcharprop #C0,#C0`: setcharprop pushes the NPC

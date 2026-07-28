@@ -22,7 +22,7 @@ import time
 from reborn_protocol.coords import (
     LEVEL_SIZE, segment_index,
 )
-from reborn_protocol.gs1.runtime import Host, UNSET
+from reborn_protocol.gs1.runtime import Host, NAMESPACES, UNSET
 from reborn_protocol.gs1.values import to_num, to_str
 from reborn_protocol.gs1.host_shared import (
     A_CLASS_NPC_ATTR, A_CLASS_PLAYER_ATTR, host_value,
@@ -176,6 +176,47 @@ def _charprop_target(code, table):
     return None
 
 
+class _GS1ObjectRef:
+    gs1_with_members = True
+
+    def __init__(self, host, kind, target, owner, ctx):
+        self.host = host
+        self.kind = kind
+        self.target = target
+        self.owner = owner
+        self.ctx = ctx
+
+    def get(self, name):
+        table = NPC_ATTR if self.kind == "npc" else PLAYER_WITH_ATTR
+        attr = table.get(name)
+        if attr is None:
+            return UNSET
+        return host_value(getattr(self.target, attr, 0))
+
+    def set(self, name, value):
+        table = NPC_ATTR if self.kind == "npc" else PLAYER_WITH_ATTR
+        attr = table.get(name)
+        if attr is None:
+            return False
+        if self.kind == "player":
+            self.host._set_player_attr(self.target, attr, value, self.ctx)
+        else:
+            setattr(self.target, attr, self.host._num_or_str(value))
+            self.host._dirty(self.target)
+        return True
+
+
+# A player with-block exposes both the normal player-prefixed spellings and
+# their explicit unprefixed aliases.  Building this once avoids accidentally
+# claiming arbitrary names (which must fall through to flags/builtins).
+PLAYER_WITH_ATTR = dict(PLAYER_ATTR)
+PLAYER_WITH_ATTR.update({
+    name[len("player"):]: attr
+    for name, attr in PLAYER_ATTR.items()
+    if name.startswith("player") and len(name) > len("player")
+})
+
+
 class GS1Host(Host):
     def __init__(self, server=None):
         self.server = server
@@ -190,8 +231,13 @@ class GS1Host(Host):
         interpreter on to the ordinary flag/var lookup -- which is also what a
         reader returns when its gate (a player / an NPC) is missing.
         """
+        if isinstance(ctx.this_obj, _GS1ObjectRef):
+            value = ctx.this_obj.get(name)
+            if value is not UNSET:
+                return value
         player = ctx.player
-        npc = ctx.this_obj
+        npc = (ctx.this_obj.owner
+               if isinstance(ctx.this_obj, _GS1ObjectRef) else ctx.this_obj)
         reader = _BUILTINS.get(name)
         if reader is not None:
             return reader(self, name, indices, ctx, npc, player)
@@ -204,8 +250,12 @@ class GS1Host(Host):
         return UNSET
 
     def set_builtin(self, name, value, indices, ctx) -> bool:
+        if isinstance(ctx.this_obj, _GS1ObjectRef):
+            if ctx.this_obj.set(name, value):
+                return True
         player = ctx.player
-        npc = ctx.this_obj
+        npc = (ctx.this_obj.owner
+               if isinstance(ctx.this_obj, _GS1ObjectRef) else ctx.this_obj)
         if name == "save" and indices and npc is not None:
             slots = ctx.vars.scopes["this"].setdefault("save", [0.0] * 10)
             index = int(to_num(indices[0]))
@@ -220,7 +270,7 @@ class GS1Host(Host):
                 self._broadcast_tiles(level, x, y, 1, 1)
             return True
         if name in PLAYER_ATTR and player is not None:
-            self._set_player_attr(player, PLAYER_ATTR[name], value)
+            self._set_player_attr(player, PLAYER_ATTR[name], value, ctx)
             return True
         if name in NPC_ATTR and npc is not None:
             setattr(npc, NPC_ATTR[name], self._num_or_str(value))
@@ -318,12 +368,55 @@ class GS1Host(Host):
         handler = self._FUNCTIONS.get(name)
         if handler is not None:
             return handler(self, name, args, ctx)
-        # getnpc/getplayer return ScriptObject references that require a
-        # script-object member-access model (obj.x / obj.hearts). Deliberately
-        # unimplemented: zero usage across the 5732-file GS1 corpus, so it isn't
-        # worth the interp rewrite; the nearest-player helpers above cover the
-        # real follow/guard idiom by setting ctx.player. -> 0 (falsey).
+        lowered = name.lower()
+        if lowered in ("getplayer", "findplayer"):
+            return self._object_ref(args, ctx, "player")
+        if lowered in ("getnpc", "findnpc"):
+            return self._object_ref(args, ctx, "npc")
+        if name == "makevar":
+            dynamic = to_str(args[0]).strip('"') if args else ""
+            namespace, dot, key = dynamic.partition(".")
+            scope = NAMESPACES.get(namespace) if dot else None
+            if scope is None:
+                key = dynamic
+            value = ctx.vars.get(scope, key)
+            return 0.0 if value is UNSET else value
+        if name == "degtorad":
+            return (to_num(args[0]) if args else 0.0) * math.pi / 180.0
         return UNSET
+
+    def _object_ref(self, args, ctx, kind):
+        wanted = to_str(args[0]).lower() if args else ""
+        if not wanted:
+            return 0.0
+        if kind == "player":
+            objects = self._players_on_level(ctx)
+            if ctx.player is not None and ctx.player not in objects:
+                objects.insert(0, ctx.player)
+            fields = ("account_name", "nickname", "id")
+        else:
+            level = self._level_of(ctx)
+            if level is None:
+                return 0.0
+            direct = (level.get_npcs() if hasattr(level, "get_npcs")
+                      else getattr(level, "npcs", getattr(level, "_npcs", [])))
+            objects = list(direct.values()) if isinstance(direct, dict) else list(direct)
+            fields = ("name", "nickname", "id")
+        for obj in objects:
+            if any(to_str(getattr(obj, field, "")).lower() == wanted
+                   for field in fields):
+                return _GS1ObjectRef(self, kind, obj, ctx.this_obj, ctx)
+        return 0.0
+
+    def _trigger_client(self, args, ctx):
+        player = ctx.player
+        if player is None or not args or not hasattr(player, "send_raw"):
+            return 0.0
+        from ..protocol.packets import build_trigger_action
+        from ..gs2 import to_csv
+        action = "clientside," + to_csv([to_str(value) for value in args])
+        _schedule(player.send_raw(build_trigger_action(0, 0, 0, 0, action)))
+        return 1.0
 
     # -- message codes -----------------------------------------------------
     def message_code(self, code, args, ctx) -> str:
@@ -337,7 +430,7 @@ class GS1Host(Host):
 
     def _color_code_character(self, args, ctx):
         """Which character a #C<n> READ refers to — mirrors the C++
-        handleCharacterBasedMessageCode (GS1MessageCodes.cpp:347):
+        mc_CharacterProperty (GS1MessageCodes.cpp:259):
           * #Cn(-1)  -> the source NPC
           * #Cn(0)   -> the acting player itself
           * #Cn(k>0) -> the k-th player on the level (falls back to the
@@ -376,7 +469,7 @@ class GS1Host(Host):
 
     def _read_color_code(self, slot, args, ctx) -> str:
         """#C<slot> as a VALUE resolves to the classic colour NAME of that
-        slot (mc_C -> getClassicColorName, Character.h:104), NOT the raw
+        slot (mc_C -> getClassicColorName, Character.h:119), NOT the raw
         index and NOT "". This is what makes the real-corpus copy idiom
         `setcharprop #C0,#C0` round-trip through the name-based write side
         (_resolve_color) instead of zeroing the slot."""
@@ -402,7 +495,7 @@ class GS1Host(Host):
         if hasattr(npc, "mark_dirty"):
             npc.mark_dirty()
 
-    def _set_player_attr(self, player, attr, value):
+    def _set_player_attr(self, player, attr, value, ctx=None):
         cur = getattr(player, attr, None)
         if isinstance(cur, str) or attr in ("chat", "nickname", "account_name",
                                             "head_image", "body_image",
@@ -420,6 +513,12 @@ class GS1Host(Host):
                 dirty = {}
                 player._gs1_dirty_props = dirty
             dirty[prop_id] = enc(getattr(player, attr))
+            if ctx is not None:
+                written = getattr(ctx, "written_players", None)
+                if written is None:
+                    written = {}
+                    ctx.written_players = written
+                written[id(player)] = player
 
     def _set_timer(self, npc, seconds):
         if hasattr(npc, "set_timer"):
@@ -624,6 +723,8 @@ class GS1Host(Host):
 
 
     _FUNCTIONS = {
+        "triggerclient": lambda self, name, args, ctx: self._trigger_client(
+            args, ctx),
         "onwall": lambda self, name, args, ctx: self._onwall(args, ctx),
         "onwall2": lambda self, name, args, ctx: self._onwall(args, ctx),
         # known stub: real level water-tile detection isn't wired server-side
@@ -646,6 +747,12 @@ class GS1Host(Host):
     }
 
     _MESSAGE_CODES = {
+        "#p": lambda args, ctx: (
+            to_str(ctx.action_params[int(to_num(args[0]))])
+            if args and 0 <= int(to_num(args[0])) < len(
+                getattr(ctx, "action_params", ()))
+            else ""
+        ),
         "#a": lambda args, ctx: (
             to_str(getattr(ctx.player, "account_name", ""))
             if ctx.player is not None else ""

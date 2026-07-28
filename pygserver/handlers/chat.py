@@ -59,6 +59,14 @@ class CommunicationHandlers:
         is_mass = len(target_ids) > 1
 
         for target_id in target_ids:
+            # ids >= 16000 are external pseudo-players (channels / channel
+            # users, see irc.py) - GServer-v2 branches the same way
+            # (Player.cpp:1639-1651, cross-server pmExternalPlayer).
+            if target_id >= 16000:
+                irc = getattr(self.server, 'irc_manager', None)
+                if irc is not None:
+                    await irc.route_external_pm(self, target_id, message)
+                continue
             target = self.server.get_player(target_id)
             if target:
                 packet = build_private_message(
@@ -121,15 +129,17 @@ class CommunicationHandlers:
         logger.debug(f"Trigger action at ({x}, {y}): {action}")
 
         # Handle serverside triggers
-        if action.startswith("serverside"):
-            await self.server.handle_trigger_action(self, x, y, action)
+        handled = False
+        if action.startswith(("serverside", "servernpc")):
+            handled = await self.server.handle_trigger_action(self, x, y, action)
 
         # Relay to other players on the level (GServer-v2 msgPLI_TRIGGERACTION:
         # sendPacketToOneLevelPart(..., { m_id }) when sendplayertriggers=true,
         # the default; excludes the sender).
-        if self.level:
+        if self.level and not handled:
             packet = build_trigger_action(self.id, npc_id, x, y, action)
             await self.server.broadcast_to_level(self.level.name, packet, exclude={self.id})
 
         # Notify NPC manager
-        await self.server.npc_manager.on_trigger_action(self, x, y, action)
+        if not handled:
+            await self.server.npc_manager.on_trigger_action(self, x, y, action)

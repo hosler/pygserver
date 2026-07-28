@@ -497,6 +497,7 @@ class NPCManager:
 
         # All NPCs by ID
         self._npcs: Dict[int, NPC] = {}
+        self._weapon_runtimes: Dict[int, NPC] = {}
         self._next_id = 10001  # NPC IDs start at 10001
 
         # Script classes by name
@@ -505,6 +506,13 @@ class NPCManager:
         # Last tick() timestamp, used to compute real elapsed time for
         # smooth (per-tick) NPC movement. None until the first tick.
         self._last_move_tick: Optional[float] = None
+
+    def register_weapon_runtime(self, npc: NPC) -> NPC:
+        """Give a server-side weapon runtime a collision-free ticking ID."""
+        npc.id = self._next_id
+        self._next_id += 1
+        self._weapon_runtimes[npc.id] = npc
+        return npc
 
     async def load_scripts(self, scripts_path: Path):
         """
@@ -710,7 +718,8 @@ class NPCManager:
                 api = npc.get_api(self)
                 await npc.trigger_event('on_move_done', api)
 
-        for npc in list(self._npcs.values()):
+        timed_npcs = list(self._npcs.values()) + list(self._weapon_runtimes.values())
+        for npc in timed_npcs:
             if npc.check_timer():
                 api = npc.get_api(self)
                 await npc.trigger_event('on_timeout', api)
@@ -771,6 +780,24 @@ class NPCManager:
         api = npc.get_api(self)
         await npc.trigger_event('on_player_touches', api, player)
         self._fire_gs1(npc, 'playertouchsme', player)
+
+    async def on_trigger_action(self, player: 'Player', x: float, y: float,
+                                action: str):
+        if not player.level or not action:
+            return
+        event = action.split(',', 1)[0].strip()
+        if not event:
+            return
+        # Strict containment, matching the reference: triggerDistance there is
+        # only a candidate-search radius; the hit test is positionInRectangle
+        # against the unexpanded {position, shape} rect (GServer-v2
+        # server/include/npcserver/NPCServer.h addEventToLevelNPCsAtPosition).
+        for npc in self.get_npcs_on_level(player.level):
+            shape = getattr(npc, 'shape', None) or (2, 2)
+            width, height = shape[:2]
+            if (npc.x <= x <= npc.x + width
+                    and npc.y <= y <= npc.y + height):
+                self._fire_gs1(npc, 'action' + event, player)
 
     async def check_touches(self, player: 'Player'):
         """Fire playertouchsme when the player newly overlaps an NPC.
