@@ -1,0 +1,20 @@
+GRAWP001
+REALNAME qa_gs2weapon
+IMAGE qa.png
+SCRIPT
+//#CLIENTSIDE
+function onCreated() {
+  this.counter = 0;
+}
+
+
+
+
+
+
+
+
+
+
+
+SCRIPTEND

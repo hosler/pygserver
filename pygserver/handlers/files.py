@@ -25,10 +25,13 @@ class FileHandlers:
     async def _handle_update_file(self, data: bytes):
         """Handle PLI_UPDATEFILE packet."""
         reader = PacketReader(data)
+        mod_time = reader.read_gint5()
         filename = reader.remaining().decode('latin-1', errors='replace')
 
         if hasattr(self.server, 'filesystem'):
-            await self.server.filesystem.handle_want_file(self, filename)
+            await self.server.filesystem.handle_update_file(
+                self, mod_time, filename
+            )
 
     @handles(PLI.VERIFYWANTSEND)
     async def _handle_verify_want_send(self, data: bytes):

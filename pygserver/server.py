@@ -19,7 +19,7 @@ from .level import Level
 from .world import World
 from .npc import NPCManager
 from .protocol.constants import PLTYPE, PLPERM
-from .protocol.packets import build_world_time
+from .protocol.packets import build_flag_del, build_flag_set, build_world_time
 
 logger = logging.getLogger(__name__)
 
@@ -494,13 +494,15 @@ class GameServer:
         """Get server flag value."""
         return self.server_flags.get(name, "")
 
-    def set_flag(self, name: str, value: str):
+    async def set_flag(self, name: str, value: str):
         """Set server flag value."""
         self.server_flags[name] = value
+        await self.broadcast_to_all(build_flag_set(name, value))
 
-    def del_flag(self, name: str):
+    async def del_flag(self, name: str):
         """Delete server flag."""
         self.server_flags.pop(name, None)
+        await self.broadcast_to_all(build_flag_del(name))
 
     async def handle_trigger_action(self, player: Player, x: float, y: float, action: str):
         """

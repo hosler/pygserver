@@ -1,0 +1,5 @@
+// qa_gs2class - GS2 class fixture with clientside code for bytecode QA.
+//#CLIENTSIDE
+function qaHelper() {
+  return 42;
+}

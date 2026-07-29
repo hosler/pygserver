@@ -23,6 +23,7 @@ from .protocol.constants import PLO, PLPROP
 from .protocol.packets import (
     PacketBuilder,
     build_bomb_add,
+    build_bomb_del,
     build_arrow_add,
     build_explosion,
     build_hurt_player,
@@ -299,7 +300,9 @@ class CombatManager:
 
         # Broadcast bomb to level
         packet = build_bomb_add(player.id, x, y, power, time_left)
-        await self.server.broadcast_to_level(player.level.name, packet)
+        await self.server.broadcast_to_level(
+            player.level.name, packet, exclude={player.id}
+        )
 
         logger.debug(f"Player {player.id} placed bomb at ({x}, {y})")
         return bomb
@@ -317,6 +320,10 @@ class CombatManager:
             return
 
         level_name = player.level.name
+        packet = build_bomb_del(x, y)
+        await self.server.broadcast_to_level(
+            level_name, packet, exclude={player.id}
+        )
         if level_name not in self._bombs:
             return
 
@@ -344,6 +351,10 @@ class CombatManager:
 
         radius = self.bomb_damage_radius + (bomb.power * 0.5)
         damage = self.bomb_base_damage * bomb.power
+
+        await self.server.broadcast_to_level(
+            bomb.level_name, build_bomb_del(bomb.x, bomb.y)
+        )
 
         # Broadcast explosion effect
         packet = build_explosion(bomb.x, bomb.y, radius, damage)
@@ -408,6 +419,11 @@ class CombatManager:
         if not player.level:
             return None
 
+        packet = build_arrow_add(player.id, x, y, flags, sprite, power)
+        await self.server.broadcast_to_level(
+            player.level.name, packet, exclude={player.id}
+        )
+
         # Check if player has arrows
         if player.arrows <= 0:
             return None
@@ -453,10 +469,6 @@ class CombatManager:
         if player.level.name not in self._arrows:
             self._arrows[player.level.name] = {}
         self._arrows[player.level.name][arrow_id] = arrow
-
-        # Broadcast arrow to level
-        packet = build_arrow_add(player.id, x, y, flags, sprite, power)
-        await self.server.broadcast_to_level(player.level.name, packet)
 
         logger.debug(f"Player {player.id} fired arrow at ({x}, {y}) direction {direction}")
         return arrow

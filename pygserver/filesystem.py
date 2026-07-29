@@ -154,6 +154,15 @@ class FileSystem:
         else:
             await self._send_file(player, filename, file_path)
 
+    async def handle_update_file(
+            self, player: 'Player', mod_time: int, filename: str):
+        """Send a file only when its modification time has changed."""
+        file_path = self._find_file(filename)
+        if file_path and mod_time == int(file_path.stat().st_mtime):
+            await player.send_raw(build_file_uptodate(filename))
+            return
+        await self.handle_want_file(player, filename)
+
     async def handle_verify_want_send(self, player: 'Player', checksum: int, filename: str):
         """
         Handle PLI_VERIFYWANTSEND - Client wants file if checksum differs.

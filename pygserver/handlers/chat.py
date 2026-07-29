@@ -94,11 +94,21 @@ class CommunicationHandlers:
         reader = PacketReader(data)
         flag_data = reader.remaining().decode('latin-1', errors='replace')
         if '=' not in flag_data:
-            self.flags[flag_data.strip()] = True
+            name = flag_data.strip()
+            if name.startswith('server.'):
+                await self.server.set_flag(name, "")
+            else:
+                self.flags[name] = True
             return
         name, value = flag_data.split('=', 1)
         name = name.strip()
         value = value.strip()
+        if name.startswith('server.'):
+            if value:
+                await self.server.set_flag(name, value)
+            else:
+                await self.server.del_flag(name)
+            return
         if value:
             self.flags[name] = value
         else:
@@ -108,7 +118,10 @@ class CommunicationHandlers:
     async def _handle_flag_del(self, data: bytes):
         """Handle PLI_FLAGDEL packet."""
         flag_name = data.decode('latin-1', errors='replace').strip()
-        self.flags.pop(flag_name, None)
+        if flag_name.startswith('server.'):
+            await self.server.del_flag(flag_name)
+        else:
+            self.flags.pop(flag_name, None)
 
     @handles(PLI.TRIGGERACTION)
     async def _handle_trigger_action(self, data: bytes):
