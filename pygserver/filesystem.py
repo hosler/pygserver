@@ -99,8 +99,15 @@ class FileSystem:
         self._cache_current_size = 0
 
         # Settings
-        self.large_file_threshold = 64 * 1024  # 64KB
-        self.chunk_size = 32 * 1024  # 32KB chunks for large files
+        # Both match GServer-v2 (server/src/player/Player.cpp: `fileData.size()
+        # > 32000` selects the large-file path, and each chunk is clamped to
+        # 32000). Ours was 64KB, so a file between 32001 and 65536 bytes went
+        # out as one ordinary PLO_FILE where the reference server would have
+        # chunked it - and pyReborn's `--tier1 large_file_transfer`, whose
+        # fixture is 45000 bytes, never entered this path at all and passed
+        # without exercising the thing it is named for.
+        self.large_file_threshold = 32000
+        self.chunk_size = 32000
         self.max_file_size = 10 * 1024 * 1024  # 10MB max
 
         # Create directories
@@ -246,20 +253,17 @@ class FileSystem:
                     if not chunk:
                         break
 
-                    # Send chunk as raw data
-                    builder = PacketBuilder()
-                    builder.write_gchar(PLO.RAWDATA)
-                    builder.write_gint3(len(chunk))
-                    builder.write_byte(ord('\n'))
-                    await player.send_raw(builder.build())
-                    await player.send_raw(chunk)
+                    # Repeat the complete file header so each raw chunk dispatches as PLO_FILE.
+                    file_packet = build_file(filename, chunk)
+                    announcement = build_raw_data_announcement(len(file_packet))
+                    await player.send_raw(announcement + file_packet)
 
                     self._downloads[player.id].sent_bytes += len(chunk)
             finally:
                 await loop.run_in_executor(None, f.close)
 
             # Send end packet
-            packet = build_large_file_end()
+            packet = build_large_file_end(filename)
             await player.send_raw(packet)
 
             # Clean up

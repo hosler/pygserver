@@ -56,9 +56,10 @@ def build_large_file_start(filename: str) -> bytes:
     return builder.build()
 
 
-def build_large_file_end() -> bytes:
+def build_large_file_end(filename: str) -> bytes:
     """Build PLO_LARGEFILEEND packet."""
     builder = PacketBuilder().write_gchar(PLO.LARGEFILEEND)
+    builder.write_string(filename)
     builder.write_newline()
     return builder.build()
 
@@ -93,5 +94,4 @@ def build_load_gani(gani_name: str, setbackto: str = "") -> bytes:
     builder.write_string(f'"SETBACKTO {setbackto}"')
     builder.write_newline()
     return builder.build()
-
 
