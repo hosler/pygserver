@@ -40,6 +40,9 @@ class PropsServer:
     async def broadcast_to_level(self, level_name, packet, exclude=None):
         self.broadcasts.append((level_name, packet, exclude))
 
+    async def broadcast_to_world(self, level_name, packet, exclude=None):
+        self.broadcasts.append((level_name, packet, exclude))
+
 
 def make_player():
     level = Level("t.nw")

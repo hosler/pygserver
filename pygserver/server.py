@@ -392,9 +392,9 @@ class GameServer:
         if self.irc_manager:
             await self.irc_manager.remove_player(player)
 
-        # Notify other players on same level
+        # Notify other players in the same contiguous world.
         if player.level:
-            await self.broadcast_to_level(
+            await self.broadcast_to_world(
                 player.level.name,
                 player.build_leave_packet(),
                 exclude={player.id}
@@ -442,6 +442,11 @@ class GameServer:
             exclude: Set of player IDs to exclude
         """
         await self.audience.broadcast_to_level(level_name, packet, exclude)
+
+    async def broadcast_to_world(self, level_name: str, packet: bytes,
+                                 exclude: Optional[Set[int]] = None):
+        """Broadcast a packet across a level's containing map."""
+        await self.audience.broadcast_to_world(level_name, packet, exclude)
 
     async def broadcast_to_all(self, packet: bytes, exclude: Optional[Set[int]] = None):
         """Broadcast packet to all logged-in players."""

@@ -5,8 +5,13 @@ from pygserver.audience import Audience
 from pygserver.baddy import Baddy, BaddyManager, BaddyType
 from pygserver.level import Level
 from pygserver.player import Player
-from pygserver.protocol.constants import BDPROP, BDMODE, PLO
-from pygserver.protocol.packets import PacketBuilder, PacketReader, build_private_message
+from pygserver.protocol.constants import BDPROP, BDMODE, PLO, PLPROP
+from pygserver.protocol.packets import (
+    PacketBuilder,
+    PacketReader,
+    build_private_message,
+    parse_player_props,
+)
 
 
 def make_player(server, player_id, level=None):
@@ -131,6 +136,7 @@ class LevelServer:
         self.audience = Audience(self)
         self.players = {}
         self.broadcast_to_level = AsyncMock()
+        self.broadcast_to_world = AsyncMock()
         self.npc_manager = MagicMock()
         self.npc_manager.on_player_enters = AsyncMock()
         self.npc_manager.on_player_leaves = AsyncMock()
@@ -184,6 +190,37 @@ class TestLeaderPackets:
         asyncio.run(second._send_level(level))
         assert len(is_leader_packets(first)) == 1
         assert len(is_leader_packets(second)) == 1
+
+
+class TestContiguousWorldPlayerProps:
+    def test_roster_props_report_map_name_and_segment_position(self):
+        level = Level("segment.nw")
+        server = LevelServer([level], {level.name})
+        gmap = MagicMock()
+        gmap.name = "world"
+        server.world.get_gmap_for_level = MagicMock(
+            return_value=(gmap, 2, 1)
+        )
+        player = make_player(server, 1, level)
+
+        reader = PacketReader(player.build_props_packet())
+        assert reader.read_gchar() == PLO.OTHERPLPROPS
+        reader.read_gshort()
+        props = parse_player_props(reader.remaining()[:-1])
+
+        assert props[PLPROP.CURLEVEL] == "world.gmap"
+        assert props[PLPROP.GMAPLEVELX] == 2
+        assert props[PLPROP.GMAPLEVELY] == 1
+
+    def test_segment_hop_in_same_map_does_not_broadcast_player_left(self):
+        old, new = Level("old.nw"), Level("new.nw")
+        server = LevelServer([old, new], {old.name, new.name})
+        player = make_player(server, 1, old)
+        server.players = {player.id: player}
+
+        asyncio.run(player.warp(new.name, 1, 1))
+
+        server.broadcast_to_world.assert_not_awaited()
 
 
 def baddy_payload(baddy_id, props):

@@ -35,10 +35,10 @@ class CommunicationHandlers:
         self.chat = message
         logger.info(f"[Chat] {self.nickname}: {message}")
 
-        # Broadcast to level
+        # PLI_TOALL reaches every logged-in player.
         if self.level:
             packet = build_chat(self.id, message)
-            await self.server.broadcast_to_level(self.level.name, packet)
+            await self.server.broadcast_to_all(packet)
 
             # Trigger NPC events
             await self.server.npc_manager.on_player_chats(self, message)
@@ -84,9 +84,9 @@ class CommunicationHandlers:
         reader = PacketReader(data)
         message = reader.remaining().decode('latin-1', errors='replace')
 
-        if self.level and not self.is_muted:
+        if not self.is_muted:
             packet = build_chat(self.id, message)
-            await self.server.broadcast_to_level(self.level.name, packet)
+            await self.server.broadcast_to_all(packet)
 
     @handles(PLI.FLAGSET)
     async def _handle_flag_set(self, data: bytes):

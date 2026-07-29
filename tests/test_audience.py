@@ -20,6 +20,7 @@ from pygserver.audience import (
     contains,
 )
 from pygserver.level import Level
+from pygserver.world import GMap
 
 
 class Entity:
@@ -34,6 +35,7 @@ class AudienceServer:
         self.world = MagicMock()
         self._levels = {level.name: level for level in levels}
         self.world.get_level = MagicMock(side_effect=self._levels.get)
+        self.world.get_gmap_for_level = MagicMock(return_value=None)
         self.players = {}
         self.npc_manager = MagicMock()
         self.npcs = []
@@ -115,6 +117,25 @@ def test_players_on_level_skips_ids_the_server_no_longer_knows():
 
     assert server.audience.players_on_level("a.nw") == []
     assert gone.id == 2
+
+
+def test_players_in_world_includes_other_segments_but_not_unrelated_levels():
+    first, second, unrelated = (
+        Level("a.nw"), Level("b.nw"), Level("elsewhere.nw"))
+    server = AudienceServer([first, second, unrelated])
+    gmap = GMap("world")
+    gmap.grid = {(0, 0): first.name, (1, 0): second.name}
+    server.world.get_gmap_for_level = MagicMock(
+        side_effect=lambda name: (
+            (gmap, 0, 0) if name == first.name
+            else (gmap, 1, 0) if name == second.name
+            else None
+        )
+    )
+    across_segment = server.add_player(second, 2)
+    server.add_player(unrelated, 3)
+
+    assert server.audience.players_in_world(first.name) == [across_segment]
 
 
 # -- spatial queries --------------------------------------------------------

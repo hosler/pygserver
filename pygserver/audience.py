@@ -119,6 +119,27 @@ class Audience:
                 out.append(player)
         return out
 
+    def players_in_world(self, level_name: str,
+                         exclude: Optional[Set[int]] = None) -> List['Player']:
+        """Every client in the map containing `level_name`.
+
+        A standalone level is its own world. A grid map is one contiguous
+        world, so membership includes every loaded segment in its grid.
+        """
+        gmap_info = self.server.world.get_gmap_for_level(level_name)
+        if gmap_info is None:
+            return self.players_on_level(level_name, exclude)
+
+        gmap = gmap_info[0]
+        players = []
+        seen = set()
+        for segment_name in gmap.grid.values():
+            for player in self.players_on_level(segment_name, exclude):
+                if player.id not in seen:
+                    seen.add(player.id)
+                    players.append(player)
+        return players
+
     # -- spatial -----------------------------------------------------------
 
     def players_near(self, level_name: str, x: float, y: float, radius: float,
@@ -160,4 +181,10 @@ class Audience:
                                  exclude: Optional[Set[int]] = None):
         """Send `packet` to every client attached to `level_name`."""
         for player in self.players_on_level(level_name, exclude):
+            await player.send_raw(packet)
+
+    async def broadcast_to_world(self, level_name: str, packet: bytes,
+                                 exclude: Optional[Set[int]] = None):
+        """Send `packet` to every client in the containing map."""
+        for player in self.players_in_world(level_name, exclude):
             await player.send_raw(packet)

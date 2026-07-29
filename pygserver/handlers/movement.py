@@ -154,6 +154,15 @@ class MovementHandlers:
                 broadcast_props[PLPROP.X2] = self.x
             if PLPROP.Y in props or PLPROP.Y2 in props:
                 broadcast_props[PLPROP.Y2] = self.y
+            position_changed = (
+                PLPROP.X in props or PLPROP.X2 in props
+                or PLPROP.Y in props or PLPROP.Y2 in props
+            )
+            if position_changed:
+                gmap_info = self.server.world.get_gmap_for_level(self.level.name)
+                if gmap_info:
+                    broadcast_props[PLPROP.GMAPLEVELX] = gmap_info[1]
+                    broadcast_props[PLPROP.GMAPLEVELY] = gmap_info[2]
             for prop_id, attr in _RELAYED_PROPS.items():
                 if prop_id in props:
                     broadcast_props[prop_id] = getattr(self, attr)
@@ -169,7 +178,7 @@ class MovementHandlers:
 
             if broadcast_props:
                 packet = build_other_player_props(self.id, broadcast_props)
-                await self.server.broadcast_to_level(
+                await self.server.broadcast_to_world(
                     self.level.name, packet, exclude={self.id}
                 )
 

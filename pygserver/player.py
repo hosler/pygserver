@@ -281,6 +281,16 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
             return
 
         old_level = self.level
+        old_gmap_info = (
+            self.server.world.get_gmap_for_level(old_level.name)
+            if old_level else None
+        )
+        new_gmap_info = self.server.world.get_gmap_for_level(level.name)
+        same_gmap = (
+            old_gmap_info is not None
+            and new_gmap_info is not None
+            and old_gmap_info[0].name == new_gmap_info[0].name
+        )
 
         # Update level membership FIRST and synchronously - no `await` between
         # detaching from the old level and attaching to the new one. NPC/chest
@@ -313,9 +323,10 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
         if old_level:
             if getattr(self.server, 'npc_manager', None):
                 await self.server.npc_manager.on_player_leaves(self, old_level)
-            await self.server.broadcast_to_level(
-                old_level.name, build_player_left(self.id), exclude={self.id}
-            )
+            if not same_gmap:
+                await self.server.broadcast_to_world(
+                    old_level.name, build_player_left(self.id), exclude={self.id}
+                )
 
         # Handle horse warp
         if hasattr(self.server, 'horse_manager'):
@@ -399,9 +410,9 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
         if level.is_player_leader(self) or gmap_info:
             await self.send_raw(build_is_leader())
 
-        # Exchange props with everyone else already on the level (see
+        # Exchange props with everyone else already in the world (see
         # audience.Audience for the one definition of who that is).
-        for other in self.server.audience.players_on_level(
+        for other in self.server.audience.players_in_world(
                 level.name, exclude={self.id}):
             await self.send_raw(other.build_props_packet())
             await other.send_raw(self.build_props_packet())
@@ -426,6 +437,20 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
 
     def build_props_packet(self) -> bytes:
         """Build PLO_OTHERPLPROPS packet for this player."""
+        gmap_info = (
+            self.server.world.get_gmap_for_level(self.level.name)
+            if self.level else None
+        )
+        if gmap_info:
+            gmap, grid_x, grid_y = gmap_info
+            current_level = (
+                gmap.name if gmap.name.endswith('.gmap')
+                else gmap.name + '.gmap'
+            )
+        else:
+            grid_x = grid_y = None
+            current_level = self.level.name if self.level else ""
+
         props = {
             PLPROP.NICKNAME: self.nickname,
             PLPROP.X2: self.x,
@@ -439,11 +464,14 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
             PLPROP.SHIELDPOWER: (self.shield_power, self.shield_image),
             PLPROP.HEADIMAGE: self.head_image,
             PLPROP.BODYIMAGE: self.body_image,
-            PLPROP.CURLEVEL: self.level.name if self.level else "",
+            PLPROP.CURLEVEL: current_level,
             PLPROP.COLORS: self.colors,
             PLPROP.MAGICPOINTS: self.mp,
             PLPROP.ALIGNMENT: self.ap,
         }
+        if gmap_info:
+            props[PLPROP.GMAPLEVELX] = grid_x
+            props[PLPROP.GMAPLEVELY] = grid_y
         return build_other_player_props(self.id, props)
 
     def build_leave_packet(self) -> bytes:
