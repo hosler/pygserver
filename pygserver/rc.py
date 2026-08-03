@@ -7,6 +7,7 @@ Based on GServer-v2 TPlayerRC.cpp implementation.
 
 import asyncio
 import logging
+import time
 from typing import TYPE_CHECKING, Optional, Dict, Any, List, Set, Callable
 from dataclasses import dataclass, field
 
@@ -24,10 +25,12 @@ from .protocol.packets import (
     build_rc_player_ban,
     build_rc_account_list,
     build_rc_account_get,
+    build_rc_file_browser_dir_list,
     build_rc_file_browser_dir,
     build_rc_file_browser_message,
-    build_rc_max_upload_filesize,
+    build_player_props,
 )
+from .level import ITEM_NAME_TO_ID
 
 if TYPE_CHECKING:
     from .server import GameServer
@@ -72,6 +75,8 @@ class RCManager:
 
         # Active RC sessions
         self._sessions: Dict[int, RCSession] = {}  # player_id -> RCSession
+        self._eval_npcs: Dict[str, Any] = {}
+        self._eval_times: Dict[str, float] = {}
 
         # RC packet handlers
         self._handlers: Dict[int, Callable] = {
@@ -147,6 +152,13 @@ class RCManager:
         """Unregister an RC session."""
         session = self._sessions.pop(player_id, None)
         if session:
+            account = session.player.account_name
+            npc = self._eval_npcs.pop(account, None)
+            self._eval_times.pop(account, None)
+            if npc is not None:
+                if npc.level is not None:
+                    npc.level.remove_npc(npc)
+                self.server.npc_manager._npcs.pop(npc.id, None)
             logger.info(f"RC session unregistered for player {player_id}")
 
     def get_session(self, player_id: int) -> Optional[RCSession]:
@@ -160,6 +172,52 @@ class RCManager:
     def get_all_sessions(self) -> List[RCSession]:
         """Get all active RC sessions."""
         return list(self._sessions.values())
+
+    @staticmethod
+    def build_add_player(player: 'Player', flags: int = 0) -> bytes:
+        """Build the player-list entry shape consumed by control clients."""
+        return RCManager.build_add_player_fields(
+            player.id, player.account_name, player.nickname, flags)
+
+    @staticmethod
+    def build_add_player_fields(player_id: int, account: str, nickname: str,
+                                flags: int = 0) -> bytes:
+        """Build a control-client player-list entry from explicit fields."""
+        builder = PacketBuilder().write_gchar(PLO.ADDPLAYER)
+        builder.write_gshort(player_id)
+        builder.write_gstring(account)
+        builder.write_gchar(PLPROP.NICKNAME).write_gstring(nickname)
+        builder.write_gchar(PLPROP.UNKNOWN81).write_gchar(flags)
+        builder.write_newline()
+        return builder.build()
+
+    @staticmethod
+    def build_del_player(player_id: int) -> bytes:
+        """Build a control-client player-list removal."""
+        builder = PacketBuilder().write_gchar(PLO.DELPLAYER)
+        builder.write_gshort(player_id)
+        builder.write_newline()
+        return builder.build()
+
+    async def notify_player_join(self, player: 'Player'):
+        """Add a newly logged-in game player to every control roster."""
+        packet = self.build_add_player(player)
+        for session in self.get_all_sessions():
+            await session.player.send_raw(packet)
+
+    async def notify_player_leave(self, player_id: int):
+        """Remove a departing game player from every control roster."""
+        packet = self.build_del_player(player_id)
+        for session in self.get_all_sessions():
+            await session.player.send_raw(packet)
+
+    async def broadcast_chat(self, message: str, exclude: Set[int] = None):
+        """Send a chat line to active control sessions."""
+        excluded = exclude or set()
+        packet = build_rc_chat(message)
+        for session in self.get_all_sessions():
+            if session.player.id not in excluded:
+                await session.player.send_raw(packet)
 
     async def handle_packet(self, player: 'Player', packet_id: int, data: bytes):
         """
@@ -367,7 +425,7 @@ class RCManager:
         player = self.server.get_player_by_name(player_name)
         if player:
             props = self._build_player_props(player)
-            packet = build_rc_player_props(player_name, props)
+            packet = self._build_rc_player_props_packet(player, props)
             await session.player.send_raw(packet)
 
     async def _handle_player_props_get2(self, session: RCSession, data: bytes):
@@ -381,7 +439,7 @@ class RCManager:
         player = self.server.get_player(player_id)
         if player:
             props = self._build_player_props(player)
-            packet = build_rc_player_props(player.account_name, props)
+            packet = self._build_rc_player_props_packet(player, props)
             await session.player.send_raw(packet)
 
     async def _handle_player_props_get3(self, session: RCSession, data: bytes):
@@ -401,7 +459,7 @@ class RCManager:
         player = self.server.get_player_by_name(player_name)
         if player:
             props = self._build_player_props(player)
-            packet = build_rc_player_props(player.account_name, props)
+            packet = self._build_rc_player_props_packet(player, props)
             await session.player.send_raw(packet)
 
     async def _handle_player_props_set(self, session: RCSession, data: bytes):
@@ -493,6 +551,17 @@ class RCManager:
             PLPROP.BOMBSCOUNT: player.bombs,
             PLPROP.ARROWSCOUNT: player.arrows,
         }
+
+    @staticmethod
+    def _build_rc_player_props_packet(player: 'Player', props: Dict[int, Any]) -> bytes:
+        """Wrap a standard player-property stream in the RC response tail."""
+        props_packet = build_player_props(props)
+        props_blob = props_packet[1:-1]
+        return build_rc_player_props(
+            player.id, player.account_name, props_blob,
+            flags=getattr(player, 'flags', {}),
+            weapons=getattr(player, 'weapons', ()),
+        )
 
     async def _handle_disconnect_player(self, session: RCSession, data: bytes):
         """Handle RC_DISCONNECTPLAYER - Disconnect a player."""
@@ -759,17 +828,22 @@ class RCManager:
         reader = PacketReader(data)
         account_name = reader.remaining().decode('latin-1', errors='replace')
 
-        account_data = {}
+        email = ""
+        is_banned = False
+        load_only = False
+        ban_length = ""
+        ban_reason = ""
         if hasattr(self.server, 'account_manager'):
             account = self.server.account_manager.get_account(account_name)
             if account:
-                account_data = {
-                    'name': account.account_name,
-                    'banned': account.is_banned,
-                    'rights': account.admin_rights,
-                }
+                email = getattr(account, 'profile_email', '')
+                is_banned = account.is_banned
+                load_only = getattr(account, 'load_only', False)
+                ban_length = getattr(account, 'ban_length', '')
+                ban_reason = account.ban_reason
 
-        packet = build_rc_account_get(account_name, account_data)
+        packet = build_rc_account_get(
+            account_name, email, is_banned, load_only, ban_length, ban_reason)
         await session.player.send_raw(packet)
 
     async def _handle_account_set(self, session: RCSession, data: bytes):
@@ -812,6 +886,8 @@ class RCManager:
         A missing session denotes server-originated GS1 text.  Keeping this
         entry point shared ensures slash commands take the same route as text
         entered by an RC instead of accidentally being broadcast as chat.
+        Eval source is limited to 8 KiB and one run per account per 250 ms;
+        the interpreter also enforces its statement and loop budgets.
         """
         if not message:
             return
@@ -822,8 +898,59 @@ class RCManager:
                 # tokenizer and dispatch rcchat/#p(index) to the control NPC
                 # once pygserver has a control-NPC/NPC-server model.
                 return
-            # No other RC slash commands are implemented yet.  Do not leak a
-            # command into ordinary RC chat; future commands belong here.
+            command, *arguments = message.split(None, 1)
+            if command.lower() in ('/sign', '/chest', '/link'):
+                if session is None:
+                    return
+                await self._process_level_object(command.lower(), arguments, session)
+                return
+            if command.lower() == '/eval':
+                if session is None:
+                    return
+                await self._process_eval(arguments, session)
+                return
+            # `/updatelevel <level>` is the REFERENCE spelling of a reload
+            # (GServer-v2 Server::processRCChat, Server.cpp:2370, same
+            # PLPERM_UPDATELEVEL gate). Accepting it means a client can send
+            # the portable spelling everywhere instead of probing which
+            # server it is talking to. `/reloadlevel` stays as an alias.
+            if command.lower() in ('/savelevel', '/reloadlevel', '/updatelevel'):
+                if session is None:
+                    return
+                if not session.has_right(PLPERM.UPDATELEVEL):
+                    await session.player.send_raw(build_rc_chat(
+                        f"{command}: permission denied (UPDATELEVEL required)"
+                    ))
+                    return
+                if not arguments or not arguments[0].strip():
+                    await session.player.send_raw(build_rc_chat(
+                        f"{command}: level name required"
+                    ))
+                    return
+                level_name = arguments[0].strip()
+                try:
+                    if command.lower() == '/savelevel':
+                        level = self.server.world.get_level(level_name)
+                        if level is None:
+                            raise FileNotFoundError(f"level not found: {level_name}")
+                        path = level.save_to_file()
+                        reply = f"Saved level {level.name} to {path}"
+                    else:
+                        current_level = self.server.world.get_level(level_name)
+                        if current_level is None:
+                            raise FileNotFoundError(
+                                f"level not found: {level_name}")
+                        retired_npc_ids = tuple(
+                            npc.id for npc in current_level.get_npcs()
+                            if getattr(npc, 'file_defined', False))
+                        level = await self.server.world.reload_level(level_name)
+                        await self.server.resend_level(
+                            level.name, retired_npc_ids=retired_npc_ids)
+                        reply = f"Reloaded level {level.name} and resent it to players"
+                except Exception as error:
+                    reply = f"{command} {level_name} failed: {error}"
+                await session.player.send_raw(build_rc_chat(reply))
+                return
             return
 
         # RC-authored chat is labelled; server-originated sendtorc text is not.
@@ -835,6 +962,152 @@ class RCManager:
         await self.broadcast_to_rcs(packet)
 
         logger.info(f"[RC] {formatted}")
+
+    async def _reply(self, session: RCSession, message: str):
+        """Send one control-chat reply to a specific session."""
+        await session.player.send_raw(build_rc_chat(message))
+
+    async def _process_level_object(self, command: str, arguments: List[str],
+                                    session: RCSession):
+        """Apply one live level-object editor command and resend the level."""
+        if not session.has_right(PLPERM.UPDATELEVEL):
+            await self._reply(
+                session, f"{command}: permission denied (UPDATELEVEL required)")
+            return
+        raw = arguments[0] if arguments else ''
+        parts = raw.split()
+        try:
+            action = parts[0].lower()
+            if action not in ('add', 'del'):
+                raise ValueError("action must be add or del")
+            minimum = {'/sign': 5, '/chest': 5, '/link': 9}[command]
+            if action == 'del':
+                minimum = 4
+            if len(parts) < minimum:
+                raise ValueError("missing arguments")
+            level_name = parts[1]
+            level = self.server.world.get_level(level_name)
+            if level is None:
+                raise FileNotFoundError(f"unknown level: {level_name}")
+            x, y = int(parts[2]), int(parts[3])
+            if not (0 <= x < level.WIDTH and 0 <= y < level.HEIGHT):
+                raise ValueError(f"coordinates out of range: {x} {y}")
+
+            if command == '/sign':
+                key = (x, y)
+                if action == 'add':
+                    text = raw.split(None, 4)[4]
+                    level._signs[key] = text
+                    reply = f"Added sign in {level.name} at {x} {y}: {text}"
+                else:
+                    if key not in level._signs:
+                        raise LookupError(f"no sign at {x} {y}")
+                    del level._signs[key]
+                    reply = f"Deleted sign in {level.name} at {x} {y}"
+            elif command == '/chest':
+                matches = [entry for entry in level._chests
+                           if entry['x'] == x and entry['y'] == y]
+                if action == 'add':
+                    item_text = parts[4]
+                    item = ITEM_NAME_TO_ID.get(item_text.lower())
+                    if item is None:
+                        try:
+                            item = int(item_text)
+                        except ValueError:
+                            raise ValueError(f"unknown item: {item_text}") from None
+                    sign = int(parts[5]) if len(parts) > 5 else 0
+                    level._chests.append(
+                        {'x': x, 'y': y, 'item': item, 'sign': sign})
+                    reply = f"Added chest in {level.name} at {x} {y}: {item_text} {sign}"
+                else:
+                    if not matches:
+                        raise LookupError(f"no chest at {x} {y}")
+                    level._chests.remove(matches[0])
+                    reply = f"Deleted chest in {level.name} at {x} {y}"
+            else:
+                matches = [entry for entry in level._links
+                           if entry['x'] == x and entry['y'] == y]
+                if action == 'add':
+                    width, height = int(parts[4]), int(parts[5])
+                    if (width <= 0 or height <= 0 or
+                            x + width > level.WIDTH or y + height > level.HEIGHT):
+                        raise ValueError(
+                            f"link area out of range: {x} {y} {width} {height}")
+                    dest_x, dest_y = int(parts[7]), int(parts[8])
+                    if not (0 <= dest_x < level.WIDTH and
+                            0 <= dest_y < level.HEIGHT):
+                        raise ValueError(
+                            f"destination coordinates out of range: {dest_x} {dest_y}")
+                    level._links.append({
+                        'dest_level': parts[6], 'x': x, 'y': y,
+                        'width': width, 'height': height,
+                        'dest_x': str(dest_x), 'dest_y': str(dest_y),
+                    })
+                    reply = (f"Added link in {level.name} at {x} {y} "
+                             f"to {parts[6]} {dest_x} {dest_y}")
+                else:
+                    if not matches:
+                        raise LookupError(f"no link at {x} {y}")
+                    level._links.remove(matches[0])
+                    reply = f"Deleted link in {level.name} at {x} {y}"
+            await self.server.resend_level(level.name)
+        except Exception as error:
+            reply = f"{command} failed: {error}"
+        await self._reply(session, reply)
+
+    async def _process_eval(self, arguments: List[str], session: RCSession):
+        """Compile and immediately run bounded GS1 source on a scratch NPC."""
+        if not session.has_right(PLPERM.UPDATELEVEL):
+            await self._reply(
+                session, "/eval: permission denied (UPDATELEVEL required)")
+            return
+        raw = arguments[0] if arguments else ''
+        pieces = raw.split(None, 1)
+        if len(pieces) != 2:
+            await self._reply(session, "/eval failed: level and code required")
+            return
+        level_name, code = pieces
+        code = code.replace('\xa7', '\n')
+        level = self.server.world.get_level(level_name)
+        if level is None:
+            await self._reply(session, f"/eval failed: unknown level: {level_name}")
+            return
+        if len(code.encode('latin-1', errors='replace')) > 8192:
+            await self._reply(session, "/eval failed: code exceeds 8192 bytes")
+            return
+        account = session.player.account_name
+        now = time.monotonic()
+        if now - self._eval_times.get(account, 0.0) < 0.25:
+            await self._reply(session, "/eval failed: rate limit (250 ms)")
+            return
+        self._eval_times[account] = now
+        from .gs1_host import compile_gs1, run_npc_event
+        try:
+            program = compile_gs1(code, raise_errors=True)
+        except Exception as error:
+            await self._reply(session, f"[eval compile error] {error}")
+            return
+        npc = self._eval_npcs.get(account)
+        if npc is None:
+            npc = self.server.npc_manager.create_npc(
+                name=f"eval:{account}", level=level)
+            npc._rc_eval_scratch = True
+            npc.visible = False
+            self._eval_npcs[account] = npc
+        elif npc.level is not level:
+            if npc.level is not None:
+                npc.level.remove_npc(npc)
+            level.add_npc(npc)
+        npc.gs1_program = program
+        npc.gs1_source = code
+        npc._rc_session = session
+        errors = []
+        npc._gs1_error_handler = errors.append
+        run_npc_event(npc, 'created', self.server, None)
+        if errors:
+            await self._reply(session, f"[eval runtime error] {errors[0]}")
+        else:
+            await self._reply(session, f"[eval ok] {level.name}")
 
     async def _handle_admin_message(self, session: RCSession, data: bytes):
         """Handle RC_ADMINMESSAGE - Admin message to all players."""
@@ -904,8 +1177,7 @@ class RCManager:
             return
 
         # Reload levels
-        if hasattr(self.server.world, 'reload_levels'):
-            self.server.world.reload_levels()
+        await self.server.world.reload_levels()
 
         await self._broadcast_rc_message(
             f"{session.player.account_name} reloaded levels"
@@ -923,12 +1195,10 @@ class RCManager:
         session.file_browser_active = True
         session.file_browser_path = ""
 
-        # Send max upload size
-        packet = build_rc_max_upload_filesize(self.max_upload_size)
-        await session.player.send_raw(packet)
-
-        # Send initial directory listing
-        await self._send_directory_listing(session)
+        folders = self._get_file_browser_folders(session)
+        await session.player.send_raw(build_rc_file_browser_dir_list(folders))
+        await session.player.send_raw(
+            build_rc_file_browser_message("Welcome to the File Browser."))
 
     async def _handle_file_browser_cd(self, session: RCSession, data: bytes):
         """Handle RC_FILEBROWSER_CD - Change directory."""
@@ -962,26 +1232,71 @@ class RCManager:
     async def _handle_file_browser_down(self, session: RCSession, data: bytes):
         """Handle RC_FILEBROWSER_DOWN - Download file."""
         if not session.file_browser_active:
+            await self._send_file_browser_message(
+                session, "File browser is not active.")
             return
 
         reader = PacketReader(data)
         filename = reader.remaining().decode('latin-1', errors='replace')
 
-        if hasattr(self.server, 'filesystem'):
-            path = session.file_browser_path + "/" + filename if session.file_browser_path else filename
-            await self.server.filesystem.send_file(session.player, path)
+        if not self._valid_browser_name(filename):
+            await self._send_file_browser_message(
+                session, f"Invalid filename: {filename}")
+            return
+        if not hasattr(self.server, 'filesystem'):
+            await self._send_file_browser_message(
+                session, "File browser storage is unavailable.")
+            return
+
+        path = self._browser_path(session, filename)
+        await self.server.filesystem.send_file(session.player, path)
 
     async def _handle_file_browser_up(self, session: RCSession, data: bytes):
         """Handle RC_FILEBROWSER_UP - Upload file."""
         if not session.has_right(PLPERM.SETATTRIBUTES):
+            await self._send_file_browser_message(
+                session, "Insufficient rights to upload files.")
             return
 
-        # File upload is handled by large file transfer
-        logger.debug("File upload initiated")
+        reader = PacketReader(data)
+        filename = reader.read_gstring()
+        file_data = reader.remaining()
+
+        error = self._upload_error(session, filename, len(file_data))
+        if error:
+            await self._send_file_browser_message(session, error)
+            return
+
+        large_buffer = session.large_file_uploads.get(filename)
+        if large_buffer is not None:
+            if len(large_buffer) + len(file_data) > self.max_upload_size:
+                session.large_file_uploads.pop(filename, None)
+                await self._send_file_browser_message(
+                    session,
+                    f"Upload refused: {filename} exceeds the maximum upload "
+                    f"size of {self.max_upload_size} bytes.")
+                return
+            large_buffer.extend(file_data)
+            await self._send_file_browser_message(
+                session, f"Accepted upload data for {filename}.")
+            return
+
+        path = self._browser_path(session, filename)
+        if not self.server.filesystem.write_file(path, file_data):
+            await self._send_file_browser_message(
+                session, f"Could not write file {filename}.")
+            return
+
+        logger.info(f"Uploaded file {path} ({len(file_data)} bytes)")
+        await self._send_file_browser_message(
+            session, f"Uploaded file {filename}.")
+        await self._send_directory_listing(session)
 
     async def _handle_file_browser_move(self, session: RCSession, data: bytes):
         """Handle RC_FILEBROWSER_MOVE - Move file."""
         if not session.has_right(PLPERM.SETATTRIBUTES):
+            await self._send_file_browser_message(
+                session, "Insufficient rights to move files.")
             return
 
         # Wire format (msgPLI_RC_FILEBROWSER_MOVE): [GUCHAR-len destination
@@ -991,28 +1306,54 @@ class RCManager:
         dest_dir = reader.read_gstring()
         filename = reader.remaining().decode('latin-1', errors='replace')
 
-        if hasattr(self.server, 'filesystem'):
-            src = session.file_browser_path + "/" + filename if session.file_browser_path else filename
-            dst = dest_dir + "/" + filename if dest_dir else filename
-            self.server.filesystem.move_file(src, dst)
-            await self._send_directory_listing(session)
+        if (not self._valid_browser_name(filename)
+                or not self._valid_browser_path(dest_dir)):
+            await self._send_file_browser_message(
+                session, "Invalid source or destination path.")
+            return
+        if not hasattr(self.server, 'filesystem'):
+            await self._send_file_browser_message(
+                session, "File browser storage is unavailable.")
+            return
+        src = self._browser_path(session, filename)
+        dst = dest_dir + "/" + filename if dest_dir else filename
+        if self.server.filesystem.move_file(src, dst):
+            message = f"Moved file {src} to {dst}."
+        else:
+            message = f"Could not move file {src} to {dst}."
+        await self._send_file_browser_message(session, message)
+        await self._send_directory_listing(session)
 
     async def _handle_file_browser_delete(self, session: RCSession, data: bytes):
         """Handle RC_FILEBROWSER_DELETE - Delete file."""
         if not session.has_right(PLPERM.SETATTRIBUTES):
+            await self._send_file_browser_message(
+                session, "Insufficient rights to delete files.")
             return
 
         reader = PacketReader(data)
         filename = reader.remaining().decode('latin-1', errors='replace')
 
-        if hasattr(self.server, 'filesystem'):
-            path = session.file_browser_path + "/" + filename if session.file_browser_path else filename
-            self.server.filesystem.delete_file(path)
-            await self._send_directory_listing(session)
+        if not self._valid_browser_name(filename):
+            await self._send_file_browser_message(
+                session, f"Invalid filename: {filename}")
+            return
+        if not hasattr(self.server, 'filesystem'):
+            await self._send_file_browser_message(
+                session, "File browser storage is unavailable.")
+            return
+        path = self._browser_path(session, filename)
+        deleted = self.server.filesystem.delete_file(path)
+        message = (f"Deleted file {filename}." if deleted
+                   else f"Could not delete file {filename}.")
+        await self._send_file_browser_message(session, message)
+        await self._send_directory_listing(session)
 
     async def _handle_file_browser_rename(self, session: RCSession, data: bytes):
         """Handle RC_FILEBROWSER_RENAME - Rename file."""
         if not session.has_right(PLPERM.SETATTRIBUTES):
+            await self._send_file_browser_message(
+                session, "Insufficient rights to rename files.")
             return
 
         # Wire format (msgPLI_RC_FILEBROWSER_RENAME): [GUCHAR-len old
@@ -1022,24 +1363,88 @@ class RCManager:
         old_name = reader.read_gstring()
         new_name = reader.read_gstring()
 
-        if hasattr(self.server, 'filesystem'):
-            old_path = session.file_browser_path + "/" + old_name if session.file_browser_path else old_name
-            new_path = session.file_browser_path + "/" + new_name if session.file_browser_path else new_name
-            self.server.filesystem.move_file(old_path, new_path)
-            await self._send_directory_listing(session)
+        if (not self._valid_browser_name(old_name)
+                or not self._valid_browser_name(new_name)):
+            await self._send_file_browser_message(
+                session, "Invalid old or new filename.")
+            return
+        if not hasattr(self.server, 'filesystem'):
+            await self._send_file_browser_message(
+                session, "File browser storage is unavailable.")
+            return
+        old_path = self._browser_path(session, old_name)
+        new_path = self._browser_path(session, new_name)
+        renamed = self.server.filesystem.move_file(old_path, new_path)
+        message = (f"Renamed file {old_name} to {new_name}." if renamed
+                   else f"Could not rename file {old_name} to {new_name}.")
+        await self._send_file_browser_message(session, message)
+        await self._send_directory_listing(session)
 
     async def _handle_folder_delete(self, session: RCSession, data: bytes):
         """Handle RC_FOLDERDELETE - Delete folder."""
         if not session.has_right(PLPERM.SETATTRIBUTES):
+            await self._send_file_browser_message(
+                session, "Insufficient rights to delete folders.")
             return
 
         reader = PacketReader(data)
         folder = reader.remaining().decode('latin-1', errors='replace')
 
-        if hasattr(self.server, 'filesystem'):
-            path = session.file_browser_path + "/" + folder if session.file_browser_path else folder
-            self.server.filesystem.delete_folder(path)
-            await self._send_directory_listing(session)
+        if not self._valid_browser_name(folder):
+            await self._send_file_browser_message(
+                session, f"Invalid folder name: {folder}")
+            return
+        if not hasattr(self.server, 'filesystem'):
+            await self._send_file_browser_message(
+                session, "File browser storage is unavailable.")
+            return
+        path = self._browser_path(session, folder)
+        deleted = self.server.filesystem.delete_folder(path)
+        message = (f"Folder {folder} has been removed." if deleted
+                   else f"Could not remove folder {folder}.")
+        await self._send_file_browser_message(session, message)
+        await self._send_directory_listing(session)
+
+    async def _send_file_browser_message(
+            self, session: RCSession, message: str):
+        """Send one visible file-browser operation result."""
+        await session.player.send_raw(build_rc_file_browser_message(message))
+
+    @staticmethod
+    def _valid_browser_name(name: str) -> bool:
+        """Return whether a name stays directly inside the current folder."""
+        return bool(name and name not in ('.', '..') and '\x00' not in name
+                    and '/' not in name and '\\' not in name)
+
+    @staticmethod
+    def _valid_browser_path(path: str) -> bool:
+        """Return whether a browser-relative path cannot traverse upward."""
+        normalized = path.replace('\\', '/')
+        return (not normalized.startswith('/') and '\x00' not in normalized
+                and '..' not in normalized.split('/'))
+
+    @staticmethod
+    def _browser_path(session: RCSession, name: str) -> str:
+        """Join a direct child name to the browser's current folder."""
+        if session.file_browser_path:
+            return session.file_browser_path.strip('/') + "/" + name
+        return name
+
+    def _upload_error(
+            self, session: RCSession, filename: str, size: int) -> Optional[str]:
+        """Return a user-visible upload rejection, or None when allowed."""
+        if not session.file_browser_active:
+            return "Upload refused: file browser is not active."
+        if 'w' not in self._get_file_browser_rights(session).lower():
+            return "Upload refused: current folder is read-only."
+        if not self._valid_browser_name(filename):
+            return f"Upload refused: invalid filename {filename}."
+        if size > self.max_upload_size:
+            return (f"Upload refused: {filename} exceeds the maximum upload "
+                    f"size of {self.max_upload_size} bytes.")
+        if not hasattr(self.server, 'filesystem'):
+            return "Upload refused: file browser storage is unavailable."
+        return None
 
     async def _send_directory_listing(self, session: RCSession):
         """Send directory listing to RC session."""
@@ -1048,8 +1453,33 @@ class RCManager:
         if hasattr(self.server, 'filesystem'):
             files = self.server.filesystem.list_directory(session.file_browser_path)
 
-        packet = build_rc_file_browser_dir(session.file_browser_path, files)
+        rights = self._get_file_browser_rights(session)
+        packet = build_rc_file_browser_dir(
+            session.file_browser_path, files, rights=rights)
         await session.player.send_raw(packet)
+
+    def _get_file_browser_folders(self, session: RCSession) -> List[str]:
+        """Return the folder-rights entries available to an RC account."""
+        account = None
+        if hasattr(self.server, 'account_manager'):
+            account = self.server.account_manager.get_account(
+                session.player.account_name)
+        folders = (getattr(account, 'folders', None)
+                   or getattr(account, 'folder_list', None))
+        resolved = list(folders) if folders else []
+        return resolved or ["rw *"]
+
+    def _get_file_browser_rights(self, session: RCSession) -> str:
+        """Find the rights attached to the current folder's wildcard entry."""
+        path = session.file_browser_path.strip('/')
+        for folder_entry in self._get_file_browser_folders(session):
+            rights, separator, pattern = folder_entry.partition(' ')
+            if not separator:
+                continue
+            base = pattern.rstrip('*').rstrip('/')
+            if not base or path == base or path.startswith(base + '/'):
+                return rights
+        return "r"
 
     # =========================================================================
     # Large File Transfer Handlers
@@ -1064,10 +1494,17 @@ class RCManager:
         RC_FILEBROWSER_UP chunks and get flushed on RC_LARGEFILEEND).
         """
         if not session.has_right(PLPERM.SETATTRIBUTES):
+            await self._send_file_browser_message(
+                session, "Insufficient rights to upload files.")
             return
 
         reader = PacketReader(data)
         filename = reader.remaining().decode('latin-1', errors='replace')
+
+        error = self._upload_error(session, filename, 0)
+        if error:
+            await self._send_file_browser_message(session, error)
+            return
 
         session.large_file_uploads[filename] = bytearray()
         logger.info(f"Large file upload started: {filename}")
@@ -1081,6 +1518,8 @@ class RCManager:
         upload could never be matched up and finalized.
         """
         if not session.has_right(PLPERM.SETATTRIBUTES):
+            await self._send_file_browser_message(
+                session, "Insufficient rights to upload files.")
             return
 
         reader = PacketReader(data)
@@ -1089,13 +1528,25 @@ class RCManager:
         buf = session.large_file_uploads.pop(filename, None)
         if buf is None:
             logger.warning(f"Large file upload ended for unknown file: {filename}")
+            await self._send_file_browser_message(
+                session, f"Upload refused: no upload was started for {filename}.")
             return
 
-        if hasattr(self.server, 'filesystem'):
-            path = session.file_browser_path + "/" + filename if session.file_browser_path else filename
-            self.server.filesystem.write_file(path, bytes(buf))
+        error = self._upload_error(session, filename, len(buf))
+        if error:
+            await self._send_file_browser_message(session, error)
+            return
+
+        path = self._browser_path(session, filename)
+        if not self.server.filesystem.write_file(path, bytes(buf)):
+            await self._send_file_browser_message(
+                session, f"Could not write file {filename}.")
+            return
 
         logger.info(f"Large file upload completed: {filename} ({len(buf)} bytes)")
+        await self._send_file_browser_message(
+            session, f"Uploaded large file {filename}.")
+        await self._send_directory_listing(session)
 
     # =========================================================================
     # Utility Methods

@@ -364,23 +364,20 @@ class FileSystem:
 
     def _get_upload_path(self, filename: str) -> Optional[Path]:
         """Get safe upload path for a filename."""
-        # Sanitize filename
-        filename = filename.replace('..', '').replace('//', '/')
+        if not filename or '\x00' in filename:
+            return None
 
-        # Determine directory by extension
-        ext = Path(filename).suffix.lower()
-        if ext in ['.nw', '.graal', '.zelda']:
-            base = self.file_dirs['levels']
-        elif ext == '.gani':
-            base = self.file_dirs['gani']
-        elif ext in ['.png', '.gif', '.bmp']:
-            base = self.file_dirs['images']
-        elif ext in ['.wav', '.mp3', '.ogg']:
-            base = self.file_dirs['sounds']
-        else:
-            base = self.base_path
+        relative = Path(filename.replace('\\', '/'))
+        if relative.is_absolute() or '..' in relative.parts:
+            return None
 
-        return base / Path(filename).name
+        base = self.base_path.resolve()
+        candidate = (base / relative).resolve()
+        try:
+            candidate.relative_to(base)
+        except ValueError:
+            return None
+        return candidate
 
     # =========================================================================
     # RC File Browser

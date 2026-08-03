@@ -25,6 +25,7 @@ from .protocol.packets import (
     build_nc_class_delete,
     build_nc_weapon_list,
     build_nc_weapon_get,
+    build_rc_chat,
 )
 
 if TYPE_CHECKING:
@@ -117,6 +118,12 @@ class NCManager:
         """Get all active NC sessions."""
         return list(self._sessions.values())
 
+    async def _require_gs2_manager(self, session: NCSession, kind: str):
+        manager = getattr(self.server, 'gs2_manager', None)
+        if manager is None:
+            await self._send_error(session, kind, "script store is unavailable")
+        return manager
+
     async def handle_packet(self, player: 'Player', packet_id: int, data: bytes):
         """
         Handle an NC packet.
@@ -194,7 +201,11 @@ class NCManager:
 
         npc = self.server.npc_manager.get_npc(npc_id)
         if npc:
-            packet = build_nc_npc_script(npc_id, npc.script or "")
+            # The script text lives in `gs1_source` (npc.py:91, written next
+            # to the compiled `gs1_program`). Reading a `script` attribute no
+            # NPC has raised AttributeError here, so this answered NOTHING and
+            # a script editor showed an empty buffer for every NPC.
+            packet = build_nc_npc_script(npc_id, npc.gs1_source or "")
             await session.player.send_raw(packet)
 
     async def _handle_npc_script_set(self, session: NCSession, data: bytes):
@@ -205,8 +216,14 @@ class NCManager:
 
         npc = self.server.npc_manager.get_npc(npc_id)
         if npc:
-            npc.script = script
-            npc.compile_script()
+            from .gs1_host import compile_gs1
+            try:
+                program = compile_gs1(script, raise_errors=True)
+            except Exception as error:
+                await self._send_compile_error(session, "NPC", str(error))
+                return
+            npc.gs1_program = program
+            npc.gs1_source = script
 
             logger.info(f"NC {session.player.account_name} updated script for NPC {npc_id}")
 
@@ -302,7 +319,7 @@ class NCManager:
             NPCPROP.X: npc.x,
             NPCPROP.Y: npc.y,
             NPCPROP.IMAGE: npc.image,
-            NPCPROP.SCRIPT: npc.script or "",
+            NPCPROP.SCRIPT: npc.gs1_source or "",
             NPCPROP.VISFLAGS: npc.vis_flags,
             NPCPROP.BLOCKFLAGS: npc.block_flags,
         }
@@ -318,14 +335,15 @@ class NCManager:
 
         session.editing_class = class_name
 
-        # Get class script
-        script = ""
-        if hasattr(self.server, 'class_manager'):
-            cls = self.server.class_manager.get_class(class_name)
-            if cls:
-                script = cls.script
+        manager = await self._require_gs2_manager(session, "class")
+        if manager is None:
+            return
+        cls = manager.get_class(class_name)
+        if cls is None:
+            await self._send_error(session, "class", f"not found: {class_name}")
+            return
 
-        packet = build_nc_class_get(class_name, script)
+        packet = build_nc_class_get(cls.name, cls.source)
         await session.player.send_raw(packet)
 
         logger.debug(f"NC {session.player.account_name} editing class {class_name}")
@@ -333,11 +351,24 @@ class NCManager:
     async def _handle_class_add(self, session: NCSession, data: bytes):
         """Handle NC_CLASSADD - Add/update a class."""
         reader = PacketReader(data)
-        class_name = reader.read_string()
+        class_name = reader.read_gstring()
         script = reader.remaining().decode('latin-1', errors='replace')
 
-        if hasattr(self.server, 'class_manager'):
-            self.server.class_manager.add_class(class_name, script)
+        from .gs1_host import compile_gs1
+        try:
+            compile_gs1(script, raise_errors=True)
+        except Exception as error:
+            await self._send_compile_error(session, "class", str(error))
+            return
+
+        manager = await self._require_gs2_manager(session, "class")
+        if manager is None:
+            return
+        try:
+            manager.upsert_class(class_name, script)
+        except OSError as error:
+            await self._send_error(session, "class", f"save failed: {error}")
+            return
 
         # Notify NC sessions
         packet = build_nc_class_add(class_name)
@@ -350,8 +381,17 @@ class NCManager:
         reader = PacketReader(data)
         class_name = reader.remaining().decode('latin-1', errors='replace')
 
-        if hasattr(self.server, 'class_manager'):
-            self.server.class_manager.remove_class(class_name)
+        manager = await self._require_gs2_manager(session, "class")
+        if manager is None:
+            return
+        try:
+            deleted = manager.delete_class(class_name)
+        except OSError as error:
+            await self._send_error(session, "class", f"delete failed: {error}")
+            return
+        if not deleted:
+            await self._send_error(session, "class", f"not found: {class_name}")
+            return
 
         # Notify NC sessions
         packet = build_nc_class_delete(class_name)
@@ -365,9 +405,11 @@ class NCManager:
 
     async def _handle_weapon_list_get(self, session: NCSession, data: bytes):
         """Handle NC_WEAPONLISTGET - Get weapon list."""
-        weapons = []
-        if hasattr(self.server, 'weapon_manager'):
-            weapons = self.server.weapon_manager.list_weapons()
+        manager = await self._require_gs2_manager(session, "weapon")
+        if manager is None:
+            return
+        weapons = sorted(weapon.name for weapon in
+                         manager.weapons.values())
 
         packet = build_nc_weapon_list(weapons)
         await session.player.send_raw(packet)
@@ -379,15 +421,15 @@ class NCManager:
 
         session.editing_weapon = weapon_name
 
-        image = ""
-        script = ""
-        if hasattr(self.server, 'weapon_manager'):
-            weapon = self.server.weapon_manager.get_weapon(weapon_name)
-            if weapon:
-                image = weapon.image
-                script = weapon.script
+        manager = await self._require_gs2_manager(session, "weapon")
+        if manager is None:
+            return
+        weapon = manager.get_weapon(weapon_name)
+        if weapon is None:
+            await self._send_error(session, "weapon", f"not found: {weapon_name}")
+            return
 
-        packet = build_nc_weapon_get(weapon_name, image, script)
+        packet = build_nc_weapon_get(weapon.name, weapon.image, weapon.source)
         await session.player.send_raw(packet)
 
         logger.debug(f"NC {session.player.account_name} editing weapon {weapon_name}")
@@ -395,22 +437,66 @@ class NCManager:
     async def _handle_weapon_add(self, session: NCSession, data: bytes):
         """Handle NC_WEAPONADD - Add/update a weapon."""
         reader = PacketReader(data)
-        weapon_name = reader.read_string()
-        image = reader.read_string()
+        weapon_name = reader.read_gstring()
+        image = reader.read_gstring()
         script = reader.remaining().decode('latin-1', errors='replace')
 
-        if hasattr(self.server, 'weapon_manager'):
-            self.server.weapon_manager.add_weapon(weapon_name, image, script)
+        from .gs1_host import compile_gs1
+        try:
+            compile_gs1(script, raise_errors=True)
+        except Exception as error:
+            await self._send_compile_error(session, "weapon", str(error))
+            return
+
+        manager = await self._require_gs2_manager(session, "weapon")
+        if manager is None:
+            return
+        try:
+            manager.upsert_weapon(weapon_name, image, script)
+        except OSError as error:
+            await self._send_error(session, "weapon", f"save failed: {error}")
+            return
+
+        # A player who already holds this weapon keeps the inventory entry and
+        # immediately receives its replacement image and clientside script.
+        for player in self.server.get_all_players():
+            if weapon_name.lower() in {
+                    held.lower() for held in (getattr(player, 'weapons', []) or [])}:
+                await manager.announce_weapon(player, weapon_name)
 
         logger.info(f"NC {session.player.account_name} updated weapon {weapon_name}")
+
+    @staticmethod
+    async def _send_compile_error(session: NCSession, kind: str, error: str):
+        """Return a compiler failure using the existing control-chat packet.
+
+        NC connections already accept the shared RC_CHAT notification packet,
+        which is visible immediately and avoids defining a new wire message.
+        """
+        await session.player.send_raw(build_rc_chat(
+            f"[NC {kind} compile error] {error}"))
+
+    @staticmethod
+    async def _send_error(session: NCSession, kind: str, error: str):
+        """Return an explicit asset operation failure to its NC editor."""
+        await session.player.send_raw(build_rc_chat(f"[NC {kind} error] {error}"))
 
     async def _handle_weapon_delete(self, session: NCSession, data: bytes):
         """Handle NC_WEAPONDELETE - Delete a weapon."""
         reader = PacketReader(data)
         weapon_name = reader.remaining().decode('latin-1', errors='replace')
 
-        if hasattr(self.server, 'weapon_manager'):
-            self.server.weapon_manager.remove_weapon(weapon_name)
+        manager = await self._require_gs2_manager(session, "weapon")
+        if manager is None:
+            return
+        try:
+            deleted = manager.delete_weapon(weapon_name)
+        except OSError as error:
+            await self._send_error(session, "weapon", f"delete failed: {error}")
+            return
+        if not deleted:
+            await self._send_error(session, "weapon", f"not found: {weapon_name}")
+            return
 
         logger.info(f"NC {session.player.account_name} deleted weapon {weapon_name}")
 

@@ -23,8 +23,16 @@ import struct
 import time
 from typing import TYPE_CHECKING
 
+from reborn_protocol.constants import PLTYPE
+
 from .protocol.constants import PLPROP
-from .protocol.packets import build_player_props, parse_login_packet
+from .protocol.packets import (
+    build_player_props,
+    build_rc_chat,
+    build_rc_max_upload_filesize,
+    build_staff_guilds,
+    parse_login_packet,
+)
 
 if TYPE_CHECKING:
     from .player import Player
@@ -59,7 +67,7 @@ class LoginService:
 
             # Create codec with no encryption key yet
             codec = player.session.start_codec(0)
-            decrypted = codec.decode_packet(packet_data)
+            decrypted = player.session.decode_packet(packet_data)
             if not decrypted:
                 logger.warning(f"Failed to decode login from {player.id}")
                 return False
@@ -72,12 +80,26 @@ class LoginService:
             if protocol not in KNOWN_PROTOCOLS:
                 logger.warning(f"Unsupported protocol: {protocol}")
 
-            # Set encryption key
-            codec.set_key(login.get('encryption_key', 0))
+            # Select both directions for the lifetime of this connection.
+            generation = login.get('encryption_generation', 5)
+            if generation == 2:
+                codec = player.session.start_codec(generation=2)
+            else:
+                codec.set_key(login.get('encryption_key', 0))
 
             # Store account info
             player.account_name = login.get('username', f'player_{player.id}')
             player.nickname = player.account_name
+            raw_client_type = login.get('client_type', 0)
+            candidate_type = PLTYPE(1 << raw_client_type) \
+                if isinstance(raw_client_type, int) and raw_client_type >= 0 \
+                else PLTYPE.CLIENT
+            valid_types = {
+                member for member in PLTYPE
+                if member.value > 0 and member.value & (member.value - 1) == 0
+            }
+            player.connection_type = candidate_type \
+                if candidate_type in valid_types else PLTYPE.CLIENT
 
             account_manager = getattr(server, 'account_manager', None)
             if account_manager:
@@ -128,6 +150,17 @@ class LoginService:
             logger.debug(f"complete_login: player {player.id} already logged in")
             return
 
+        connection_type = player.connection_type
+        is_rc = bool(connection_type & PLTYPE.ANYRC)
+        is_nc = connection_type == PLTYPE.NC
+
+        if is_rc and not player.server.register_rc_session(player):
+            await player.disconnect("You do not have RC access.")
+            return
+        if is_nc and not player.server.register_nc_session(player):
+            await player.disconnect("You do not have NC access.")
+            return
+
         await self.send_login_response()
 
         player.logged_in = True
@@ -138,12 +171,43 @@ class LoginService:
         if listserver:
             await listserver.add_player(player)
 
+        if is_rc:
+            await self.send_rc_login_sequence()
+            return
+        if is_nc:
+            return
+
         gs2 = getattr(player.server, 'gs2_manager', None)
         if gs2 is not None:
             await gs2.announce_weapons(player)
 
         config = player.server.config
         await player.warp(config.start_level, config.start_x, config.start_y)
+
+        rc_manager = getattr(player.server, 'rc_manager', None)
+        if rc_manager:
+            await rc_manager.notify_player_join(player)
+
+    async def send_rc_login_sequence(self):
+        """Send the control-client welcome and current player roster."""
+        player = self.player
+        server = player.server
+        manager = server.rc_manager
+
+        await player.send_raw(build_rc_chat(f"Welcome to {server.config.name}."))
+        await player.send_raw(build_rc_max_upload_filesize(
+            manager.max_upload_size))
+        guilds = getattr(server.config, 'staff_guilds', None) \
+            or getattr(server.config, 'staff', [])
+        await player.send_raw(build_staff_guilds(guilds))
+
+        for online_player in server.get_all_players():
+            if (online_player.id != player.id
+                    and online_player.connection_type & PLTYPE.ANYCLIENT):
+                await player.send_raw(manager.build_add_player(online_player))
+
+        await manager.broadcast_chat(
+            f"New RC: {player.account_name}", exclude={player.id})
 
     async def send_login_response(self):
         """Send PLO_PLAYERPROPS with the player's initial state."""

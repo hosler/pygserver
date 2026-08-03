@@ -395,7 +395,10 @@ def _c_sendtorc(self, a, npc, player, ctx):
     message = to_str(a[0]) if a else ""
     rc_manager = getattr(self.server, "rc_manager", None) if self.server else None
     if rc_manager is not None and hasattr(rc_manager, "process_chat"):
-        _schedule(rc_manager.process_chat(message))
+        # Eval scratch NPCs retain their owning control session so bridge
+        # output follows the shared chat path and reaches its caller.
+        session = getattr(npc, "_rc_session", None)
+        _schedule(rc_manager.process_chat(message, session))
 
 def _queue_player_prop(player, prop_id, value):
     dirty = getattr(player, "_gs1_dirty_props", None)

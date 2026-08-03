@@ -19,9 +19,16 @@ from .level import Level
 from .world import World
 from .npc import NPCManager
 from .protocol.constants import PLTYPE, PLPERM
-from .protocol.packets import build_flag_del, build_flag_set, build_world_time
+from .protocol.packets import (
+    build_flag_del,
+    build_flag_set,
+    build_npc_del,
+    build_world_time,
+)
 
 logger = logging.getLogger(__name__)
+
+_ALL_ADMIN_RIGHTS = sum(permission.value for permission in PLPERM)
 
 
 class GameServer:
@@ -337,10 +344,28 @@ class GameServer:
                     name="levelnpc", level=level,
                     x=ndef['x'], y=ndef['y']
                 )
+                npc.file_defined = True
                 if image and image != '-':
                     npc.image = image
                 if code.strip():
                     self.npc_manager.attach_gs1(npc, code)
+
+    async def resend_level(self, level_name: str,
+                           retired_npc_ids=()):
+        """Re-warp occupants in place so client level stores are rebuilt.
+
+        A full same-level entry is intentional: client sign, chest, and link
+        stores append incremental arrival packets and otherwise retain stale
+        or duplicate definitions. Retired NPC ids must be deleted before the
+        replacement level state sends its new NPC property packets.
+        """
+        level = self.world.get_level(level_name)
+        if level is None:
+            raise FileNotFoundError(f"level not found: {level_name}")
+        for player in list(self.get_players_on_level(level.name)):
+            for npc_id in retired_npc_ids:
+                await player.send_raw(build_npc_del(npc_id))
+            await player.warp(level.name, player.x, player.y)
 
     async def _handle_connection(self, reader: asyncio.StreamReader,
                                   writer: asyncio.StreamWriter):
@@ -380,6 +405,10 @@ class GameServer:
 
     async def _remove_player(self, player: Player):
         """Remove a player from the server."""
+        if (self.rc_manager and player.logged_in
+                and player.connection_type & PLTYPE.ANYCLIENT):
+            await self.rc_manager.notify_player_leave(player.id)
+
         # Remove from listserver
         if self.listserver and player.logged_in:
             await self.listserver.remove_player(player)
@@ -645,11 +674,10 @@ class GameServer:
 
         # Also check staff config
         if self.is_staff(player.account_name):
-            rights |= PLPERM.ALL if hasattr(PLPERM, 'ALL') else 0xFFFFF
+            rights |= _ALL_ADMIN_RIGHTS
 
         if rights > 0:
             self.rc_manager.register_session(player, rights)
-            player.connection_type = PLTYPE.RC
             logger.info(f"RC session registered for {player.account_name} with rights {rights}")
             return True
 
@@ -675,7 +703,10 @@ class GameServer:
             if account:
                 rights = account.admin_rights
 
-        if self.is_staff(player.account_name) or (rights & PLPERM.NPCCONTROL):
+        if self.is_staff(player.account_name):
+            rights |= _ALL_ADMIN_RIGHTS
+
+        if rights > 0:
             self.nc_manager.register_session(player)
             player.connection_type = PLTYPE.NC
             logger.info(f"NC session registered for {player.account_name}")

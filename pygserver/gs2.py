@@ -251,6 +251,7 @@ class GS2Script:
     joined_classes: str = ''
     server_program: Optional[Any] = None
     server_runtime: Optional[Any] = None
+    source_path: Optional[Path] = None
 
     def build_headers(self, source: str):
         """Derive the DES key, CRC32 and CSV headers from the full source.
@@ -407,7 +408,8 @@ class GS2ScriptManager:
 
         serverside, clientside = split_clientside(script_source)
         script = GS2Script(kind=kind, name=name, image=image,
-                           source=script_source, clientside=clientside)
+                           source=script_source, clientside=clientside,
+                           source_path=path)
         if kind == 'weapon' and serverside:
             from .gs1_host import compile_gs1
             from .npc import NPC
@@ -446,6 +448,64 @@ class GS2ScriptManager:
     def get_weapon(self, name: str) -> Optional[GS2Script]:
         return self.weapons.get(name.lower())
 
+    @staticmethod
+    def _atomic_write(path: Path, text: str):
+        """Replace a source file without exposing a partially written file."""
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd, temporary = tempfile.mkstemp(prefix=f".{path.name}.",
+                                         dir=path.parent)
+        try:
+            with os.fdopen(fd, "w", encoding="latin-1", errors="replace") as stream:
+                stream.write(text)
+                stream.flush()
+                os.fsync(stream.fileno())
+            os.replace(temporary, path)
+        except BaseException:
+            try:
+                os.unlink(temporary)
+            except OSError:
+                pass
+            raise
+
+    @staticmethod
+    def _encoded_weapon_filename(name: str) -> str:
+        return ''.join(
+            char if char.isascii() and (char.isalnum() or char == '.')
+            else f"%{ord(char):03d}"
+            for char in f"weapon{name}.txt"
+        )
+
+    def upsert_weapon(self, name: str, image: str, source: str) -> GS2Script:
+        """Persist and load an NC-created or replaced weapon."""
+        current = self.get_weapon(name)
+        directory = Path(getattr(self.server.config, "weapons_dir", None)
+                         or "weapons")
+        path = (current.source_path if current and current.source_path
+                else directory / self._encoded_weapon_filename(name))
+        lines = ["GRAWP001", f"REALNAME {name}", f"IMAGE {image}"]
+        if source:
+            lines.extend(("SCRIPT", source, "SCRIPTEND"))
+        self._atomic_write(path, '\n'.join(lines) + '\n')
+        if current and current.server_runtime is not None:
+            manager = getattr(self.server, "npc_manager", None)
+            if manager is not None:
+                manager.unregister_weapon_runtime(current.server_runtime)
+        self._load_file(path, 'weapon')
+        return self.get_weapon(name)  # type: ignore[return-value]
+
+    def delete_weapon(self, name: str) -> bool:
+        weapon = self.weapons.pop(name.lower(), None)
+        if weapon is None:
+            return False
+        if weapon.server_runtime is not None:
+            manager = getattr(self.server, "npc_manager", None)
+            if manager is not None:
+                manager.unregister_weapon_runtime(weapon.server_runtime)
+        if weapon.source_path is not None:
+            weapon.source_path.unlink(missing_ok=True)
+            weapon.source_path.with_suffix('.gs2bc').unlink(missing_ok=True)
+        return True
+
     def upsert_classic_weapon(self, name: str, image: str,
                               source: str) -> GS2Script:
         """Create/update a persistent classic weapon from an NPC script."""
@@ -476,11 +536,7 @@ class GS2ScriptManager:
     def _save_classic_weapon(self, weapon: GS2Script, source: str):
         directory = Path(getattr(self.server.config, "weapons_dir", None)
                          or "weapons")
-        encoded = ''.join(
-            char if char.isascii() and (char.isalnum() or char == '.')
-            else f"%{ord(char):03d}"
-            for char in f"weapon{weapon.name}.txt"
-        )
+        encoded = self._encoded_weapon_filename(weapon.name)
         lines = ["GRAWP001", f"REALNAME {weapon.name}",
                  f"IMAGE {weapon.image}"]
         if source:
@@ -495,6 +551,27 @@ class GS2ScriptManager:
 
     def get_class(self, name: str) -> Optional[GS2Script]:
         return self.classes.get(name.lower())
+
+    def upsert_class(self, name: str, source: str) -> GS2Script:
+        """Persist and load an NC-created or replaced script class."""
+        current = self.get_class(name)
+        encoded = ''.join(
+            char if char.isascii() and (char.isalnum() or char in '._-')
+            else f"%{ord(char):03d}" for char in name)
+        path = (current.source_path if current and current.source_path
+                else self.base_path / 'scripts' / f'{encoded}.txt')
+        self._atomic_write(path, source)
+        self._load_file(path, 'class')
+        return self.get_class(name)  # type: ignore[return-value]
+
+    def delete_class(self, name: str) -> bool:
+        script = self.classes.pop(name.lower(), None)
+        if script is None:
+            return False
+        if script.source_path is not None:
+            script.source_path.unlink(missing_ok=True)
+            script.source_path.with_suffix('.gs2bc').unlink(missing_ok=True)
+        return True
 
     def get_gani(self, name: str) -> Optional[GS2Gani]:
         """Compile a .gani's script, memoised by name.

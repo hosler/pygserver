@@ -349,11 +349,8 @@ class TestRCApIncrementSet:
         asyncio.run(main())
 
 
-class TestNCWeaponAndClassGuards:
-    """GameServer used to declare weapon_manager/class_manager and leave them
-    None forever, so every `hasattr(server, ...)` guard below passed and then
-    dereferenced None. The attributes are gone with the dead WeaponManager, so
-    the guards finally skip the way they were written to."""
+class TestNCWeaponAndClassStoreErrors:
+    """An unavailable script store produces a visible NC error."""
 
     def _nc(self):
         from pygserver.nc import NCManager, NCSession
@@ -364,7 +361,7 @@ class TestNCWeaponAndClassGuards:
         nc = NCManager(GameServer())
         return nc, NCSession(player=_make_player(MagicMock()))
 
-    def test_weapon_handlers_skip_instead_of_dereferencing_none(self):
+    def test_weapon_handlers_report_unavailable_store(self):
         nc, session = self._nc()
 
         async def main():
@@ -373,7 +370,9 @@ class TestNCWeaponAndClassGuards:
             await nc._handle_weapon_delete(session, b"bow")
         asyncio.run(main())
 
-    def test_class_edit_skips_instead_of_dereferencing_none(self):
+        assert session.player.send_raw.await_count == 3
+
+    def test_class_edit_reports_unavailable_store(self):
         nc, session = self._nc()
 
         async def main():
@@ -381,4 +380,4 @@ class TestNCWeaponAndClassGuards:
         asyncio.run(main())
 
         packet = session.player.send_raw.await_args[0][0]
-        assert b"someclass" in packet
+        assert b"script store is unavailable" in packet

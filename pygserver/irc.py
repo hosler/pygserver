@@ -29,6 +29,7 @@ from typing import Dict, List, Optional, Sequence, Set, Tuple
 
 from .protocol.constants import PLO, PLPROP
 from .protocol.packets import PacketBuilder, build_other_player_props
+from .rc import RCManager
 
 logger = logging.getLogger(__name__)
 
@@ -391,8 +392,8 @@ class IrcManager:
         nick = f"{channel.name} ({len(channel.members)},0)"
         flags = self._channel_flags(channel, viewer)
         if viewer is not None and self._is_rc(viewer):
-            return self._build_add_player(channel.pseudo_id, account, nick,
-                                          flags)
+            return RCManager.build_add_player_fields(
+                channel.pseudo_id, account, nick, flags)
         return build_other_player_props(channel.pseudo_id, {
             PLPROP.NICKNAME: nick,
             PLPROP.ACCOUNTNAME: account,
@@ -407,36 +408,20 @@ class IrcManager:
         nick = f"{member.nickname} (on {channel.name})"
         flags = CATEGORY_EXTERNAL | CATEGORY_CHANNELUSER
         if viewer is not None and self._is_rc(viewer):
-            return self._build_add_player(pseudo_id, member.account_name,
-                                          nick, flags)
+            return RCManager.build_add_player_fields(
+                pseudo_id, member.account_name, nick, flags)
         return build_other_player_props(pseudo_id, {
             PLPROP.NICKNAME: nick,
             PLPROP.ACCOUNTNAME: member.account_name,
             _PROP_LISTCATEGORY: flags,
         })
 
-    @staticmethod
-    def _build_add_player(pseudo_id: int, account: str, nick: str,
-                          flags: int) -> bytes:
-        """PLO_ADDPLAYER(55), the RC shape (PlayerRequestText.cpp:166):
-        {gshort id}{gchar len}{account}{prop 0 nick}{prop 81 flags}."""
-        builder = PacketBuilder().write_gchar(PLO.ADDPLAYER)
-        builder.write_gshort(pseudo_id)
-        builder.write_gstring(account)
-        builder.write_gchar(PLPROP.NICKNAME).write_gstring(nick)
-        builder.write_gchar(_PROP_LISTCATEGORY).write_gchar(flags)
-        builder.write_newline()
-        return builder.build()
-
     def _remove_packet(self, pseudo_id: int, viewer) -> bytes:
         """Pseudo-player removal (PlayerExternalPlayers.cpp:123-127):
         PLO_DELPLAYER for RC, OTHERPLPROPS + the void DISCONNECT prop (51)
         for clients."""
         if viewer is not None and self._is_rc(viewer):
-            builder = PacketBuilder().write_gchar(PLO.DELPLAYER)
-            builder.write_gshort(pseudo_id)
-            builder.write_newline()
-            return builder.build()
+            return RCManager.build_del_player(pseudo_id)
         return build_other_player_props(pseudo_id, {_PROP_DISCONNECT: None})
 
     # =========================================================================

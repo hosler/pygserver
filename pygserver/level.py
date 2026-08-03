@@ -6,6 +6,8 @@ tiles, NPCs, items, signs, and links.
 """
 
 import logging
+import os
+import tempfile
 from typing import TYPE_CHECKING, Optional, List, Dict, Tuple
 from pathlib import Path
 
@@ -32,6 +34,10 @@ BADDY_NAME_TO_TYPE: Dict[str, int] = {
     "graysoldier": 0, "bluesoldier": 1, "redsoldier": 2, "shootingsoldier": 3,
     "swampsoldier": 4, "frog": 5, "octopus": 6, "goldenwarrior": 7,
     "lizardon": 8, "dragon": 9, "spider": 6,
+}
+ITEM_ID_TO_NAME = {value: name for name, value in ITEM_NAME_TO_ID.items()}
+BADDY_TYPE_TO_NAME = {
+    value: name for name, value in BADDY_NAME_TO_TYPE.items() if name != "spider"
 }
 
 
@@ -86,6 +92,10 @@ class Level:
         # NPC definitions (parsed from file: {x, y, image, code})
         self._npc_defs: List[Dict] = []
 
+        # Non-empty directives outside the supported file sections. Keeping
+        # these makes serialization reject data it would otherwise discard.
+        self._unsupported_features: List[str] = []
+
     @classmethod
     def load(cls, file_path: str) -> 'Level':
         """
@@ -136,6 +146,118 @@ class Level:
             tiles.append(tile_id)
             i += 2
         return tiles
+
+    def _encode_board_row(self, y: int) -> str:
+        """Encode one complete tile row for a GLEVNW01 BOARD record."""
+        encoded = []
+        for x in range(self.WIDTH):
+            tile_id = self.get_tile(x, y)
+            if not 0 <= tile_id < 4096:
+                raise ValueError(f"tile ({x}, {y}) id {tile_id} is not representable")
+            encoded.append(self.BASE64_CHARS[tile_id // 64])
+            encoded.append(self.BASE64_CHARS[tile_id % 64])
+        return ''.join(encoded)
+
+    @staticmethod
+    def _single_line(value, field: str) -> str:
+        text = str(value)
+        if '\n' in text or '\r' in text:
+            raise ValueError(f"{field} cannot contain a newline")
+        return text
+
+    def serialize(self) -> str:
+        """Return this level in the GLEVNW01 text format."""
+        if self._unsupported_features:
+            raise ValueError(
+                "unsupported level feature: " + self._unsupported_features[0]
+            )
+        lines = ["GLEVNW01"]
+        for y in range(self.HEIGHT):
+            lines.append(f"BOARD 0 {y} 64 0 {self._encode_board_row(y)}")
+
+        for link in self._links:
+            required = ('dest_level', 'x', 'y', 'width', 'height',
+                        'dest_x', 'dest_y')
+            if any(key not in link for key in required):
+                raise ValueError(f"link has missing fields: {link!r}")
+            values = [self._single_line(link[key], f"link {key}")
+                      for key in required]
+            if not values[0]:
+                raise ValueError("link destination level cannot be empty")
+            lines.append("LINK " + ' '.join(values))
+
+        for (x, y), text in self._signs.items():
+            if 'SIGNEND' in str(text).splitlines():
+                raise ValueError(f"sign ({x}, {y}) contains SIGNEND")
+            lines.extend((f"SIGN {int(x)} {int(y)}", str(text), "SIGNEND"))
+
+        for chest in self._chests:
+            required = ('x', 'y', 'item')
+            if any(key not in chest for key in required):
+                raise ValueError(f"chest has missing fields: {chest!r}")
+            item_id = int(chest['item'])
+            item = ITEM_ID_TO_NAME.get(item_id, str(item_id))
+            lines.append(
+                f"CHEST {int(chest['x'])} {int(chest['y'])} {item} "
+                f"{int(chest.get('sign', 0))}"
+            )
+
+        # RC eval scratch NPCs are marked `_rc_eval_scratch`; serialization
+        # writes only file definitions, never live `_npcs`, so they cannot leak.
+        for definition in self._npc_defs:
+            required = ('x', 'y', 'image', 'code')
+            if any(key not in definition for key in required):
+                raise ValueError(f"NPC definition has missing fields: {definition!r}")
+            image = self._single_line(definition['image'] or '-', "NPC image")
+            code = str(definition['code'])
+            if 'NPCEND' in code.splitlines():
+                raise ValueError("NPC code contains NPCEND")
+            lines.extend((
+                f"NPC {image} {definition['x']} {definition['y']}",
+                code, "NPCEND",
+            ))
+
+        for baddy in self._baddies:
+            required = ('x', 'y', 'type', 'verses')
+            if any(key not in baddy for key in required):
+                raise ValueError(f"baddy definition has missing fields: {baddy!r}")
+            baddy_type = int(baddy['type'])
+            type_name = BADDY_TYPE_TO_NAME.get(baddy_type, str(baddy_type))
+            verses = [str(verse) for verse in baddy['verses']]
+            if any('\n' in verse or '\r' in verse or verse == 'BADDYEND'
+                   for verse in verses):
+                raise ValueError("baddy verse is not representable")
+            lines.append(f"BADDY {baddy['x']} {baddy['y']} {type_name}")
+            lines.extend(verses)
+            lines.append("BADDYEND")
+
+        return '\n'.join(lines) + '\n'
+
+    def save_to_file(self, path=None) -> Path:
+        """Atomically write the level, defaulting to its loaded path."""
+        target = Path(path) if path is not None else (
+            Path(self.file_path) if self.file_path else None
+        )
+        if target is None:
+            raise ValueError("level has no file path")
+        target.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                    mode='w', encoding='latin-1', newline='\n',
+                    dir=target.parent, prefix=f".{target.name}.",
+                    suffix='.tmp', delete=False) as temporary:
+                temporary_path = Path(temporary.name)
+                temporary.write(self.serialize())
+                temporary.flush()
+                os.fsync(temporary.fileno())
+            os.replace(temporary_path, target)
+        except Exception:
+            if temporary_path is not None:
+                temporary_path.unlink(missing_ok=True)
+            raise
+        self.file_path = str(target)
+        return target
 
     def _parse_nw_file(self, data: bytes):
         """
@@ -278,6 +400,9 @@ class Level:
                 self._baddies.append({
                     'x': bx, 'y': by, 'type': btype, 'verses': verses,
                 })
+
+            elif section not in ('GLEVNW01', 'BOARD'):
+                self._unsupported_features.append(stripped)
 
     def get_tile(self, x: int, y: int) -> int:
         """Get tile ID at position."""

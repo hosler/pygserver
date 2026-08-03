@@ -9,7 +9,9 @@ send_packet / disconnect to this and keeps no transport state of its own.
 
 import asyncio
 import logging
-from typing import Optional
+from typing import Optional, Union
+
+from reborn_protocol.codec import Gen2Codec
 
 from .protocol.codec import ServerCodec, PacketBuffer
 
@@ -24,7 +26,7 @@ class PlayerSession:
         self.reader = reader
         self.writer = writer
         self.connected = True
-        self.codec: Optional[ServerCodec] = None
+        self.codec: Optional[Union[ServerCodec, Gen2Codec]] = None
         self.buffer = PacketBuffer()
 
     async def read(self, limit: int = 65536, timeout: Optional[float] = None) -> bytes:
@@ -33,17 +35,32 @@ class PlayerSession:
             return await self.reader.read(limit)
         return await asyncio.wait_for(self.reader.read(limit), timeout=timeout)
 
-    def start_codec(self, key: int = 0) -> ServerCodec:
-        """Create the session codec (the login packet arrives with key 0)."""
-        self.codec = ServerCodec(key)
+    def start_codec(self, key: int = 0, generation: int = 5):
+        """Create the codec selected by the connection's login generation."""
+        if generation == 2:
+            self.codec = Gen2Codec()
+        elif generation == 5:
+            self.codec = ServerCodec(key)
+        else:
+            raise ValueError(f"Unsupported encryption generation: {generation}")
         return self.codec
+
+    def decode_packet(self, data: bytes) -> Optional[bytes]:
+        """Decode one framed payload with the selected session codec."""
+        if not self.codec:
+            return None
+        if isinstance(self.codec, Gen2Codec):
+            return self.codec.recv_packet(data)
+        return self.codec.decode_packet(data)
 
     async def send(self, data: bytes):
         """Encode and send one packet. Marks the session dead on a send error."""
         if not self.connected or not self.codec:
             return
         try:
-            encoded = self.codec.encode_packet(data)
+            encoded = (self.codec.send_packet(data)
+                       if isinstance(self.codec, Gen2Codec)
+                       else self.codec.encode_packet(data))
             self.writer.write(encoded)
             await self.writer.drain()
         except Exception as e:
@@ -56,7 +73,9 @@ class PlayerSession:
         Unlike send(), a failure here propagates: the login flow treats it as a
         failed login rather than continuing with a half-initialised player.
         """
-        encoded = self.codec.encode_packet(data, is_login_response=True)
+        encoded = (self.codec.send_packet(data)
+                   if isinstance(self.codec, Gen2Codec)
+                   else self.codec.encode_packet(data, is_login_response=True))
         self.writer.write(encoded)
         await self.writer.drain()
 

@@ -514,6 +514,10 @@ class NPCManager:
         self._weapon_runtimes[npc.id] = npc
         return npc
 
+    def unregister_weapon_runtime(self, npc: NPC):
+        """Stop ticking a replaced or deleted server-side weapon script."""
+        self._weapon_runtimes.pop(npc.id, None)
+
     async def load_scripts(self, scripts_path: Path):
         """
         Load NPC script classes from Python files.

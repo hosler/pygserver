@@ -322,11 +322,11 @@ class GS1Host(Host):
     def _broadcast_tiles(self, level, x, y, width, height):
         if self.server is None or not hasattr(level, "_tiles"):
             return
-        tiles = bytearray()
-        level_width = int(getattr(level, "WIDTH", LEVEL_SIZE))
+        from ..protocol.packets import PacketBuilder
+        tiles = PacketBuilder()
         for row in range(y, y + height):
-            start = (row * level_width + x) * 2
-            tiles += bytes(level._tiles[start:start + width * 2])
+            for column in range(x, x + width):
+                tiles.write_gshort(level.get_tile(column, row))
         try:
             from ..protocol.packets import build_board_modify, build_board_modify2
             world = getattr(self.server, "world", None)
@@ -338,11 +338,11 @@ class GS1Host(Host):
             if gmap_info:
                 _, map_x, map_y = gmap_info
                 packet = build_board_modify2(
-                    map_x, map_y, x, y, width, height, bytes(tiles)
+                    map_x, map_y, x, y, width, height, tiles.build()
                 )
             else:
                 packet = build_board_modify(
-                    x, y, width, height, bytes(tiles)
+                    x, y, width, height, tiles.build()
                 )
             _schedule(self.server.broadcast_to_level(
                 level.name, packet))

@@ -282,10 +282,13 @@ class TestLargeFileTransferWireFormat:
         mock_server = MagicMock()
         rc = RCManager(mock_server)
         player = MagicMock()
+        player.send_raw = AsyncMock()
         player.id = 1
         player.account_name = "admin"
         
-        session = RCSession(player=player, rights=PLPERM.SETATTRIBUTES)
+        session = RCSession(
+            player=player, rights=PLPERM.SETATTRIBUTES,
+            file_browser_active=True)
 
         payload = b"myfile.txt"
 
@@ -303,10 +306,13 @@ class TestLargeFileTransferWireFormat:
         mock_server = MagicMock()
         rc = RCManager(mock_server)
         player = MagicMock()
+        player.send_raw = AsyncMock()
         player.id = 1
         player.account_name = "admin"
         
-        session = RCSession(player=player, rights=PLPERM.SETATTRIBUTES)
+        session = RCSession(
+            player=player, rights=PLPERM.SETATTRIBUTES,
+            file_browser_active=True)
 
         payload = b"nonexistent.txt"
 
@@ -328,10 +334,13 @@ class TestLargeFileTransferWireFormat:
         
         rc = RCManager(mock_server)
         player = MagicMock()
+        player.send_raw = AsyncMock()
         player.id = 1
         player.account_name = "admin"
         
-        session = RCSession(player=player, rights=PLPERM.SETATTRIBUTES)
+        session = RCSession(
+            player=player, rights=PLPERM.SETATTRIBUTES,
+            file_browser_active=True)
         session.file_browser_path = ""
 
         # Start file upload
@@ -361,10 +370,13 @@ class TestLargeFileTransferWireFormat:
         
         rc = RCManager(mock_server)
         player = MagicMock()
+        player.send_raw = AsyncMock()
         player.id = 1
         player.account_name = "admin"
         
-        session = RCSession(player=player, rights=PLPERM.SETATTRIBUTES)
+        session = RCSession(
+            player=player, rights=PLPERM.SETATTRIBUTES,
+            file_browser_active=True)
         session.file_browser_path = "uploads"
 
         async def main():
@@ -383,6 +395,7 @@ class TestLargeFileTransferWireFormat:
         mock_server = MagicMock()
         rc = RCManager(mock_server)
         player = MagicMock()
+        player.send_raw = AsyncMock()
         
         session = RCSession(player=player, rights=0)
 

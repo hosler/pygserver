@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 
-from reborn_protocol.coords import LEVEL_SIZE, level_index
+from reborn_protocol.coords import LEVEL_SIZE
 from reborn_protocol.gs1.values import to_num, to_str
 
 from ..execution import _schedule
@@ -93,10 +93,11 @@ def _c_updateboard(self, a, npc, player, ctx):
     h = max(0, min(LEVEL_SIZE - y, int(to_num(a[3]))))
     if w == 0 or h == 0:
         return
-    tiles = bytearray()
+    from ...protocol.packets import PacketBuilder
+    tiles = PacketBuilder()
     for row in range(y, y + h):
-        start = level_index(x, row) * 2
-        tiles += bytes(lvl._tiles[start:start + w * 2])
+        for column in range(x, x + w):
+            tiles.write_gshort(lvl.get_tile(column, row))
     try:
         from ...protocol.packets import build_board_modify, build_board_modify2
         world = getattr(self.server, "world", None)
@@ -108,10 +109,10 @@ def _c_updateboard(self, a, npc, player, ctx):
         if gmap_info:
             _, map_x, map_y = gmap_info
             packet = build_board_modify2(
-                map_x, map_y, x, y, w, h, bytes(tiles)
+                map_x, map_y, x, y, w, h, tiles.build()
             )
         else:
-            packet = build_board_modify(x, y, w, h, bytes(tiles))
+            packet = build_board_modify(x, y, w, h, tiles.build())
         _schedule(self.server.broadcast_to_level(
             lvl.name, packet))
     except Exception:

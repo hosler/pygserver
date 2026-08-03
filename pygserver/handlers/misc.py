@@ -41,13 +41,9 @@ class MiscHandlers:
         if len(tile_data) < expected_size:
             return
 
-        idx = 0
         for ty in range(y, y + h):
             for tx in range(x, x + w):
-                if idx + 1 < len(tile_data):
-                    tile_id = tile_data[idx] | (tile_data[idx + 1] << 8)
-                    self.level.set_tile(tx, ty, tile_id)
-                    idx += 2
+                self.level.set_tile(tx, ty, reader.read_gshort())
 
         # Broadcast modification to other players on level
         from ..protocol.packets import build_board_modify, build_board_modify2

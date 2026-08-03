@@ -35,9 +35,10 @@ from .handlers import (
 from .player_login import LoginService
 from .player_session import PlayerSession
 from .player_state import Character, Identity, Inventory, Status
-from .protocol.constants import PLO, PLPROP
+from .protocol.constants import PLI, PLO, PLPROP
 from .protocol.packets import (
     PacketBuilder,
+    PacketReader,
     build_player_props,
     build_other_player_props,
     build_warp,
@@ -91,6 +92,13 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
         # Packet ids that reached neither a handler nor the RC/NC ranges. Kept
         # so "the server ignored that" is visible instead of silent.
         self._unhandled_packet_ids: Set[int] = set()
+
+        # PLI_RAWDATA announces that the next packet is length-framed binary
+        # data rather than newline-framed text. Keep this state on the
+        # connection because the announcement and raw packet may arrive in
+        # separate decoded bundles.
+        self._raw_packet_size: Optional[int] = None
+        self._raw_packet_data = bytearray()
 
     # =========================================================================
     # Connection lifecycle
@@ -195,7 +203,7 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
         self._buffer.add_data(data)
 
         for packet_data in self._buffer.get_packets():
-            decrypted = self._codec.decode_packet(packet_data)
+            decrypted = self.session.decode_packet(packet_data)
             if not decrypted:
                 continue
 
@@ -205,6 +213,22 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
         """Handle decoded packet data (may contain multiple packets)."""
         pos = 0
         while pos < len(data):
+            if self._raw_packet_size is not None:
+                needed = self._raw_packet_size - len(self._raw_packet_data)
+                take = min(needed, len(data) - pos)
+                self._raw_packet_data.extend(data[pos:pos + take])
+                pos += take
+                if len(self._raw_packet_data) < self._raw_packet_size:
+                    break
+
+                packet_bytes = bytes(self._raw_packet_data)
+                self._raw_packet_size = None
+                self._raw_packet_data.clear()
+                if packet_bytes:
+                    await self._dispatch_packet(
+                        packet_bytes[0] - 32, packet_bytes[1:])
+                continue
+
             # Find newline
             newline = data.find(b'\n', pos)
             if newline == -1:
@@ -220,41 +244,52 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
             packet_id = packet_bytes[0] - 32
             packet_body = packet_bytes[1:] if len(packet_bytes) > 1 else b""
 
-            # Dispatch to a registered game-client handler first. The RC/NC
-            # packet id ranges below overlap ordinary PLI ids (e.g.
-            # PLI_PROFILEGET=80/PLI_PROFILESET=81 both fall inside 51-98), so
-            # checking the ranges first hijacked those packets and made the
-            # registered _handle_profile_get/_handle_profile_set handlers
-            # unreachable for game clients.
-            handler = self._handlers.get(packet_id)
-            if handler:
-                try:
-                    await handler(packet_body)
-                except Exception as e:
-                    logger.error(f"Packet handler error (id={packet_id}): {e}")
+            if packet_id == PLI.RAWDATA:
+                reader = PacketReader(packet_body)
+                self._raw_packet_size = reader.read_gint3()
+                self._raw_packet_data.clear()
                 continue
 
-            # Check for RC/NC packets
-            if packet_id >= 51 and packet_id <= 98:
-                # RC packet
-                if hasattr(self.server, 'rc_manager'):
-                    await self.server.rc_manager.handle_packet(self, packet_id, packet_body)
-                continue
-            elif packet_id >= 103 and packet_id <= 119:
-                # NC packet
-                if hasattr(self.server, 'nc_manager'):
-                    await self.server.nc_manager.handle_packet(self, packet_id, packet_body)
-                continue
-            elif packet_id in [150, 151]:
-                # NC level list packets
-                if hasattr(self.server, 'nc_manager'):
-                    await self.server.nc_manager.handle_packet(self, packet_id, packet_body)
-                continue
+            await self._dispatch_packet(packet_id, packet_body)
 
-            if packet_id not in self._unhandled_packet_ids:
-                self._unhandled_packet_ids.add(packet_id)
-                logger.debug(
-                    f"Player {self.id}: no handler for packet id {packet_id}")
+    async def _dispatch_packet(self, packet_id: int, packet_body: bytes):
+        """Dispatch one fully framed packet."""
+
+        # Dispatch to a registered game-client handler first. The RC/NC
+        # packet id ranges below overlap ordinary PLI ids (e.g.
+        # PLI_PROFILEGET=80/PLI_PROFILESET=81 both fall inside 51-98), so
+        # checking the ranges first hijacked those packets and made the
+        # registered _handle_profile_get/_handle_profile_set handlers
+        # unreachable for game clients.
+        handler = self._handlers.get(packet_id)
+        if handler:
+            try:
+                await handler(packet_body)
+            except Exception as e:
+                logger.error(f"Packet handler error (id={packet_id}): {e}")
+            return
+
+        # Check for RC/NC packets
+        if packet_id >= 51 and packet_id <= 98:
+            # RC packet
+            if hasattr(self.server, 'rc_manager'):
+                await self.server.rc_manager.handle_packet(self, packet_id, packet_body)
+            return
+        elif packet_id >= 103 and packet_id <= 119:
+            # NC packet
+            if hasattr(self.server, 'nc_manager'):
+                await self.server.nc_manager.handle_packet(self, packet_id, packet_body)
+            return
+        elif packet_id in [150, 151]:
+            # NC level list packets
+            if hasattr(self.server, 'nc_manager'):
+                await self.server.nc_manager.handle_packet(self, packet_id, packet_body)
+            return
+
+        if packet_id not in self._unhandled_packet_ids:
+            self._unhandled_packet_ids.add(packet_id)
+            logger.debug(
+                f"Player {self.id}: no handler for packet id {packet_id}")
 
     # =========================================================================
     # Level transitions

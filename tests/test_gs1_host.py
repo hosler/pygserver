@@ -11,6 +11,7 @@ import pytest
 
 from pygserver.combat import CarryObjectSprite
 from pygserver.gs1.host import GS1Host, _PELTWITH_TYPE, _SHOTBY_SOURCE
+from pygserver.level import Level
 from pygserver.npc import NPC, NPCManager
 from pygserver.gs1_host import compile_gs1, run_npc_event
 
@@ -903,8 +904,7 @@ def test_updateboard_broadcasts_region():
         class Server:
             async def broadcast_to_level(self, name, packet, *a, **k):
                 sent.append(packet)
-        level = FakeLevel()
-        level._tiles = bytearray(8192)
+        level = Level("test.nw")
         npc = make_npc("if (created) { updateboard 0,0,4,4; }", level)
         run_npc_event(npc, "created", Server(), None)
         await asyncio.sleep(0)

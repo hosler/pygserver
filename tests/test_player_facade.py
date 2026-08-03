@@ -175,10 +175,11 @@ def test_login_service_is_attached_to_its_player():
 
 # -- login handshake (both verification paths) ------------------------------
 
-def login_frame(username="hosler", password="pw", protocol="G3D0311C"):
+def login_frame(username="hosler", password="pw", protocol="G3D0311C",
+                client_type=0):
     """The client's first packet: 2-byte length + plain zlib body."""
     body = (PacketBuilder()
-            .write_gchar(PLTYPE.CLIENT)
+            .write_gchar(client_type)
             .write_gchar(7)                     # encryption key
             .write_string(protocol)
             .write_gstring(username)

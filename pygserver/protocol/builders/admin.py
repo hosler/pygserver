@@ -1,7 +1,7 @@
 """Packet construction helpers."""
 
 import logging
-from typing import List, Tuple
+from typing import Any, List, Mapping, Sequence
 
 from ..packet_codec import PacketBuilder
 from ..constants import (
@@ -42,19 +42,45 @@ def build_rc_folder_config(config: str) -> bytes:
     return builder.build()
 
 
-def build_rc_server_flags(flags: str) -> bytes:
-    """Build PLO_RC_SERVERFLAGSGET packet."""
+def build_rc_server_flags(flags: Mapping[str, Any]) -> bytes:
+    """Build PLO_RC_SERVERFLAGSGET with counted ``name=value`` entries."""
     builder = PacketBuilder().write_gchar(PLO.RC_SERVERFLAGSGET)
-    builder.write_string(flags)
+    builder.write_gshort(len(flags))
+    for name, value in flags.items():
+        builder.write_gstring(f"{name}={value}")
     builder.write_newline()
     return builder.build()
 
 
-def build_rc_player_props(account: str, props: str) -> bytes:
-    """Build PLO_RC_PLAYERPROPSGET packet."""
+def build_rc_player_props(player_id: int, account: str, props: bytes,
+                          flags: Mapping[str, Any] = None,
+                          chests: Sequence[Any] = (),
+                          weapons: Sequence[str] = ()) -> bytes:
+    """Build PLO_RC_PLAYERPROPSGET in ``getPropsForRCPacket`` layout."""
     builder = PacketBuilder().write_gchar(PLO.RC_PLAYERPROPSGET)
+    builder.write_gshort(player_id)
     builder.write_gstring(account)
-    builder.write_string(props)
+    builder.write_gstring("main")
+    builder.write_gchar(len(props)).write_bytes(props)
+
+    flags = flags or {}
+    builder.write_gshort(len(flags))
+    for name, value in flags.items():
+        builder.write_gstring(f"{name}={value}"[:223])
+
+    builder.write_gshort(len(chests))
+    for chest in chests:
+        if isinstance(chest, Mapping):
+            level, x, y = chest["level"], chest["x"], chest["y"]
+        else:
+            level, x, y = chest
+        encoded_level = level.encode("latin-1")
+        builder.write_gchar(len(encoded_level) + 2)
+        builder.write_gchar(x).write_gchar(y).write_bytes(encoded_level)
+
+    builder.write_gchar(len(weapons))
+    for weapon in weapons:
+        builder.write_gstring(weapon)
     builder.write_newline()
     return builder.build()
 
@@ -77,13 +103,12 @@ def build_rc_player_comments(account: str, comments: str) -> bytes:
     return builder.build()
 
 
-def build_rc_player_ban(account: str, banned: bool, reason: str, length: str) -> bytes:
+def build_rc_player_ban(account: str, banned: bool, reason: str) -> bytes:
     """Build PLO_RC_PLAYERBANGET packet."""
     builder = PacketBuilder().write_gchar(PLO.RC_PLAYERBANGET)
     builder.write_gstring(account)
     builder.write_gchar(1 if banned else 0)
-    builder.write_gstring(reason)
-    builder.write_gstring(length)
+    builder.write_string(reason)
     builder.write_newline()
     return builder.build()
 
@@ -97,28 +122,66 @@ def build_rc_account_list(accounts: List[str]) -> bytes:
     return builder.build()
 
 
-def build_rc_account_get(account: str, props: str) -> bytes:
+def build_rc_account_get(account: str, email: str = "", banned: bool = False,
+                         load_only: bool = False, ban_length: str = "",
+                         ban_reason: str = "") -> bytes:
     """Build PLO_RC_ACCOUNTGET packet."""
     builder = PacketBuilder().write_gchar(PLO.RC_ACCOUNTGET)
     builder.write_gstring(account)
-    builder.write_string(props)
+    builder.write_gstring("")
+    builder.write_gstring(email)
+    builder.write_gchar(1 if banned else 0)
+    builder.write_gchar(1 if load_only else 0)
+    builder.write_gchar(0)
+    builder.write_gstring("main")
+    builder.write_gstring(ban_length)
+    builder.write_gstring(ban_reason)
     builder.write_newline()
     return builder.build()
 
 
-def build_rc_file_browser_dir(path: str, files: List[Tuple[str, int, int]]) -> bytes:
-    """Build PLO_RC_FILEBROWSER_DIRLIST packet.
+def build_rc_file_browser_dir_list(folders: Sequence[str]) -> bytes:
+    """Build PLO_RC_FILEBROWSER_DIRLIST with a force-quoted CSV payload."""
+    payload = ','.join(
+        '"' + folder.replace('"', '""') + '"'
+        for folder in folders
+    )
+    return (PacketBuilder().write_gchar(PLO.RC_FILEBROWSER_DIRLIST)
+            .write_string(payload).write_newline().build())
+
+
+def build_rc_file_browser_dir(path: str, files: Sequence[Any],
+                              rights: str = "rw") -> bytes:
+    """Build PLO_RC_FILEBROWSER_DIR with length-prefixed file blocks.
 
     Args:
         path: Current directory path
-        files: List of (filename, size, modtime) tuples
+        files: FileInfo objects or (filename, size, modtime) tuples
+        rights: Rights string attached to each regular file
     """
-    builder = PacketBuilder().write_gchar(PLO.RC_FILEBROWSER_DIRLIST)
+    builder = PacketBuilder().write_gchar(PLO.RC_FILEBROWSER_DIR)
     builder.write_gstring(path)
-    for filename, size, modtime in files:
-        builder.write_gstring(filename)
-        builder.write_gint5(size)
-        builder.write_gint5(modtime)
+    for file_info in files:
+        if hasattr(file_info, "name"):
+            filename = file_info.name
+            size = file_info.size
+            modtime = int(file_info.modified_time)
+            is_directory = file_info.is_directory
+        else:
+            filename, size, modtime = file_info
+            is_directory = False
+
+        # The reference wildcard listing omits directories.  Keep them usable
+        # in this hierarchical browser by marking their names with a trailing
+        # slash and encoding them as zero-sized, read-only file blocks.
+        entry_rights = "r" if is_directory else rights
+        if is_directory and not filename.endswith("/"):
+            filename += "/"
+        entry = PacketBuilder().write_gstring(filename)
+        entry.write_gstring(entry_rights).write_gint5(size).write_gint5(modtime)
+        entry_data = entry.build()
+        builder.write_string(" ").write_gchar(len(entry_data))
+        builder.write_string(entry_data.decode("latin-1"))
     builder.write_newline()
     return builder.build()
 
@@ -144,10 +207,20 @@ def build_rc_max_upload_filesize(size: int) -> bytes:
 # =============================================================================
 
 def build_nc_level_list(levels: List[str]) -> bytes:
-    """Build PLO_NC_LEVELLIST packet."""
+    """Build PLO_NC_LEVELLIST packet.
+
+    The body is ONE gtokenized (comma-separated) list, not a sequence of
+    length-prefixed strings: the reference builds `"name\\n"` per level and
+    sends `ret.gtokenize()` (GServer-v2 PlayerNCPackets.cpp:723). The weapon
+    list two packets over IS length-prefixed (`>> (char)len << name`,
+    PlayerNCPackets.cpp:565), which is what this builder used to copy - so a
+    client that decodes the reference form read the whole list as one row
+    with the length bytes stuck to the front of each name.
+    """
+    from ...irc import gtokenize      # local: irc is above the protocol layer
+
     builder = PacketBuilder().write_gchar(PLO.NC_LEVELLIST)
-    for level in levels:
-        builder.write_gstring(level)
+    builder.write_string(gtokenize(levels))
     builder.write_newline()
     return builder.build()
 
@@ -243,5 +316,3 @@ def build_nc_weapon_get(name: str, image: str, script: str) -> bytes:
     builder.write_string(script)
     builder.write_newline()
     return builder.build()
-
-

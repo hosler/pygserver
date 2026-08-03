@@ -34,7 +34,7 @@ def parse_login_packet(data: bytes) -> dict:
     Parse login packet from client.
 
     Login packet format (after zlib decompression):
-    [client_type+32][encryption_key+32][protocol_string:8bytes]
+    [client_type+32][encryption_key+32 if generation > 3][protocol_string:8bytes]
     [username_len+32][username][password_len+32][password]
     [build_len+32][build]?[client_info]
 
@@ -43,9 +43,19 @@ def parse_login_packet(data: bytes) -> dict:
     """
     reader = PacketReader(data)
 
+    client_type = reader.read_gchar()
+    # RC (bit index 1) and NC (bit index 3) negotiate generation 2 before the
+    # rest of the login is read, so neither puts a key byte on the wire. Keep
+    # CLIENT (0) and all other types on the established generation-5 path:
+    # this server only supports 6.037 game clients, and guessing at legacy
+    # CLIENT behavior here would risk shifting their working login packets.
+    encryption_generation = 2 if client_type in (1, 3) else 5
+
     result = {
-        'client_type': reader.read_gchar(),
-        'encryption_key': reader.read_gchar(),
+        'client_type': client_type,
+        'encryption_generation': encryption_generation,
+        'encryption_key': (reader.read_gchar()
+                           if encryption_generation > 3 else 0),
         'protocol': reader.read_string(8),
         'username': reader.read_gstring(),
         'password': reader.read_gstring(),

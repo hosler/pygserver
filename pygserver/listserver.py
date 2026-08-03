@@ -443,11 +443,10 @@ class ServerListClient:
 
     async def _handle_verify_account(self, reader: PacketReader):
         """Handle account verification response."""
-        account_len = reader.read_gchar()
-        account = reader.read_bytes(account_len).decode('latin1')
+        account = reader.read_gstring()
         player_id = reader.read_gshort()
         player_type = reader.read_gchar()
-        message = reader.read_string(reader.bytes_left()).decode('latin1')
+        message = reader.remaining().decode('latin1', errors='ignore')
 
         # Find the player
         player = self.server.players.get(player_id)

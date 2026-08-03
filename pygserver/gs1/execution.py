@@ -5,7 +5,8 @@ import logging
 
 from reborn_protocol.gs1.runtime import Context, VarStore
 from reborn_protocol.gs1.interp import Interpreter
-from reborn_protocol.gs1.parser import parse
+from reborn_protocol.gs1.lexer import tokenize
+from reborn_protocol.gs1.parser import Parser, parse
 
 logger = logging.getLogger(__name__)
 
@@ -24,11 +25,19 @@ def _schedule(coro):
         return False
 
 
-def compile_gs1(code: str):
+def compile_gs1(code: str, raise_errors: bool = False):
     """Parse GS1 source into a Program AST (None on hard failure)."""
     try:
+        if raise_errors:
+            parser = Parser(tokenize(code))
+            program = parser.parse_program()
+            if parser.errors:
+                raise parser.errors[0]
+            return program
         return parse(code)
     except Exception:
+        if raise_errors:
+            raise
         logger.warning("failed to parse GS1 NPC script", exc_info=True)
         return None
 
@@ -218,6 +227,9 @@ def run_npc_event(npc, event: str, server=None, player=None, source=None,
     except Exception as e:
         from .host import _report_gs1_error
         _report_gs1_error(f"event {event} on npc {getattr(npc, 'id', '?')}", e)
+        error_handler = getattr(npc, "_gs1_error_handler", None)
+        if error_handler is not None:
+            error_handler(str(e))
         _flush_event_players(ctx, player)
         return ctx
     if not resumable.done:

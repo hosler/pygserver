@@ -317,9 +317,26 @@ def test_updateboard_sends_the_requested_rows():
     broadcasts = asyncio.run(main())
     assert len(broadcasts) == 1
     packet = broadcasts[0][1]
-    # PLO_BOARDMODIFY: 1 id + 4 gchar header, then the tiles little-endian in
-    # row-major order from (3, 2), then the terminator.
-    assert packet[5:13] == bytes([10, 0, 11, 0, 12, 0, 13, 0])
+    # Hand-decode the reference GSHORT layout without using a client codec.
+    encoded = packet[5:13]
+    tiles = [((encoded[i] - 32) << 7) + encoded[i + 1] - 32
+             for i in range(0, len(encoded), 2)]
+    assert tiles == [10, 11, 12, 13]
+
+
+def test_tiles_assignment_broadcasts_a_gshort_tile():
+    async def main():
+        server = FakeServer()
+        level = server.add_level("t.nw")
+        npc = make_npc("if (created) { tiles[12,12] = 314; }", level)
+        run_npc_event(npc, "created", server, None)
+        await asyncio.sleep(0)
+        return server.broadcasts[0][1]
+
+    packet = asyncio.run(main())
+    encoded = packet[5:7]
+    tile_id = ((encoded[0] - 32) << 7) + encoded[1] - 32
+    assert tile_id == 314
 
 
 def test_updateboard_clamps_the_region_to_the_board():

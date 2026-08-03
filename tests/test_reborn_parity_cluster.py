@@ -73,16 +73,11 @@ class TestValuelessFlags:
 
 class TestBoardModifyPackets:
     @staticmethod
-    def _payload(x=3, y=4, width=1, height=1, tile=0x1234):
-        return (
-            PacketBuilder()
-            .write_gchar(x)
-            .write_gchar(y)
-            .write_gchar(width)
-            .write_gchar(height)
-            .write_bytes(tile.to_bytes(2, "little"))
-            .build()
-        )
+    def _payload(x=3, y=4, width=1, height=1, tile=314):
+        # Construct the reference layout by hand: four offset GCHAR values,
+        # followed by one two-byte 7-bit short.
+        return bytes((x + 32, y + 32, width + 32, height + 32,
+                      (tile >> 7) + 32, (tile & 0x7f) + 32))
 
     def test_plain_level_uses_level_local_packet(self):
         level = Level("plain.nw")
@@ -90,6 +85,8 @@ class TestBoardModifyPackets:
         player = make_player(server, 1, level)
 
         asyncio.run(player._handle_board_modify(self._payload()))
+
+        assert level.get_tile(3, 4) == 314
 
         packet = server.broadcast_to_level.await_args.args[1]
         reader = PacketReader(packet)

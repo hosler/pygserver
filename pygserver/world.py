@@ -245,3 +245,45 @@ class World:
     def get_all_levels(self) -> List[Level]:
         """Get all loaded levels."""
         return self._level_manager.get_all_levels()
+
+    async def reload_level(self, name: str) -> Level:
+        """Reload one cached level in place while retaining its players."""
+        level = self.get_level(name)
+        if level is None:
+            raise FileNotFoundError(f"level not found: {name}")
+        if not level.file_path:
+            raise ValueError(f"level has no file path: {name}")
+
+        data = Path(level.file_path).read_bytes()
+        replacement = Level(level.name)
+        replacement.file_path = level.file_path
+        replacement._parse_nw_file(data)
+
+        if self.server.npc_manager:
+            for npc in list(level.get_npcs()):
+                if getattr(npc, 'file_defined', False):
+                    # A live file-defined NPC disappears immediately when its
+                    # definition is removed; runtime-created NPCs stay alive.
+                    level.remove_npc(npc)
+                    self.server.npc_manager._npcs.pop(npc.id, None)
+        if self.server.item_manager:
+            self.server.item_manager._chests.pop(level.name, None)
+        if self.server.baddy_manager:
+            self.server.baddy_manager._baddies.pop(level.name, None)
+
+        level._tiles = replacement._tiles
+        level._links = replacement._links
+        level._signs = replacement._signs
+        level._chests = replacement._chests
+        level._baddies = replacement._baddies
+        level._npc_defs = replacement._npc_defs
+        level._unsupported_features = replacement._unsupported_features
+        await self.server._register_level_features(level)
+        return level
+
+    async def reload_levels(self) -> List[Level]:
+        """Reload every cached level in place."""
+        reloaded = []
+        for level in list(self.get_all_levels()):
+            reloaded.append(await self.reload_level(level.name))
+        return reloaded
