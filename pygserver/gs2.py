@@ -21,13 +21,13 @@ setScript(), server/src/scripting/ScriptClass.cpp setScript()).
 
 import logging
 import os
-import shutil
-import subprocess
 import tempfile
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+
+from reborn_protocol.gs2.compiler import Gs2Compiler as GS2Compiler, find_compiler
 
 from .protocol.packets import (
     build_gani_script,
@@ -111,58 +111,6 @@ def split_clientside(source: str) -> Tuple[str, str]:
     if end_of_line == -1:
         return minified[:sep].strip(), ''
     return minified[:sep].strip(), minified[end_of_line + 1:].strip()
-
-
-# =============================================================================
-# Compiler
-# =============================================================================
-
-def find_compiler() -> Optional[str]:
-    """Locate the gs2test binary: $GS2TEST_BIN, the sibling reborn-protocol
-    checkout's cached build, or PATH. None if there isn't a runnable one."""
-    repo_root = Path(__file__).resolve().parents[2]
-    candidates = [
-        os.environ.get("GS2TEST_BIN"),
-        str(repo_root / "reborn-protocol" / "tests" / "tools" / "gs2test"),
-        shutil.which("gs2test"),
-    ]
-    for candidate in candidates:
-        if candidate and Path(candidate).is_file() and os.access(candidate, os.X_OK):
-            return candidate
-    return None
-
-
-class GS2Compiler:
-    """Wrapper around the gs2test binary. Absent binary = compile() returns None."""
-
-    def __init__(self, binary: Optional[str] = None):
-        self.binary = binary if binary is not None else find_compiler()
-
-    @property
-    def available(self) -> bool:
-        return self.binary is not None
-
-    def compile(self, source: str, name: str = "script") -> Optional[bytes]:
-        if not self.available or not source.strip():
-            return None
-        with tempfile.TemporaryDirectory(prefix="pygserver-gs2-") as tmp:
-            src_path = Path(tmp) / "in.gs2"
-            out_path = Path(tmp) / "out.gs2bc"
-            src_path.write_text(source, encoding='latin-1', errors='replace')
-            try:
-                proc = subprocess.run(
-                    [self.binary, str(src_path), "-o", str(out_path)],
-                    capture_output=True, text=True, timeout=30)
-            except (OSError, subprocess.SubprocessError) as e:
-                logger.warning(f"GS2 compile of {name} failed to run: {e}")
-                return None
-            if proc.returncode != 0 or not out_path.exists():
-                # Not an error condition: a GS1 clientside half is expected to
-                # fail here and is served as text instead. The caller counts.
-                logger.debug(f"GS2 compile of {name} failed: "
-                             f"{(proc.stderr or proc.stdout).strip()[:300]}")
-                return None
-            return out_path.read_bytes()
 
 
 # =============================================================================
