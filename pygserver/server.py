@@ -246,8 +246,12 @@ class GameServer:
         if levels_path.exists():
             logger.info(f"Loading levels from {levels_path}")
 
-            # Load individual levels
-            for level_file in levels_path.glob("*.nw"):
+            # Load individual levels, including nested folders (the
+            # reference indexes level dirs recursively - FileSystem.cpp:91).
+            # Only .nw files load eagerly; other suffixes resolve on demand.
+            for level_file in sorted(self.world._level_manager.level_paths().values()):
+                if level_file.suffix.lower() != '.nw':
+                    continue
                 try:
                     level = Level.load(str(level_file))
                     self.world.add_level(level)

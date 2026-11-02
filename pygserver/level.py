@@ -8,6 +8,7 @@ tiles, NPCs, items, signs, and links.
 import logging
 import os
 import tempfile
+import time
 from typing import TYPE_CHECKING, Optional, List, Dict, Tuple
 from pathlib import Path
 
@@ -507,9 +508,63 @@ class LevelManager:
     Manages level loading and caching.
     """
 
+    LEVEL_SUFFIXES = ('.nw', '.graal', '.zelda')
+
+    # Minimum spacing between directory rescans triggered by lookup misses.
+    # PLI_ADJACENTLEVEL hands client-chosen names to get_level, so a miss
+    # must stay cheap instead of walking the whole tree every time.
+    RESCAN_INTERVAL = 5.0
+
     def __init__(self, levels_dir: str = "levels"):
         self.levels_dir = levels_dir
         self._levels: Dict[str, Level] = {}
+        self._paths: Optional[Dict[str, Path]] = None
+        self._last_scan = 0.0
+
+    def level_paths(self, refresh: bool = False) -> Dict[str, Path]:
+        """Map bare level file names to paths, searching subdirectories.
+
+        Real worlds keep levels in nested folders (e.g. levels/playerbase/
+        room0.nw) and scripts/links name them by file name alone; the
+        reference indexes its level folders recursively (GServer-v2
+        server/src/filesystem/FileSystem.cpp:91). First occurrence wins on
+        duplicate names, in sorted path order, so lookups are deterministic.
+        """
+        if self._paths is None or refresh:
+            paths: Dict[str, Path] = {}
+            root = Path(self.levels_dir)
+            if root.is_dir():
+                for path in sorted(root.rglob('*')):
+                    if path.is_file() and path.suffix.lower() in self.LEVEL_SUFFIXES:
+                        if path.name in paths:
+                            logger.warning(
+                                f"Duplicate level name {path.name}: using "
+                                f"{paths[path.name]}, ignoring {path}")
+                            continue
+                        paths[path.name] = path
+            self._paths = paths
+            self._last_scan = time.monotonic()
+        return self._paths
+
+    def find_level_path(self, name: str) -> Optional[Path]:
+        """Resolve a level name (with or without extension) to its file."""
+        if not name or '/' in name or '\\' in name or name.startswith('.'):
+            return None
+        paths = self.level_paths()
+        candidates = [name] + [f"{name}{ext}" for ext in self.LEVEL_SUFFIXES]
+        for candidate in candidates:
+            path = paths.get(candidate)
+            if path is not None:
+                return path
+        # A level added after startup: rescan before giving up, but never
+        # more often than RESCAN_INTERVAL so repeated misses stay cheap.
+        if time.monotonic() - self._last_scan >= self.RESCAN_INTERVAL:
+            paths = self.level_paths(refresh=True)
+            for candidate in candidates:
+                path = paths.get(candidate)
+                if path is not None:
+                    return path
+        return None
 
     def get_level(self, name: str) -> Optional[Level]:
         """
@@ -525,22 +580,12 @@ class LevelManager:
         if name in self._levels:
             return self._levels[name]
 
-        # Try to load
-        level_path = Path(self.levels_dir) / name
-        if level_path.exists():
-            level = Level.load(str(level_path))
-            self._levels[name] = level
-            return level
-
-        # Try without extension
-        for ext in ['.nw', '.graal', '.zelda']:
-            level_path = Path(self.levels_dir) / f"{name}{ext}"
-            if level_path.exists():
-                level = Level.load(str(level_path))
-                self._levels[name] = level
-                return level
-
-        return None
+        level_path = self.find_level_path(name)
+        if level_path is None:
+            return None
+        level = Level.load(str(level_path))
+        self._levels[name] = level
+        return level
 
     def add_level(self, level: Level):
         """Add a level to the cache."""
