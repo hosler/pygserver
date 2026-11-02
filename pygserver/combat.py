@@ -20,6 +20,7 @@ from .audience import (
     FIRESPY_HIT_PLAYERS,
 )
 from .protocol.constants import PLO, PLPROP
+from reborn_protocol import PLSTATUS
 from .protocol.packets import (
     PacketBuilder,
     build_bomb_add,
@@ -114,12 +115,14 @@ class Arrow:
     y: float
     direction: int  # 0=up, 1=left, 2=down, 3=right
     created_at: float = field(default_factory=time.time)
-    speed: float = 8.0  # Tiles per second
+    speed: float = 20.0  # TClient.cpp:3653: DOUBLE_004023d8 = 1 tile/50ms tick
+    max_distance: float = 128.0  # GServer Level.cpp:2629
+    distance: float = 0.0
 
     @property
     def expired(self) -> bool:
-        """Check if arrow has traveled max distance (about 2 seconds)."""
-        return time.time() - self.created_at >= 2.0
+        """Check whether flight has reached the travel cap (6.4s at 20 Hz)."""
+        return self.distance >= self.max_distance
 
 
 @dataclass
@@ -177,7 +180,8 @@ class CombatManager:
         self.arrow_damage = 1  # Half hearts
         self.bomb_base_damage = 2  # Half hearts per power level
         self.sword_damage = [0, 1, 2, 3, 4]  # Damage by sword power level
-        self.respawn_time = 3.0  # Seconds
+        # Deviation from FourPlay TPlayer.cpp:2166: bots need automatic revival.
+        self.respawn_time = 3.0  # Fallback when no revival input arrives.
 
         # Invincibility tracking (player_id -> expire_time)
         self._invincible: Dict[int, float] = {}
@@ -496,10 +500,11 @@ class CombatManager:
         }
 
         dx, dy = dir_vectors.get(arrow.direction, (0, 0))
-        move_speed = arrow.speed * 0.05  # Per tick (50ms)
+        move_speed = min(arrow.speed * 0.05, arrow.max_distance - arrow.distance)
 
         arrow.x += dx * move_speed
         arrow.y += dy * move_speed
+        arrow.distance += move_speed
 
         # Check wall collision. Use the level's own bounds instead of a bare
         # 64 (Level.WIDTH/HEIGHT today, but this is the source of truth) and
@@ -623,6 +628,10 @@ class CombatManager:
             damage_type: Type of damage source
             attacker_id: ID of attacking player (if any)
         """
+        # A life ends once, even after the hit invincibility has expired.
+        if player.hearts <= 0 or getattr(player, 'client_status', 0) & PLSTATUS.DEAD:
+            return
+
         # Check invincibility
         if player.id in self._invincible:
             if time.time() < self._invincible[player.id]:
@@ -670,6 +679,11 @@ class CombatManager:
             killer_id: ID of killing player (if any)
             damage_type: How the player died
         """
+        if getattr(player, 'pending_revive', None):
+            return
+        # Identity also prevents an old fallback from reviving a later life.
+        revival = object()
+        player.pending_revive = revival
         logger.info(f"Player {player.id} ({player.nickname}) died")
 
         # Update stats
@@ -691,34 +705,40 @@ class CombatManager:
         # Respawn after delay. Keep a strong reference in self._respawn_tasks
         # (see comment on that attribute) so the task can't be garbage
         # collected before it fires.
-        task = asyncio.create_task(self._respawn_player(player))
+        task = asyncio.create_task(self._respawn_player(player, revival))
         self._respawn_tasks.add(task)
         task.add_done_callback(self._respawn_tasks.discard)
 
-    async def _respawn_player(self, player: 'Player'):
-        """
-        Respawn a player after death.
-
-        Args:
-            player: Player to respawn
-        """
+    async def _respawn_player(self, player: 'Player', revival):
+        """Fallback for clients that send no revival props within three seconds."""
         await asyncio.sleep(self.respawn_time)
+        if getattr(player, 'pending_revive', None) is revival:
+            await self.revive_player(player)
 
+    async def revive_player(self, player: 'Player'):
+        """Restore and warp a pending life once, for input and timer revival."""
+        if not getattr(player, 'pending_revive', None):
+            return
+        # Claim revival before any await so input and fallback cannot both run.
+        player.pending_revive = None
         if not player.connected:
             return
 
-        # Restore health and tell the client (CURPOWER = hearts * 2), so it
-        # leaves the death state instead of staying locked at 0 hearts.
         player.hearts = player.max_hearts
-        await player.send_props({PLPROP.CURPOWER: int(player.hearts * 2)})
-
-        # Warp to spawn point
+        player.client_status = getattr(player, 'client_status', 0) & ~PLSTATUS.DEAD
+        # Give both revival paths the same three-second protection window.
+        self.set_invincible(player.id, 3.0)
+        await player.send_props({
+            PLPROP.CURPOWER: int(player.hearts * 2),
+            PLPROP.STATUS: player.client_status,
+        })
+        # Revival input calls loadStartLevel(false) (TPlayer.cpp:2166).
         await player.warp(
             self.server.config.start_level,
             self.server.config.start_x,
             self.server.config.start_y
         )
-
+        self.set_invincible(player.id, 3.0)
         logger.info(f"Player {player.id} respawned")
 
     async def handle_fire_spy(self, player: 'Player', x: float, y: float):

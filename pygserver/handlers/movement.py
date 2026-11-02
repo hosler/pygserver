@@ -2,6 +2,8 @@
 
 import logging
 
+from reborn_protocol import PLSTATUS
+
 from ..protocol.constants import PLI, PLO, PLPROP
 from ..protocol.packets import (
     PacketReader,
@@ -61,6 +63,7 @@ class MovementHandlers:
     async def _handle_player_props(self, data: bytes):
         """Handle PLI_PLAYERPROPS packet."""
         props = parse_player_props(data)
+        pending_revive = getattr(self, 'pending_revive', None)
 
         # Update position
         if PLPROP.X2 in props:
@@ -141,6 +144,11 @@ class MovementHandlers:
             self.hearts = new_hearts
             if new_hearts <= 0 and was_alive and hasattr(self.server, 'combat_manager'):
                 await self.server.combat_manager.handle_player_death(self)
+
+        if PLPROP.STATUS in props:
+            self.client_status = props[PLPROP.STATUS]
+            if pending_revive and not self.client_status & PLSTATUS.DEAD:
+                await self.server.combat_manager.revive_player(self)
 
         # Relay the parts of the update other players can see.
         if self.level:

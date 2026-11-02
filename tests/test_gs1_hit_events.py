@@ -258,7 +258,7 @@ def test_arrow_hits_npc_fires_wasshot_with_shotbyplayer_flag():
         server._players[1] = shooter
 
         arrow = Arrow(id=1, player_id=1, level_name=level.name,
-                      x=10.0, y=10.0, direction=2)
+                      x=10.0, y=9.0, direction=2)  # TClient.cpp:3653: DOUBLE_004023d8 = 1 tile/tick
         await server.combat_manager._update_arrow(arrow, level)
 
         assert target.gs1_scopes["this"]["shot"] == 1.0
