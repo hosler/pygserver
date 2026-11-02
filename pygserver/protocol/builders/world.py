@@ -197,9 +197,12 @@ def build_npc_weapon_add_scripted(weapon_name: str, image: str,
 
 
 def build_npc_weapon_del(weapon_name: str) -> bytes:
-    """Build PLO_NPCWEAPONDEL packet."""
+    """Build PLO_NPCWEAPONDEL with a raw trailing weapon name.
+
+    Reference: GServer-v2/server/src/player/Player.cpp:1150.
+    """
     builder = PacketBuilder().write_gchar(PLO.NPCWEAPONDEL)
-    builder.write_gstring(weapon_name)
+    builder.write_string(weapon_name)
     builder.write_newline()
     return builder.build()
 

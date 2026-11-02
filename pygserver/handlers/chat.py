@@ -3,6 +3,7 @@
 import logging
 
 from ..protocol.constants import PLI
+from ..trigger_commands import dispatch_trigger_command
 from ..protocol.packets import (
     PacketReader,
     build_chat,
@@ -137,9 +138,12 @@ class CommunicationHandlers:
         npc_id = reader.read_gint3()
         x = reader.read_gchar() / 2.0
         y = reader.read_gchar() / 2.0
-        action = reader.remaining().decode('latin-1', errors='replace').strip()
+        action = reader.remaining().decode('latin-1', errors='replace')
 
         logger.debug(f"Trigger action at ({x}, {y}): {action}")
+
+        if await dispatch_trigger_command(self.server, self, action):
+            return
 
         # Handle serverside triggers
         handled = False

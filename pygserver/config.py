@@ -62,9 +62,20 @@ class ServerConfig:
     sword_limit: int = 3
     shield_limit: int = 3
     heal_swords: bool = False
+    heart_limit: int = 3  # GServer-v2/server/include/Server.h:166.
     # Client PLI_PUTNPC is opt-in, matching the reference server's
     # get<bool>(...).value_or(false).
     putnpc_enabled: bool = False
+
+    # Builtin triggeractions (GServer-v2/server/include/Server.h:143-150).
+    triggerhack_weapons: bool = False
+    triggerhack_groups: bool = True
+    triggerhack_guilds: bool = False
+    triggerhack_rc: bool = False
+    triggerhack_levels: bool = False
+    triggerhack_props: bool = False
+    triggerhack_execscript: bool = False
+    triggerhack_files: bool = False
 
     # Ambient world population: number of wandering VillagerNPCs to spawn on
     # the start level at boot (0 disables). See npcs/villager.py.
@@ -117,6 +128,11 @@ class ServerConfig:
                         key, value = line.split('=', 1)
                         key = key.strip().lower()
                         value = value.strip()
+                        # Real serveroptions files annotate numeric/boolean
+                        # values in place (`triggerhack_weapons = true# ...`,
+                        # cf. GServer-v2 server/src/utilities/Settings.cpp:50).
+                        # Free-text options keep their '#' (`name = Server #1`).
+                        scalar = value.split('#', 1)[0].strip()
 
                         if key == 'name':
                             config.name = value
@@ -127,7 +143,7 @@ class ServerConfig:
                         elif key == 'url':
                             config.url = value
                         elif key == 'serverport':
-                            config.port = int(value)
+                            config.port = int(scalar)
                         elif key == 'serverip':
                             config.serverip = value
                         elif key == 'localip':
@@ -135,30 +151,39 @@ class ServerConfig:
                         elif key == 'listip':
                             config.listip = value
                         elif key == 'listport':
-                            config.listport = int(value)
+                            config.listport = int(scalar)
                         elif key == 'staff':
                             config.staff = [s.strip() for s in value.split(',')]
                         elif key == 'noverifylogin':
                             # noverifylogin=true means verify_login=False (don't verify)
-                            config.verify_login = value.lower() != 'true'
+                            config.verify_login = scalar.lower() != 'true'
                         elif key == 'startlevel':
                             config.start_level = value
                         elif key == 'startx':
-                            config.start_x = float(value)
+                            config.start_x = float(scalar)
                         elif key == 'starty':
-                            config.start_y = float(value)
+                            config.start_y = float(scalar)
                         elif key == 'maxplayers':
-                            config.max_players = int(value)
+                            config.max_players = int(scalar)
                         elif key == 'gmaps':
                             config.gmaps = [g.strip() for g in value.split(',') if g.strip()]
                         elif key == 'swordlimit':
-                            config.sword_limit = int(value)
+                            config.sword_limit = int(scalar)
                         elif key == 'shieldlimit':
-                            config.shield_limit = int(value)
+                            config.shield_limit = int(scalar)
                         elif key == 'healswords':
-                            config.heal_swords = value.lower() == 'true'
+                            config.heal_swords = scalar.lower() == 'true'
+                        elif key == 'heartlimit':
+                            config.heart_limit = int(scalar)
                         elif key == 'putnpcenabled':
-                            config.putnpc_enabled = value.lower() == 'true'
+                            config.putnpc_enabled = scalar.lower() == 'true'
+                        elif key in (
+                            'triggerhack_weapons', 'triggerhack_groups',
+                            'triggerhack_guilds', 'triggerhack_rc',
+                            'triggerhack_levels', 'triggerhack_props',
+                            'triggerhack_execscript', 'triggerhack_files',
+                        ):
+                            setattr(config, key, scalar.lower() == 'true')
         except FileNotFoundError:
             pass  # Use defaults
 
@@ -188,6 +213,10 @@ class ServerConfig:
         """Clamp a claimed shield power to `shieldlimit` (floor 0)."""
         return max(0, min(int(power), self.shield_limit))
 
+    def apply_max_hearts(self, hearts: int) -> int:
+        """Apply the reference's heartlimit and hard maximum of 20 hearts."""
+        return max(0, min(int(hearts), self.heart_limit, 20))
+
     def to_file(self, path: str):
         """Save configuration to file."""
         with open(path, 'w') as f:
@@ -201,3 +230,10 @@ class ServerConfig:
             f.write(f"startx = {self.start_x}\n")
             f.write(f"starty = {self.start_y}\n")
             f.write(f"maxplayers = {self.max_players}\n")
+            f.write(f"heartlimit = {self.heart_limit}\n")
+            for key in (
+                'triggerhack_weapons', 'triggerhack_groups',
+                'triggerhack_guilds', 'triggerhack_rc', 'triggerhack_levels',
+                'triggerhack_props', 'triggerhack_execscript', 'triggerhack_files',
+            ):
+                f.write(f"{key} = {str(getattr(self, key)).lower()}\n")

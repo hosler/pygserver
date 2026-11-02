@@ -187,8 +187,24 @@ def _c_triggeraction(self, a, npc, player, ctx):
     if not hasattr(self.server, "handle_trigger_action"):
         return
     x, y = to_num(a[0]), to_num(a[1])
+    action = ",".join(to_str(v) for v in a[2:])
     parts = ["gs1"] + [to_str(v) for v in a[2:]]
-    _schedule(self.server.handle_trigger_action(player, x, y, ",".join(parts)))
+
+    async def _dispatch():
+        # Scripts the reference runs client-side (classic worlds' lobby NPCs:
+        # `triggeraction 0,0,gr.addweapon,-validation;`) run on this server
+        # instead, so their builtin gr.* actions must reach the same
+        # dispatcher PLI_TRIGGERACTION uses (handlers/chat.py).
+        try:
+            from ...trigger_commands import dispatch_trigger_command
+        except ImportError:  # pragma: no cover - packaging guard
+            dispatch_trigger_command = None
+        if dispatch_trigger_command is not None and getattr(self.server, "config", None) is not None:
+            if await dispatch_trigger_command(self.server, player, action):
+                return
+        await self.server.handle_trigger_action(player, x, y, ",".join(parts))
+
+    _schedule(_dispatch())
 
 def _spawn_npc(self, image, script, x, y, ctx):
     lvl = self._level_of(ctx)

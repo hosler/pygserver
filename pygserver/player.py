@@ -82,6 +82,7 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
 
         # Current level
         self.level: Optional['Level'] = None
+        self.group: str = ""  # Stored only; no group level instancing.
 
         # PLI packet id -> bound handler, from the mixins' @handles decorations.
         self._handlers: Dict[int, Any] = {
