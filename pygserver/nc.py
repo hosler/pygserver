@@ -216,14 +216,12 @@ class NCManager:
 
         npc = self.server.npc_manager.get_npc(npc_id)
         if npc:
-            from .gs1_host import compile_gs1
             try:
-                program = compile_gs1(script, raise_errors=True)
+                self.server.npc_manager.attach_gs1(
+                    npc, script, raise_errors=True, fire_created=False)
             except Exception as error:
                 await self._send_compile_error(session, "NPC", str(error))
                 return
-            npc.gs1_program = program
-            npc.gs1_source = script
 
             logger.info(f"NC {session.player.account_name} updated script for NPC {npc_id}")
 

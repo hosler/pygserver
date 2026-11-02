@@ -67,6 +67,10 @@ class ServerConfig:
     # get<bool>(...).value_or(false).
     putnpc_enabled: bool = False
 
+    # Script mode: GServer-v2/server/src/scripting/Script.cpp:430-434;
+    # option name from GServer-v2/bin/servers/default/config/serveroptions.txt:305.
+    serverside: bool = True
+
     # Builtin triggeractions (GServer-v2/server/include/Server.h:143-150).
     triggerhack_weapons: bool = False
     triggerhack_groups: bool = True
@@ -178,6 +182,7 @@ class ServerConfig:
                         elif key == 'putnpcenabled':
                             config.putnpc_enabled = scalar.lower() == 'true'
                         elif key in (
+                            'serverside',
                             'triggerhack_weapons', 'triggerhack_groups',
                             'triggerhack_guilds', 'triggerhack_rc',
                             'triggerhack_levels', 'triggerhack_props',
@@ -232,6 +237,7 @@ class ServerConfig:
             f.write(f"maxplayers = {self.max_players}\n")
             f.write(f"heartlimit = {self.heart_limit}\n")
             for key in (
+                'serverside',
                 'triggerhack_weapons', 'triggerhack_groups',
                 'triggerhack_guilds', 'triggerhack_rc', 'triggerhack_levels',
                 'triggerhack_props', 'triggerhack_execscript', 'triggerhack_files',

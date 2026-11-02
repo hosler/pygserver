@@ -421,9 +421,10 @@ def test_eval_syntax_error_replies_to_caller():
 
 
 def test_nc_npc_script_syntax_error_replies_to_saving_session():
-    npc = SimpleNamespace(id=10001, script='', gs1_program=None, gs1_source='')
-    server = SimpleNamespace(npc_manager=SimpleNamespace(
-        get_npc=lambda npc_id: npc if npc_id == npc.id else None))
+    npc = NPC(10001)
+    server = SimpleNamespace()
+    server.npc_manager = NPCManager(server)
+    server.npc_manager._npcs[npc.id] = npc
     manager = NCManager(server)
     player = SimpleNamespace(account_name='editor', send_raw=AsyncMock())
     session = NCSession(player=player)

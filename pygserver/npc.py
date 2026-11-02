@@ -22,6 +22,28 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# reborn_protocol.props.encode_value(NPC_PROPS[1]) uses two G-encoded
+# length lanes, each at most 223: (223 << 7) + 223, not a 16-bit integer.
+_MAX_CLIENT_SCRIPT_BYTES = 0x705F
+
+
+def split_gs1_script(code: str, npcserver: bool) -> tuple[str, str]:
+    """Split GS1 source using GServer-v2 Script.cpp:415-483 script modes.
+
+    The marker's entire line is discarded with server scripting enabled.
+    Keep internal newlines here; only the packet builder mangles them.
+    StringUtils.h:265-301 also trims the mangled newline character (0xa7).
+    """
+    whitespace = " \t\r\n\v\f\xa7"
+    if not npcserver:
+        return "", code.strip(whitespace)
+    marker = code.find("//#CLIENTSIDE")
+    if marker < 0:
+        return code.strip(whitespace), ""
+    line_end = code.find("\n", marker)
+    client = code[line_end + 1:] if line_end >= 0 else ""
+    return code[:marker].strip(whitespace), client.strip(whitespace)
+
 
 class NPC:
     """
@@ -89,6 +111,7 @@ class NPC:
         # given a slot here (see memory: gs1-python-port, upstream d6c78ef3).
         self.gs1_program: Optional[Any] = None
         self.gs1_source = ""
+        self.client_script: str = ""
         self.gs1_scopes: Dict[str, dict] = {"this": {}, "thiso": {}}
 
         # Server-owned GS1 showimg layers. Only indices 0..199 belong here;
@@ -119,6 +142,7 @@ class NPC:
         # Dirty flag: set when a visible property changes so the manager
         # re-broadcasts this NPC's props to players on the next tick.
         self._dirty = False
+        self._script_dirty = False
 
         # API wrapper for scripts
         self._api: Optional['NPCApi'] = None
@@ -165,8 +189,8 @@ class NPC:
             self._api = NPCApi(self, manager)
         return self._api
 
-    def build_props_packet(self) -> bytes:
-        """Build NPC properties packet."""
+    def build_props_packet(self, *, include_script: bool = True) -> bytes:
+        """Build NPC properties, including the client script for full sends."""
         props = {
             NPCPROP.IMAGE: self.image,
             NPCPROP.X: self.x,
@@ -183,6 +207,17 @@ class NPC:
             NPCPROP.SPRITE: int(self.direction) & 0x03,
             NPCPROP.GLOVEPOWER: self.glove_power,
         }
+        if include_script and self.client_script:
+            script = self.client_script.replace("\n", "\xa7").encode(
+                "latin-1", errors="replace")
+            if len(script) > _MAX_CLIENT_SCRIPT_BYTES:
+                # Unlike GServer-v2 NPC.cpp:675-677 (warning only), truncate
+                # so the encoded length still describes the whole payload.
+                logger.warning(
+                    "Clientside script of NPC %s (%s) exceeds %s bytes; truncating",
+                    self.id, self.name, _MAX_CLIENT_SCRIPT_BYTES)
+                script = script[:_MAX_CLIENT_SCRIPT_BYTES]
+            props[NPCPROP.SCRIPT] = script.decode("latin-1")
         if self.gani:
             props[NPCPROP.GANI] = self.gani
         if self.nickname:
@@ -589,15 +624,26 @@ class NPCManager:
         api = npc.get_api(self)
         await npc.trigger_event('on_created', api)
 
-    def attach_gs1(self, npc: NPC, code: str):
-        """Compile a GS1 script onto an NPC and fire its 'created' handler."""
+    def attach_gs1(self, npc: NPC, code: str, *, raise_errors: bool = False,
+                   fire_created: bool = True):
+        """Attach both script halves, compiling and running only serverside.
+
+        NC saves use strict compilation and retain the old script on errors;
+        they do not fire a new 'created' event.
+        """
         from .gs1_host import compile_gs1, run_npc_event
-        prog = compile_gs1(code)
-        if prog is None:
-            return
+        config = getattr(self.server, "config", None)
+        server_code, client_code = split_gs1_script(
+            code, getattr(config, "serverside", True))
+        prog = (compile_gs1(server_code, raise_errors=raise_errors)
+                if server_code.strip() else None)
         npc.gs1_program = prog
         npc.gs1_source = code
-        run_npc_event(npc, 'created', self.server, None)
+        npc.client_script = client_code
+        npc._script_dirty = True
+        npc.mark_dirty()
+        if prog is not None and fire_created:
+            run_npc_event(npc, 'created', self.server, None)
 
     def _fire_gs1(self, npc: NPC, event: str, player: Optional['Player'] = None,
                   source: Optional[str] = None, carryobject_type=None):
@@ -748,7 +794,10 @@ class NPCManager:
             if npc._dirty:
                 npc._dirty = False
                 if npc.level:
-                    packet = npc.build_props_packet()
+                    # Movement/appearance updates only carry the script after
+                    # an attachment or NC edit; level-entry sends remain full.
+                    packet = npc.build_props_packet(include_script=npc._script_dirty)
+                    npc._script_dirty = False
                     await self.server.broadcast_to_level(npc.level.name, packet)
 
     async def on_player_enters(self, player: 'Player', level: 'Level'):
