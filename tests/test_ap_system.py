@@ -199,6 +199,10 @@ async def test_pvp_kill_ap_update(enabled, sparring, victim_ap, expected):
     await manager.handle_player_death(victim, killer.id)
     await asyncio.gather(*manager._respawn_tasks)
     assert (killer.ap, killer.ap_counter) == expected
+    if sparring:
+        assert killer.kills == 0
+        killer.send_props.assert_not_awaited()
+        return
     killer.send_props.assert_any_await({PLPROP.KILLSCOUNT: 1})
     if killer.ap != 50:
         killer.send_props.assert_any_await({PLPROP.ALIGNMENT: expected[0]})

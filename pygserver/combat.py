@@ -844,6 +844,28 @@ class CombatManager:
         if player.hearts <= 0:
             await self.handle_player_death(player, attacker_id, damage_type)
 
+    async def credit_kill(self, killer: 'Player', victim: 'Player'):
+        """Credit one killer for the victim's current death."""
+        if killer is victim or getattr(victim, 'kill_credited', False):
+            return
+        # Reserve credit before any await so claims cannot double-count it.
+        victim.kill_credited = True
+        if victim.level and victim.level.is_sparring_zone:
+            # GServer-v2/server/src/player/packets/PlayerClientPackets.cpp:420-462
+            # updates spar ratings here; rating changes are out of scope.
+            return
+        killer.kills += 1
+        await killer.send_props({PLPROP.KILLSCOUNT: killer.kills})
+        # GServer-v2/server/src/player/packets/PlayerClientPackets.cpp:466-487:
+        # kill_penalty in ap_system.py uses the same integer-division AP
+        # formula, zero clamp, victim-AP exemption, and threshold timer.
+        if self.server.config.apsystem:
+            result = kill_penalty(killer.ap, victim.ap, self.server.config.aptime)
+            if result is not None:
+                killer.ap, killer.ap_counter = result
+                await killer.send_props({PLPROP.ALIGNMENT: killer.ap})
+        logger.info(f"  Killed by {killer.nickname}")
+
     async def handle_player_death(self, player: 'Player',
                                    killer_id: Optional[int] = None,
                                    damage_type: DamageType = DamageType.OTHER):
@@ -860,6 +882,7 @@ class CombatManager:
         # Identity also prevents an old fallback from reviving a later life.
         revival = object()
         player.pending_revive = revival
+        player.kill_credited = False
         logger.info(f"Player {player.id} ({player.nickname}) died")
 
         # Update stats
@@ -869,17 +892,7 @@ class CombatManager:
         if killer_id is not None:
             killer = self.server.get_player(killer_id)
             if killer:
-                killer.kills += 1
-                await killer.send_props({PLPROP.KILLSCOUNT: killer.kills})
-                # GServer-v2/server/src/player/packets/PlayerClientPackets.cpp:420-487
-                # applies AP penalties only outside sparring zones.
-                if (self.server.config.apsystem
-                        and not (player.level and player.level.is_sparring_zone)):
-                    result = kill_penalty(killer.ap, player.ap, self.server.config.aptime)
-                    if result is not None:
-                        killer.ap, killer.ap_counter = result
-                        await killer.send_props({PLPROP.ALIGNMENT: killer.ap})
-                logger.info(f"  Killed by {killer.nickname}")
+                await self.credit_kill(killer, player)
 
         # Trigger NPC death event (optional hook).
         npc_mgr = getattr(self.server, 'npc_manager', None)
@@ -905,6 +918,7 @@ class CombatManager:
             return
         # Claim revival before any await so input and fallback cannot both run.
         player.pending_revive = None
+        player.kill_credited = False
         if not player.connected:
             return
 

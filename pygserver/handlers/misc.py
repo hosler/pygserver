@@ -189,8 +189,19 @@ class MiscHandlers:
     @handles(PLI.CLAIMPKER)
     async def _handle_claim_pker(self, data: bytes):
         """Handle PLI_CLAIMPKER packet."""
-        # PK claim system
-        pass
+        killer = self.server.get_player(PacketReader(data).read_gshort())
+        if killer is None or killer is self:
+            return
+        # GServer-v2/server/src/player/packets/PlayerClientPackets.cpp:405-414.
+        killer.flags['playerkiller'] = True
+        # Stricter than the reference, which trusts any claim: require a
+        # pending, uncredited death. Sword kills already credit server-side
+        # in handle_player_death; their victim's follow-up must not count twice.
+        if (not getattr(self, 'pending_revive', None)
+                or getattr(self, 'kill_credited', False)):
+            logger.debug("Ignoring kill claim from player %s: alive or credited", self.id)
+            return
+        await self.server.combat_manager.credit_kill(killer, self)
 
     @handles(PLI.RAWDATA)
     async def _handle_raw_data(self, data: bytes):
