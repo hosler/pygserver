@@ -94,6 +94,8 @@ async def test_sword_kill_then_claim_credits_once(combat):
 
 async def test_sparring_claim_does_not_change_kills_or_ap(combat):
     server, killer, victim = combat
+    killer.session.writer.get_extra_info.return_value = ('192.0.2.1', 10000)
+    victim.session.writer.get_extra_info.return_value = ('192.0.2.2', 20000)
     victim.level.is_sparring_zone = True
     await report_death(server, victim)
     await claim(victim, killer.id)
@@ -101,7 +103,9 @@ async def test_sparring_claim_does_not_change_kills_or_ap(combat):
     assert victim.kill_credited
     assert killer.kills == 0
     assert (killer.ap, killer.ap_counter) == (50, 7)
-    killer.send_props.assert_not_awaited()
+    assert killer.elo_rating > 1500
+    killer.send_props.assert_awaited_once_with({
+        PLPROP.RATING: (killer.elo_rating, killer.elo_deviation)})
 
 
 async def test_revival_allows_credit_for_next_death(combat):

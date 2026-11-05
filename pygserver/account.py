@@ -42,6 +42,9 @@ class Account:
     # Stats
     kills: int = 0
     deaths: int = 0
+    elo_rating: float = 1500.0
+    elo_deviation: float = 350.0
+    last_spar_time: int = 0  # Unix seconds
     online_time: int = 0  # Seconds
 
     # Equipment
@@ -140,6 +143,9 @@ class Account:
             'admin_rights': self.admin_rights,
             'kills': self.kills,
             'deaths': self.deaths,
+            'elo_rating': self.elo_rating,
+            'elo_deviation': self.elo_deviation,
+            'last_spar_time': self.last_spar_time,
             'online_time': self.online_time,
             'head_image': self.head_image,
             'body_image': self.body_image,
@@ -189,6 +195,9 @@ class Account:
         account.admin_rights = data.get('admin_rights', 0)
         account.kills = data.get('kills', 0)
         account.deaths = data.get('deaths', 0)
+        account.elo_rating = data.get('elo_rating', 1500.0)
+        account.elo_deviation = data.get('elo_deviation', 350.0)
+        account.last_spar_time = data.get('last_spar_time', 0)
         account.online_time = data.get('online_time', 0)
         account.head_image = data.get('head_image', 'head19.png')
         account.body_image = data.get('body_image', 'body.png')
@@ -504,6 +513,9 @@ class AccountManager:
         # never exchanged with the player, so every login restarted both at 0.
         player.kills = account.kills
         player.deaths = account.deaths
+        player.elo_rating = account.elo_rating
+        player.elo_deviation = account.elo_deviation
+        player.last_spar_time = account.last_spar_time
         player.flags = account.flags.copy()
         player.gattribs = {i: v for i, v in enumerate(account.gattribs) if v}
         # Weapons must be on the player before complete_login runs, which is
@@ -544,6 +556,9 @@ class AccountManager:
         account.ap_counter = player.ap_counter
         account.kills = player.kills
         account.deaths = player.deaths
+        account.elo_rating = player.elo_rating
+        account.elo_deviation = player.elo_deviation
+        account.last_spar_time = player.last_spar_time
         account.flags = player.flags.copy()
         account.weapons = player.weapons.copy()
 

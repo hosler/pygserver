@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 from reborn_protocol.constants import PLTYPE
 
 from .protocol.constants import PLPROP
+from .spar_rating import decay_deviation
 from .protocol.packets import (
     build_flag_set,
     build_has_npc_server,
@@ -172,6 +173,16 @@ class LoginService:
             await player.disconnect("You do not have NC access.")
             return
 
+        # GServer-v2/server/src/player/PlayerClient.cpp:453-471: whole days
+        # truncate toward zero, and even capped deviation resets the clock.
+        # PlayerClient only, so RC and NC logins leave the rating alone.
+        if connection_type & PLTYPE.ANYCLIENT:
+            now = int(time.time())
+            days = int((now - player.last_spar_time) / 86400)
+            if days != 0:
+                player.elo_deviation = decay_deviation(player.elo_deviation, days)
+                player.last_spar_time = now
+
         await self.send_login_response()
 
         player.logged_in = True
@@ -253,6 +264,7 @@ class LoginService:
             PLPROP.COLORS: player.colors,
             PLPROP.MAGICPOINTS: player.mp,
             PLPROP.ALIGNMENT: player.ap,
+            PLPROP.RATING: (player.elo_rating, player.elo_deviation),
         }
 
         await player.session.send_login_response(build_player_props(props))

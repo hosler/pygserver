@@ -88,6 +88,7 @@ def test_ap_config_defaults_parse_and_write(tmp_path):
 
 def make_player(server, player_id=2):
     player = Player(server, player_id, AsyncMock(), MagicMock())
+    player.session.writer.get_extra_info.return_value = ('192.0.2.1', 12000 + player_id)
     player.logged_in = True
     player.level = Level('test.nw')
     player.send_props = AsyncMock()

@@ -108,6 +108,13 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
     # Connection lifecycle
     # =========================================================================
 
+    @property
+    def remote_ip(self) -> Optional[str]:
+        """Return the peer IP without its port, for sparring checks."""
+        writer = getattr(self.session, 'writer', None)
+        peer = writer.get_extra_info('peername') if writer else None
+        return peer[0] if peer else None
+
     async def run(self):
         """Main player loop - handle packets until disconnect."""
         try:
@@ -596,6 +603,9 @@ _STATE_ALIASES: Dict[str, Tuple[str, str]] = {
     'shield_power': ('character', 'shield_power'),
     'kills': ('character', 'kills'),
     'deaths': ('character', 'deaths'),
+    'elo_rating': ('character', 'elo_rating'),
+    'elo_deviation': ('character', 'elo_deviation'),
+    'last_spar_time': ('character', 'last_spar_time'),
     'head_image': ('character', 'head_image'),
     'body_image': ('character', 'body_image'),
     'sword_image': ('character', 'sword_image'),

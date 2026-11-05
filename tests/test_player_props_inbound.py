@@ -252,6 +252,32 @@ def test_kill_and_death_counts_survive_a_server_restart(tmp_path):
     assert (fresh.kills, fresh.deaths) == (3, 2)
 
 
+def test_spar_ratings_survive_a_server_restart(tmp_path):
+    from pygserver.account import AccountManager
+
+    manager = AccountManager(MagicMock(), str(tmp_path))
+    account = manager.create_account('tester')
+    _server, player = make_player()
+    player.elo_rating = 1662.212158203125
+    player.elo_deviation = 290.2302551269531
+    player.last_spar_time = 1700000000
+    try:
+        manager.save_player_to_account(player, account)
+    finally:
+        manager._save_executor.shutdown(wait=True)
+
+    restarted = AccountManager(MagicMock(), str(tmp_path))
+    try:
+        reloaded = restarted.get_account('tester')
+        _server, fresh = make_player()
+        restarted.load_player_from_account(fresh, reloaded)
+        for value in (reloaded, fresh):
+            assert (value.elo_rating, value.elo_deviation, value.last_spar_time) == (
+                player.elo_rating, player.elo_deviation, player.last_spar_time)
+    finally:
+        restarted._save_executor.shutdown(wait=True)
+
+
 def test_the_players_weapon_list_is_not_shared_with_the_account(tmp_path):
     """_save_account snapshots to_dict() on the caller's thread but writes on
     the executor thread, so the player must never hold the same list object the

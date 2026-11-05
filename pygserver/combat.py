@@ -18,6 +18,7 @@ from .audience import (
     FIRESPY_HIT_PLAYERS,
 )
 from .ap_system import kill_penalty
+from .spar_rating import glicko_update
 from .tiletypes import get_tile_type
 from .protocol.constants import PLO, PLPROP
 from reborn_protocol import PLSTATUS
@@ -852,7 +853,23 @@ class CombatManager:
         victim.kill_credited = True
         if victim.level and victim.level.is_sparring_zone:
             # GServer-v2/server/src/player/packets/PlayerClientPackets.cpp:420-462
-            # updates spar ratings here; rating changes are out of scope.
+            if self.server.config.dontupdateratingd:
+                return
+            if killer.remote_ip == victim.remote_ip:
+                return
+            old_loser = (victim.elo_rating, victim.elo_deviation)
+            old_winner = (killer.elo_rating, killer.elo_deviation)
+            win_rating, win_dev, lose_rating, lose_dev = glicko_update(
+                *old_loser, *old_winner)
+            killer.elo_rating, killer.elo_deviation = win_rating, win_dev
+            victim.elo_rating, victim.elo_deviation = lose_rating, lose_dev
+            if old_loser != (lose_rating, lose_dev):
+                await victim.send_props({PLPROP.RATING: (lose_rating, lose_dev)})
+            if old_winner != (win_rating, win_dev):
+                await killer.send_props({PLPROP.RATING: (win_rating, win_dev)})
+            now = int(time.time())
+            victim.last_spar_time = now
+            killer.last_spar_time = now
             return
         killer.kills += 1
         await killer.send_props({PLPROP.KILLSCOUNT: killer.kills})

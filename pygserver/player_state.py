@@ -53,6 +53,9 @@ class Character:
         # Combat stats
         self.kills = 0
         self.deaths = 0
+        self.elo_rating = 1500.0
+        self.elo_deviation = 350.0
+        self.last_spar_time = 0
 
         # Appearance
         self.head_image = "head19.png"

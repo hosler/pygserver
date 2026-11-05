@@ -59,6 +59,7 @@ class ServerConfig:
 
     # GServer-v2/server/include/Server.h:173-174 (thresholds in seconds).
     apsystem: bool = True
+    dontupdateratingd: bool = False
     aptime: List[int] = field(default_factory=lambda: [30, 90, 300, 600, 1200])
 
     # Gear power limits. Names and defaults are GServer-v2's own server options
@@ -187,6 +188,8 @@ class ServerConfig:
                             config.heal_swords = scalar.lower() == 'true'
                         elif key == 'heartlimit':
                             config.heart_limit = int(scalar)
+                        elif key == 'dontupdateratingd':
+                            config.dontupdateratingd = scalar.lower() == 'true'
                         elif key == 'apsystem':
                             config.apsystem = scalar.lower() == 'true'
                         elif key in ('aptime0', 'aptime1', 'aptime2', 'aptime3', 'aptime4'):
@@ -249,6 +252,7 @@ class ServerConfig:
             f.write(f"maxplayers = {self.max_players}\n")
             f.write(f"heartlimit = {self.heart_limit}\n")
             f.write(f"apsystem = {str(self.apsystem).lower()}\n")
+            f.write(f"dontupdateratingd = {str(self.dontupdateratingd).lower()}\n")
             for band, seconds in enumerate(self.aptime):
                 f.write(f"aptime{band} = {seconds}\n")
             for key in (
