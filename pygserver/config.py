@@ -57,6 +57,10 @@ class ServerConfig:
     max_players: int = 100
     heartbeat_interval: float = 5.0  # seconds
 
+    # GServer-v2/server/include/Server.h:173-174 (thresholds in seconds).
+    apsystem: bool = True
+    aptime: List[int] = field(default_factory=lambda: [30, 90, 300, 600, 1200])
+
     # Gear power limits. Names and defaults are GServer-v2's own server options
     # (SettingCache declarations, server/include/Server.h:156-158).
     sword_limit: int = 3
@@ -179,6 +183,10 @@ class ServerConfig:
                             config.heal_swords = scalar.lower() == 'true'
                         elif key == 'heartlimit':
                             config.heart_limit = int(scalar)
+                        elif key == 'apsystem':
+                            config.apsystem = scalar.lower() == 'true'
+                        elif key in ('aptime0', 'aptime1', 'aptime2', 'aptime3', 'aptime4'):
+                            config.aptime[int(key[-1])] = int(scalar)
                         elif key == 'putnpcenabled':
                             config.putnpc_enabled = scalar.lower() == 'true'
                         elif key in (
@@ -236,6 +244,9 @@ class ServerConfig:
             f.write(f"starty = {self.start_y}\n")
             f.write(f"maxplayers = {self.max_players}\n")
             f.write(f"heartlimit = {self.heart_limit}\n")
+            f.write(f"apsystem = {str(self.apsystem).lower()}\n")
+            for band, seconds in enumerate(self.aptime):
+                f.write(f"aptime{band} = {seconds}\n")
             for key in (
                 'serverside',
                 'triggerhack_weapons', 'triggerhack_groups',

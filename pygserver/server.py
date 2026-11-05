@@ -13,12 +13,13 @@ from typing import Dict, Optional, Set, List
 from pathlib import Path
 
 from .audience import Audience
+from .ap_system import regen_step
 from .config import ServerConfig
 from .player import Player
 from .level import Level
 from .world import World
 from .npc import NPCManager
-from .protocol.constants import PLTYPE, PLPERM
+from .protocol.constants import PLTYPE, PLPERM, PLPROP, PLSTATUS
 from .protocol.packets import (
     build_flag_del,
     build_flag_set,
@@ -104,6 +105,7 @@ class GameServer:
         # Asyncio server
         self._server: Optional[asyncio.Server] = None
         self._last_heartbeat = 0.0
+        self._last_ap_tick = 0.0
 
     async def start(self):
         """Start the game server."""
@@ -446,6 +448,12 @@ class GameServer:
                     self._last_heartbeat = now
                     await self._send_heartbeat()
 
+                # GServer-v2/server/include/Server.h:537 and
+                # GServer-v2/server/src/Server.cpp:427-435: one player step/s.
+                if now - self._last_ap_tick >= 1.0:
+                    self._last_ap_tick = now
+                    await self._regen_ap()
+
                 # Run NPC timers
                 await self.npc_manager.tick()
 
@@ -456,6 +464,22 @@ class GameServer:
                 break
             except Exception as e:
                 logger.error(f"Main loop error: {e}")
+
+    async def _regen_ap(self):
+        """Advance AP timers for eligible logged-in players."""
+        if not self.config.apsystem:
+            return
+        # GServer-v2/server/src/player/PlayerClient.cpp:239-263.
+        for player in list(self.players.values()):
+            if not player.logged_in or not player.level:
+                continue
+            if (getattr(player, 'client_status', 0) & PLSTATUS.PAUSED
+                    or player.level.is_sparring_zone):
+                continue
+            player.ap, player.ap_counter, changed = regen_step(
+                player.ap, player.ap_counter, self.config.aptime)
+            if changed:
+                await player.send_props({PLPROP.ALIGNMENT: player.ap})
 
     async def _send_heartbeat(self):
         """Send world time heartbeat to all connected players."""

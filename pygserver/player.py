@@ -590,6 +590,7 @@ _STATE_ALIASES: Dict[str, Tuple[str, str]] = {
     'colors': ('character', 'colors'),
     'mp': ('character', 'mp'),
     'ap': ('character', 'ap'),
+    'ap_counter': ('character', 'ap_counter'),
     'gani': ('character', 'gani'),
     'sprite': ('character', 'sprite'),
     'chat': ('character', 'chat'),

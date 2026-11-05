@@ -66,6 +66,7 @@ class Character:
         # ap starts at 50 (neutral on the 0-100 good/evil scale).
         self.mp = 0
         self.ap = 50
+        self.ap_counter = 0
 
         # Animation
         self.gani = "idle"

@@ -66,6 +66,9 @@ class Account:
     shield_power: int = 1
     mp: int = 0        # PLPROP_MAGICPOINTS
     ap: int = 50       # PLPROP_ALIGNMENT (GServer default 50)
+    # GServer-v2/server/src/loader/flatfile/FlatFileAccountLoader.cpp:409-415,656
+    # persists APCOUNTER; GServer-v2/server/include/Account.h:68 defaults to 0.
+    ap_counter: int = 0
 
     # Position
     level_name: str = ""
@@ -147,6 +150,7 @@ class Account:
             'shield_power': self.shield_power,
             'mp': self.mp,
             'ap': self.ap,
+            'ap_counter': self.ap_counter,
             'level_name': self.level_name,
             'x': self.x,
             'y': self.y,
@@ -197,6 +201,7 @@ class Account:
         account.shield_power = data.get('shield_power', 1)
         account.mp = data.get('mp', 0)
         account.ap = data.get('ap', 50)
+        account.ap_counter = data.get('ap_counter', 0)
         account.level_name = data.get('level_name', '')
         account.x = data.get('x', 30.0)
         account.y = data.get('y', 30.0)
@@ -478,6 +483,7 @@ class AccountManager:
         player.shield_power = account.shield_power
         player.mp = account.mp
         player.ap = account.ap
+        player.ap_counter = account.ap_counter
         player.flags = account.flags.copy()
         player.gattribs = {i: v for i, v in enumerate(account.gattribs) if v}
         # Weapons must be on the player before complete_login runs, which is
@@ -515,6 +521,7 @@ class AccountManager:
         account.shield_power = player.shield_power
         account.mp = player.mp
         account.ap = player.ap
+        account.ap_counter = player.ap_counter
         account.flags = player.flags.copy()
         account.weapons = player.weapons.copy()
 

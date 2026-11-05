@@ -640,6 +640,10 @@ class NPCManager:
         npc.gs1_program = prog
         npc.gs1_source = code
         npc.client_script = client_code
+        # Test doubles stand in for Level here, so look the hook up.
+        check_zone = getattr(npc.level, 'check_sparring_zone', None)
+        if check_zone is not None:
+            check_zone(client_code)
         npc._script_dirty = True
         npc.mark_dirty()
         if prog is not None and fire_created:

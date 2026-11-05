@@ -19,6 +19,7 @@ from .audience import (
     BOMB_BLAST_PLAYERS,
     FIRESPY_HIT_PLAYERS,
 )
+from .ap_system import kill_penalty
 from .protocol.constants import PLO, PLPROP
 from reborn_protocol import PLSTATUS
 from .protocol.packets import (
@@ -695,6 +696,14 @@ class CombatManager:
             if killer:
                 killer.kills += 1
                 await killer.send_props({PLPROP.KILLSCOUNT: killer.kills})
+                # GServer-v2/server/src/player/packets/PlayerClientPackets.cpp:420-487
+                # applies AP penalties only outside sparring zones.
+                if (self.server.config.apsystem
+                        and not (player.level and player.level.is_sparring_zone)):
+                    result = kill_penalty(killer.ap, player.ap, self.server.config.aptime)
+                    if result is not None:
+                        killer.ap, killer.ap_counter = result
+                        await killer.send_props({PLPROP.ALIGNMENT: killer.ap})
                 logger.info(f"  Killed by {killer.nickname}")
 
         # Trigger NPC death event (optional hook).

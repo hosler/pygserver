@@ -74,6 +74,7 @@ class Level:
 
         # NPCs on this level
         self._npcs: Dict[int, 'NPC'] = {}
+        self.is_sparring_zone = False
 
         # Level links (warps)
         self._links: List[Dict] = []
@@ -451,6 +452,14 @@ class Level:
         """Add an NPC to this level."""
         self._npcs[npc.id] = npc
         npc.level = self
+        self.check_sparring_zone(npc.client_script)
+
+    def check_sparring_zone(self, client_script: str):
+        """Cache the zone flag when an NPC is added or its script attached."""
+        # GServer-v2/server/src/level/Level.cpp:1563-1566: trim left, then
+        # test the client script prefix. The flag stays set after NPC removal.
+        if client_script.lstrip(' \t\r\n\v\f\xa7').startswith('sparringzone'):
+            self.is_sparring_zone = True
 
     def remove_npc(self, npc: 'NPC'):
         """Remove an NPC from this level."""
