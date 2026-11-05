@@ -315,12 +315,14 @@ def build_default_weapon(item_id: int) -> bytes:
     return builder.build()
 
 
-def build_has_npc_server(has: bool) -> bytes:
-    """Build PLO_HASNPCSERVER packet."""
-    builder = PacketBuilder().write_gchar(PLO.HASNPCSERVER)
-    builder.write_gchar(1 if has else 0)
-    builder.write_newline()
-    return builder.build()
+def build_has_npc_server(has: bool = True) -> bytes:
+    """Build the bare PLO_HASNPCSERVER packet (GServer-v2 Player.cpp:760:
+    `>> (char)PLO_HASNPCSERVER`, no payload). The reference never sends a
+    "no NPC server" form; it simply omits the packet, so `has=False`
+    returns b"" for callers that pass the mode through."""
+    if not has:
+        return b""
+    return PacketBuilder().write_gchar(PLO.HASNPCSERVER).write_newline().build()
 
 
 def build_staff_guilds(guilds: List[str]) -> bytes:

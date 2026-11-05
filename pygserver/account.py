@@ -304,19 +304,20 @@ class AccountManager:
     # Account Operations
     # =========================================================================
 
-    def get_account(self, account_name: str) -> Optional[Account]:
+    def get_account(self, account_name: str, reload: bool = False) -> Optional[Account]:
         """
         Get an account by name.
 
         Args:
             account_name: Account name
+            reload: Refresh from disk, keeping the cached account if loading fails
 
         Returns:
             Account if found, None otherwise
         """
         # Check cache
         name_lower = account_name.lower()
-        if name_lower in self._accounts:
+        if not reload and name_lower in self._accounts:
             return self._accounts[name_lower]
 
         # Try to load from disk
@@ -324,7 +325,7 @@ class AccountManager:
         if account:
             self._accounts[name_lower] = account
 
-        return account
+        return account or self._accounts.get(name_lower)
 
     def create_account(self, account_name: str, password: str = "") -> Account:
         """

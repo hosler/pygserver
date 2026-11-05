@@ -28,6 +28,7 @@ from reborn_protocol.constants import PLTYPE
 from .protocol.constants import PLPROP
 from .protocol.packets import (
     build_flag_set,
+    build_has_npc_server,
     build_player_props,
     build_rc_chat,
     build_rc_max_upload_filesize,
@@ -104,7 +105,16 @@ class LoginService:
 
             account_manager = getattr(server, 'account_manager', None)
             if account_manager:
-                account = account_manager.get_account(player.account_name)
+                account_in_use = any(
+                    other is not player and other.connected
+                    and other.account_name.lower() == player.account_name.lower()
+                    for other in getattr(server, 'players', {}).values()
+                )
+                # QA fixtures restock ammo/reset position on disk between logins.
+                # Refresh idle accounts like GServer-v2/server/src/player/Player.cpp:663-666
+                # and server/src/loader/flatfile/FlatFileAccountLoader.cpp:100-116.
+                account = account_manager.get_account(
+                    player.account_name, reload=not account_in_use)
                 if not account:
                     account = account_manager.create_account(player.account_name)
                 account_manager.load_player_from_account(player, account)
@@ -246,4 +256,11 @@ class LoginService:
         }
 
         await player.session.send_login_response(build_player_props(props))
+        # GServer-v2/server/src/player/Player.cpp:754-760 sends a bare
+        # PLO_HASNPCSERVER only to game clients when an NPC server is present.
+        # pygserver's serverside mode IS that NPC server (server.py
+        # flag_is_public mirrors Server.cpp:1935 for the same reason).
+        if (player.connection_type & PLTYPE.ANYCLIENT
+                and getattr(player.server.config, 'serverside', False)):
+            await player.send_raw(build_has_npc_server(True))
         logger.debug(f"Login response sent for player {player.id}")
