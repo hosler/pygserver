@@ -500,6 +500,10 @@ class AccountManager:
         player.mp = account.mp
         player.ap = account.ap
         player.ap_counter = account.ap_counter
+        # Kill/death counts (PLPROP KILLSCOUNT/DEATHSCOUNT) were serialised but
+        # never exchanged with the player, so every login restarted both at 0.
+        player.kills = account.kills
+        player.deaths = account.deaths
         player.flags = account.flags.copy()
         player.gattribs = {i: v for i, v in enumerate(account.gattribs) if v}
         # Weapons must be on the player before complete_login runs, which is
@@ -538,6 +542,8 @@ class AccountManager:
         account.mp = player.mp
         account.ap = player.ap
         account.ap_counter = player.ap_counter
+        account.kills = player.kills
+        account.deaths = player.deaths
         account.flags = player.flags.copy()
         account.weapons = player.weapons.copy()
 

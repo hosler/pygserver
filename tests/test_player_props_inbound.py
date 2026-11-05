@@ -228,6 +228,30 @@ def test_weapons_survive_a_server_restart(tmp_path):
     assert fresh.weapons == ["qa_gs2vm"]
 
 
+def test_kill_and_death_counts_survive_a_server_restart(tmp_path):
+    """Account.kills/deaths were serialised to JSON but never exchanged with the
+    player, so KILLSCOUNT and DEATHSCOUNT restarted at 0 on every login and a
+    credited kill (combat.credit_kill) lasted one session."""
+    from pygserver.account import AccountManager
+
+    manager = AccountManager(MagicMock(), str(tmp_path))
+    account = manager.create_account("hosler")
+    _server, player = make_player()
+    player.kills = 3
+    player.deaths = 2
+
+    manager.save_player_to_account(player, account)
+    manager._save_executor.shutdown()   # drain the single writer thread
+
+    restarted = AccountManager(MagicMock(), str(tmp_path))
+    reloaded = restarted.get_account("hosler")
+    _server, fresh = make_player()
+    restarted.load_player_from_account(fresh, reloaded)
+
+    assert (reloaded.kills, reloaded.deaths) == (3, 2)
+    assert (fresh.kills, fresh.deaths) == (3, 2)
+
+
 def test_the_players_weapon_list_is_not_shared_with_the_account(tmp_path):
     """_save_account snapshots to_dict() on the caller's thread but writes on
     the executor thread, so the player must never hold the same list object the
