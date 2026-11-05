@@ -15,6 +15,8 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, List, Dict, Any
 
+from .protocol.constants import PLTYPE
+
 if TYPE_CHECKING:
     from .server import GameServer
     from .player import Player
@@ -61,7 +63,11 @@ class Account:
     # no-ops the whole bomb/arrow path.
     bombs: int = 10
     arrows: int = 5
-    glove_power: int = 0
+    # Player GLOVEPOWER is 1-based: 1 = bare hands, 2 = glove1, 3 = glove2
+    # (LevelItem.cpp clamps a glove pickup to >= 2; the funtimes
+    # defaultaccount.txt has GLOVEP 1). The client's liftobj search runs
+    # `0 .. glovepower + 1`, so a stored 0 cannot lift vases/pots.
+    glove_power: int = 1
     sword_power: int = 1
     shield_power: int = 1
     mp: int = 0        # PLPROP_MAGICPOINTS
@@ -196,7 +202,7 @@ class Account:
         # arrows default must match the dataclass/GServer default of 5; a 0
         # here silently disables the whole arrow-relay path for the account.
         account.arrows = data.get('arrows', 5)
-        account.glove_power = data.get('glove_power', 0)
+        account.glove_power = max(1, data.get('glove_power', 1))
         account.sword_power = data.get('sword_power', 1)
         account.shield_power = data.get('shield_power', 1)
         account.mp = data.get('mp', 0)
@@ -409,11 +415,20 @@ class AccountManager:
 
     async def save_all_accounts(self):
         """Save all cached accounts to disk."""
-        count = 0
-        for account in self._accounts.values():
-            self._save_account(account)
-            count += 1
-        logger.debug(f"Saved {count} accounts")
+        saved = set()
+        for player in list(getattr(self.server, 'players', {}).values()):
+            if (not player.logged_in
+                    or not player.connection_type & PLTYPE.ANYCLIENT):
+                continue
+            name = player.account_name.lower()
+            account = self._accounts.get(name)
+            if account is not None:
+                self.save_player_to_account(player, account)
+                saved.add(name)
+        for name, account in self._accounts.items():
+            if name not in saved:
+                self._save_account(account)
+        logger.debug(f"Saved {len(self._accounts)} accounts")
 
     def list_accounts(self) -> List[str]:
         """

@@ -17,3 +17,12 @@ def test_inline_hash_comment_ends_scalar_values_only(tmp_path):
     assert config.heart_limit == 3
     assert config.name == "Server #1"
     assert config.description == "Join #general"
+
+
+def test_villager_count_is_read_from_serveroptions(tmp_path):
+    """villager_count is a pygserver-only option (config.py); the loader
+    must honour it so a world can tone down the start-level crowd."""
+    from pygserver.config import ServerConfig
+    path = tmp_path / "serveroptions.txt"
+    path.write_text("name = x\nvillager_count = 2# two is plenty\n")
+    assert ServerConfig.from_file(str(path)).villager_count == 2

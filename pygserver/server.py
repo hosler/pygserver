@@ -19,6 +19,7 @@ from .player import Player
 from .level import Level
 from .world import World
 from .npc import NPCManager
+from .server_flags import ServerFlags
 from .protocol.constants import PLTYPE, PLPERM, PLPROP, PLSTATUS
 from .protocol.packets import (
     build_flag_del,
@@ -60,7 +61,7 @@ class GameServer:
         self.npc_manager = NPCManager(self)
 
         # Server flags (custom game state)
-        self.server_flags: Dict[str, str] = {}
+        self.server_flags = ServerFlags(self)
         self.flags = self.server_flags  # Alias for compatibility
 
         # Combat system (bombs, arrows, damage)
@@ -106,6 +107,7 @@ class GameServer:
         self._server: Optional[asyncio.Server] = None
         self._last_heartbeat = 0.0
         self._last_ap_tick = 0.0
+        self._last_flag_save = time.monotonic()
 
     async def start(self):
         """Start the game server."""
@@ -142,6 +144,10 @@ class GameServer:
 
         # Stop subsystems
         await self._stop_subsystems()
+        try:
+            self.server_flags.save()
+        except Exception:
+            logger.exception("Failed to save server flags during shutdown")
 
         if self._server:
             self._server.close()
@@ -411,6 +417,9 @@ class GameServer:
 
     async def _remove_player(self, player: Player):
         """Remove a player from the server."""
+        manager = getattr(self, 'combat_manager', None)
+        if manager is not None:
+            manager.discard_held_bomb(player.id)
         if (self.rc_manager and player.logged_in
                 and player.connection_type & PLTYPE.ANYCLIENT):
             await self.rc_manager.notify_player_leave(player.id)
@@ -456,6 +465,13 @@ class GameServer:
 
                 # Run NPC timers
                 await self.npc_manager.tick()
+
+                if time.monotonic() - self._last_flag_save >= 60:
+                    self._last_flag_save = time.monotonic()
+                    try:
+                        self.server_flags.save()
+                    except Exception:
+                        logger.exception("Failed to save server flags")
 
                 # Sleep briefly
                 await asyncio.sleep(0.05)  # 50ms tick rate
@@ -558,13 +574,30 @@ class GameServer:
 
     async def set_flag(self, name: str, value: str):
         """Set server flag value."""
-        self.server_flags[name] = value
-        await self.broadcast_to_all(build_flag_set(name, value))
+        if isinstance(self.server_flags, ServerFlags):
+            self.server_flags.put(name, value, notify=False)
+        else:
+            self.server_flags[name] = value
+        await self._broadcast_flag(name, self.server_flags[name])
 
     async def del_flag(self, name: str):
         """Delete server flag."""
-        self.server_flags.pop(name, None)
-        await self.broadcast_to_all(build_flag_del(name))
+        if isinstance(self.server_flags, ServerFlags):
+            if name in self.server_flags:
+                self.server_flags.remove(name, notify=False)
+        else:
+            self.server_flags.pop(name, None)
+        await self._broadcast_flag(name, None, deleted=True)
+
+    def flag_is_public(self, name: str) -> bool:
+        # GServer-v2 Server.cpp:1939 shares only serverr.* in NPC-server mode.
+        return (not getattr(getattr(self, "config", None), "serverside", False)
+                or name.startswith("serverr."))
+
+    async def _broadcast_flag(self, name, value, deleted=False):
+        if self.flag_is_public(name):
+            packet = build_flag_del(name) if deleted else build_flag_set(name, value)
+            await self.broadcast_to_all(packet)
 
     async def handle_trigger_action(self, player: Player, x: float, y: float, action: str):
         """
@@ -588,7 +621,7 @@ class GameServer:
 
         logger.debug(f"Serverside trigger: {action_type} with params {params}")
 
-        if carrier == "serverside" and self.gs2_manager is not None:
+        if carrier == "serverside" and player is not None and self.gs2_manager is not None:
             weapon = self.gs2_manager.get_weapon(action_type)
             runtime = getattr(weapon, "server_runtime", None)
             if runtime is not None:
@@ -610,7 +643,7 @@ class GameServer:
                           params=params)
             return True
 
-        if carrier != "serverside":
+        if carrier != "serverside" or player is None:
             return False
 
         # Handle common triggers

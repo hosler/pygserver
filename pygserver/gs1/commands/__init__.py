@@ -32,7 +32,7 @@ _NOOP_COMMANDS = (
     "play", "play2", "playlooped", "playsound", "stopmidi", "stopsound",
     "seteffectmode", "setcoloreffect", "setzoomeffect", "seteffect",
     "timereverywhere", "drawunderplayer", "drawoverplayer",
-    "drawaslight", "drawovertrees", "dontblock", "blockagain",
+    "drawaslight", "drawovertrees",
     "dontblocklocal", "blockagainlocal",
     # setimgvis is client-only; the server-owned equivalent is changeimgvis.
     "setimgvis", "putleaps",

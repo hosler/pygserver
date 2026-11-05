@@ -1142,3 +1142,30 @@ def test_player_glovepower_uses_player_wire_scale():
     assert npc.gs1_scopes["this"]["playerpower"] == 2
     assert npc.gs1_scopes["this"]["npcpower"] == 1
     assert npc.glove_power == 1
+
+
+def test_dontblock_and_blockagain_toggle_noblock_wire_flag():
+    from pygserver.protocol.constants import NPCPROP
+    npc = make_npc("if (created) { dontblock; }")
+    run_npc_event(npc, "created", None, FakePlayer())
+    assert npc.block_flags & 0x01
+    assert npc._dirty is True
+    # BLOCKFLAGS (prop 14) rides in the NPC props sent to clients.
+    packet = npc.build_props_packet()
+    assert bytes([NPCPROP.BLOCKFLAGS + 32, 1 + 32]) in packet
+
+    npc.gs1_program = compile_gs1("if (created) { blockagain; }")
+    run_npc_event(npc, "created", None, FakePlayer())
+    assert not npc.block_flags & 0x01
+
+
+def test_blocking_npc_keeps_block_flags_clear():
+    npc = make_npc("if (created) { setimg a.png; }")
+    run_npc_event(npc, "created", None, FakePlayer())
+    assert npc.block_flags == 0
+
+
+def test_new_accounts_start_with_bare_hand_glove_power():
+    from pygserver.account import Account
+    assert Account(account_name="x").glove_power == 1
+    assert Account.from_dict({"account_name": "x", "glove_power": 0}).glove_power == 1

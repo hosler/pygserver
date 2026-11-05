@@ -94,6 +94,10 @@ class CommunicationHandlers:
         """Handle PLI_FLAGSET packet."""
         reader = PacketReader(data)
         flag_data = reader.remaining().decode('latin-1', errors='replace')
+        # GServer-v2 PlayerClientPackets.cpp:652-656 protects clientr.* in NPC-server mode.
+        if (flag_data.partition('=')[0].strip().startswith('clientr.')
+                and getattr(self.server.config, 'serverside', True)):
+            return
         if '=' not in flag_data:
             name = flag_data.strip()
             if name.startswith('server.'):
@@ -119,6 +123,8 @@ class CommunicationHandlers:
     async def _handle_flag_del(self, data: bytes):
         """Handle PLI_FLAGDEL packet."""
         flag_name = data.decode('latin-1', errors='replace').strip()
+        if flag_name.startswith('clientr.'):
+            return
         if flag_name.startswith('server.'):
             await self.server.del_flag(flag_name)
         else:

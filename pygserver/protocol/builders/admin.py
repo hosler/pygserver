@@ -3,6 +3,7 @@
 import logging
 from typing import Any, List, Mapping, Sequence
 
+from ...server_flags import serialize_flag
 from ..packet_codec import PacketBuilder
 from ..constants import (
     PLO
@@ -43,11 +44,13 @@ def build_rc_folder_config(config: str) -> bytes:
 
 
 def build_rc_server_flags(flags: Mapping[str, Any]) -> bytes:
-    """Build PLO_RC_SERVERFLAGSGET with counted ``name=value`` entries."""
+    """Build PLO_RC_SERVERFLAGSGET with counted serialized flag entries."""
+    entries = [serialize_flag(name, value) for name, value in flags.items()]
+    entries = [entry for entry in entries if entry is not None]
     builder = PacketBuilder().write_gchar(PLO.RC_SERVERFLAGSGET)
-    builder.write_gshort(len(flags))
-    for name, value in flags.items():
-        builder.write_gstring(f"{name}={value}")
+    builder.write_gshort(len(entries))
+    for entry in entries:
+        builder.write_gstring(entry)
     builder.write_newline()
     return builder.build()
 

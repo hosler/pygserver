@@ -4,9 +4,11 @@ import asyncio
 import logging
 
 from reborn_protocol.gs1.runtime import Context, VarStore
-from reborn_protocol.gs1.interp import Interpreter
 from reborn_protocol.gs1.lexer import tokenize
 from reborn_protocol.gs1.parser import Parser, parse
+
+from .interpreter import ServerInterpreter
+from .player_flags import PlayerVarStore
 
 logger = logging.getLogger(__name__)
 
@@ -125,18 +127,19 @@ def _bind_fresh_gs1_call(ctx, npc, server, player, event, source,
     GS1Host.get_builtin."""
     sc = npc.gs1_scopes
     level = getattr(npc, "level", None)
-    scopes = {
-        "this": sc["this"], "thiso": sc["thiso"],
-        "local": {}, "temp": {},
-        "client": _lazy(player, "_gs1_client"),
-        "server": _lazy(server, "_gs1_server"),
-        "level": _lazy(level, "_gs1_vars"),
-        "global": _lazy(server, "_gs1_global"),
-    }
     player_flags = getattr(player, "flags", None)
     if player_flags is None:
         player_flags = _lazy(player, "_gs1_flags")
-    ctx.vars = VarStore(scopes=scopes, player_flags=player_flags)
+    scopes = {
+        "this": sc["this"], "thiso": sc["thiso"],
+        "local": {}, "temp": {},
+        "client": player_flags,
+        "server": (server.server_flags if hasattr(server, "server_flags")
+                   else _lazy(server, "_gs1_server")),
+        "level": _lazy(level, "_gs1_vars"),
+        "global": _lazy(server, "_gs1_global"),
+    }
+    ctx.vars = PlayerVarStore(player, scopes=scopes, player_flags=player_flags)
     ctx.this_obj = npc
     ctx.player = player
     ctx.hit_source = source
@@ -223,7 +226,7 @@ def run_npc_event(npc, event: str, server=None, player=None, source=None,
     _bind_fresh_gs1_call(ctx, npc, server, player, event, source,
                          carryobject_type, params)
     try:
-        resumable = Interpreter(ctx).run_event_resumable(prog, event)
+        resumable = ServerInterpreter(ctx).run_event_resumable(prog, event)
     except Exception as e:
         from .host import _report_gs1_error
         _report_gs1_error(f"event {event} on npc {getattr(npc, 'id', '?')}", e)

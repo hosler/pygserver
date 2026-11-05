@@ -35,7 +35,7 @@ class Character:
         self.x = 0.0
         self.y = 0.0
         self.direction = 2  # Down
-        self.carrysprite = 0
+        self.carrysprite = -1
         # Retained until a carried-NPC throw consumes it.  Clients normally
         # clear CARRYNPC separately from sending THROWCARRIED.
         self.npc_id = 0

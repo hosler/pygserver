@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 # self.x/self.y, chat because only a CHANGED value goes out, and gear because it
 # is relayed as a (power, image) pair.
 _RELAYED_PROPS = {
+    PLPROP.CARRYSPRITE: 'carrysprite',
     PLPROP.DIRECTION: 'direction',
     PLPROP.SPRITE: 'sprite',
     PLPROP.GANI: 'gani',

@@ -27,6 +27,7 @@ from reborn_protocol.constants import PLTYPE
 
 from .protocol.constants import PLPROP
 from .protocol.packets import (
+    build_flag_set,
     build_player_props,
     build_rc_chat,
     build_rc_max_upload_filesize,
@@ -176,6 +177,12 @@ class LoginService:
             return
         if is_nc:
             return
+
+        for name, value in list(player.flags.items()):
+            await player.send_raw(build_flag_set(name, value))
+        for name, value in list(getattr(player.server, "server_flags", {}).items()):
+            if player.server.flag_is_public(name):
+                await player.send_raw(build_flag_set(name, value))
 
         gs2 = getattr(player.server, 'gs2_manager', None)
         if gs2 is not None:

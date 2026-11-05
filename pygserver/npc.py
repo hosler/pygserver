@@ -234,6 +234,8 @@ class NPC:
             props[NPCPROP.SHIELDIMAGE] = (self.shield_power, self.shield_image)
         if self.horse_image:
             props[NPCPROP.HORSEIMAGE] = self.horse_image
+        if self.block_flags:
+            props[NPCPROP.BLOCKFLAGS] = self.block_flags
         if getattr(self, 'imagepart', None):
             props[NPCPROP.IMAGEPART] = self.imagepart
         if any(self.colors):
@@ -650,7 +652,7 @@ class NPCManager:
             run_npc_event(npc, 'created', self.server, None)
 
     def _fire_gs1(self, npc: NPC, event: str, player: Optional['Player'] = None,
-                  source: Optional[str] = None, carryobject_type=None):
+                  source: Optional[str] = None, carryobject_type=None, params=None):
         """Run a GS1 event handler on an NPC if it has a GS1 program.
 
         `source` is who/what initiated the hit for events that expose it as
@@ -661,7 +663,7 @@ class NPCManager:
             return
         from .gs1_host import run_npc_event
         run_npc_event(npc, event, self.server, player, source=source,
-                      carryobject_type=carryobject_type)
+                      carryobject_type=carryobject_type, params=params)
 
     async def on_npc_washit(self, npc: NPC, player: Optional['Player'] = None):
         """Fire `washit` on an NPC hit by hitnpc/hitobjects or a player's
@@ -840,21 +842,37 @@ class NPCManager:
 
     async def on_trigger_action(self, player: 'Player', x: float, y: float,
                                 action: str):
-        if not player.level or not action:
+        await self.fire_trigger_at(player.level, x, y, action, player, None)
+
+    async def fire_trigger_at(self, level, x: float, y: float, action_csv: str,
+                              player=None, source_npc=None):
+        """Dispatch a trigger at a point, retaining the caller's player context.
+
+        GServer-v2 Server.cpp:2003-2010 only relays NPC-originated triggers
+        to nearby players. Dispatch to other containing NPCs is our extension;
+        the player-originated NPC dispatch follows the reference behavior.
+        """
+        from .gs2 import parse_csv_tolerant
+        if not level or not action_csv:
             return
-        event = action.split(',', 1)[0].strip()
+        fields = parse_csv_tolerant(action_csv)
+        event = fields[0].strip()
         if not event:
             return
         # Strict containment, matching the reference: triggerDistance there is
         # only a candidate-search radius; the hit test is positionInRectangle
         # against the unexpanded {position, shape} rect (GServer-v2
         # server/include/npcserver/NPCServer.h addEventToLevelNPCsAtPosition).
-        for npc in self.get_npcs_on_level(player.level):
+        for npc in self.get_npcs_on_level(level):
+            if npc is source_npc:
+                continue
             shape = getattr(npc, 'shape', None) or (2, 2)
             width, height = shape[:2]
             if (npc.x <= x <= npc.x + width
                     and npc.y <= y <= npc.y + height):
-                self._fire_gs1(npc, 'action' + event, player)
+                self._fire_gs1(npc, 'action' + event, player,
+                               source='npc' if source_npc is not None else 'player',
+                               params=fields[1:])
 
     async def check_touches(self, player: 'Player'):
         """Fire playertouchsme when the player newly overlaps an NPC.

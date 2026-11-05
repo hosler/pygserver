@@ -180,17 +180,22 @@ def _c_addweapon(self, a, npc, player, ctx):
         logger.debug("addweapon send failed for %s", name, exc_info=True)
 
 def _c_triggeraction(self, a, npc, player, ctx):
-    # triggeraction x,y,action,params... — dispatch a serverside trigger.
-    # handle_trigger_action reads token[1] as the action, so prefix with "gs1".
-    if player is None or self.server is None or len(a) < 3:
+    if self.server is None or len(a) < 3:
         return
-    if not hasattr(self.server, "handle_trigger_action"):
-        return
+    from ...gs2 import to_csv
+    from ...protocol.packets import build_trigger_action
     x, y = to_num(a[0]), to_num(a[1])
-    action = ",".join(to_str(v) for v in a[2:])
-    parts = ["gs1"] + [to_str(v) for v in a[2:]]
+    fields = [to_str(v) for v in a[2:]]
+    action = to_csv(fields)
+    level = getattr(npc, "level", None)
+    npc_id = getattr(npc, "id", 0)
 
     async def _dispatch():
+        # GServer-v2 GS1Commands.cpp:3635 targets only the source player for clientside.
+        if fields[0] == "clientside":
+            if player is not None:
+                await player.send_raw(build_trigger_action(0, 0, 0, 0, action))
+            return
         # Scripts the reference runs client-side (classic worlds' lobby NPCs:
         # `triggeraction 0,0,gr.addweapon,-validation;`) run on this server
         # instead, so their builtin gr.* actions must reach the same
@@ -199,10 +204,20 @@ def _c_triggeraction(self, a, npc, player, ctx):
             from ...trigger_commands import dispatch_trigger_command
         except ImportError:  # pragma: no cover - packaging guard
             dispatch_trigger_command = None
-        if dispatch_trigger_command is not None and getattr(self.server, "config", None) is not None:
+        if (player is not None and dispatch_trigger_command is not None
+                and getattr(self.server, "config", None) is not None):
             if await dispatch_trigger_command(self.server, player, action):
                 return
-        await self.server.handle_trigger_action(player, x, y, ",".join(parts))
+        handler = getattr(self.server, "handle_trigger_action", None)
+        if handler is not None:
+            carrier = action if fields[0] in ("serverside", "servernpc") else "gs1," + action
+            if await handler(player, x, y, carrier):
+                return
+        manager = getattr(self.server, "npc_manager", None)
+        if manager is not None and level is not None:
+            await manager.fire_trigger_at(level, x, y, action, player, npc)
+            await self.server.broadcast_to_level(
+                level.name, build_trigger_action(0, npc_id, x, y, action))
 
     _schedule(_dispatch())
 
@@ -379,10 +394,17 @@ def _make_blockflag_cmd(bit, on):
     def handler(self, a, npc, player, ctx):
         if npc is not None:
             bf = int(getattr(npc, "block_flags", 0) or 0)
-            npc.block_flags = (bf | bit) if on else (bf & ~bit)
+            nf = (bf | bit) if on else (bf & ~bit)
+            if nf != bf:
+                npc.block_flags = nf
+                self._dirty(npc)
     return handler
 
-# NPCBlockFlags: CANBECARRIED=2, CANBEPULLED=4, CANBEPUSHED=8
+# NPCBlockFlags: NOBLOCK=1, CANBECARRIED=2, CANBEPULLED=4, CANBEPUSHED=8
+# dontblock/blockagain toggle NOBLOCK on the wire BLOCKFLAGS prop
+# (GS1Commands.cpp fn_dontblock/fn_blockagain); clients gate NPC collision on it.
+_c_dontblock = _make_blockflag_cmd(0x01, True)
+_c_blockagain = _make_blockflag_cmd(0x01, False)
 _c_canbecarried = _make_blockflag_cmd(0x02, True)
 _c_cannotbecarried = _make_blockflag_cmd(0x02, False)
 _c_canbepulled = _make_blockflag_cmd(0x04, True)
@@ -530,6 +552,8 @@ _COMMANDS = {
     'carryobject': _c_carryobject,
     'throwcarry': _c_throwcarry,
     'takeplayercarry': _c_takeplayercarry,
+    'dontblock': _c_dontblock,
+    'blockagain': _c_blockagain,
     'canbecarried': _c_canbecarried,
     'cannotbecarried': _c_cannotbecarried,
     'canbepulled': _c_canbepulled,

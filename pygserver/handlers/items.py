@@ -27,6 +27,7 @@ class ItemHandlers:
             await self.server.item_manager.spawn_item(
                 self.level, x, y, LevelItemType(item_type),
                 exclude_player_id=self.id,
+                layer=getattr(self, 'layer', 0),
             )
 
     @handles(PLI.ITEMDEL)

@@ -82,14 +82,6 @@ BADDY_DEFAULT_IMAGE = {
     9: "baddydragon.png",
 }
 
-# Drop tables by baddy type
-BADDY_DROPS = {
-    BaddyType.GRAYBALL: [(0, 0.6), (1, 0.3), (4, 0.1)],  # (item_type, probability)
-    BaddyType.REDBALL: [(0, 0.4), (1, 0.4), (4, 0.2)],
-    # Add more as needed
-}
-
-
 @dataclass
 class Baddy:
     """Represents an enemy (baddy) in the world."""
@@ -244,6 +236,14 @@ class BaddyManager:
             for baddy_id, baddy in list(baddies.items()):
                 # Handle dead baddies
                 if baddy.dead:
+                    # GServer-v2 LevelBaddy.cpp:281: DIE lasts two seconds;
+                    # the respawn timeout starts only after entering DEAD.
+                    if baddy.mode == BDMODE.DIE:
+                        if current_time - baddy.death_time >= 2.0:
+                            baddy.mode = BDMODE.DEAD
+                            baddy.death_time = current_time
+                            await self._broadcast_baddy_props(baddy)
+                        continue
                     if self.baddy_respawn_enabled and baddy.respawn_enabled:
                         if current_time - baddy.death_time >= baddy.respawn_time:
                             await self._respawn_baddy(baddy)
@@ -539,9 +539,11 @@ class BaddyManager:
             baddy: Baddy that died
             killer: Player that killed it (if any)
         """
+        if baddy.dead:
+            return
         baddy.dead = True
         baddy.death_time = time.time()
-        baddy.mode = BDMODE.DEAD
+        baddy.mode = BDMODE.DIE
 
         # Broadcast death
         packet = baddy.build_props_packet()
@@ -552,18 +554,15 @@ class BaddyManager:
         # Spawn drop
         level = self.server.world.get_level(baddy.level_name)
         if level and hasattr(self.server, 'item_manager'):
-            drops = BADDY_DROPS.get(baddy.baddy_type, [(0, 0.5)])  # Default: green rupee 50%
-            roll = random.random()
-            cumulative = 0.0
-            for item_type, probability in drops:
-                cumulative += probability
-                if roll < cumulative:
-                    from .protocol.constants import LevelItemType
-                    await self.server.item_manager.spawn_item(
-                        level, baddy.x, baddy.y,
-                        LevelItemType(item_type)
-                    )
-                    break
+            # GServer-v2 LevelBaddy.cpp:93: uniform 0..11; 0..5 map
+            # directly to item IDs, 6..9 are green, 10..11 drop nothing.
+            roll = random.randint(0, 11)
+            if roll < 10:
+                from .protocol.constants import LevelItemType
+                await self.server.item_manager.spawn_item(
+                    level, baddy.x, baddy.y,
+                    LevelItemType(roll if roll <= 5 else 0)
+                )
 
         logger.info(f"Baddy {baddy.id} died, killed by player {killer.id if killer else 'unknown'}")
 

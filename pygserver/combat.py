@@ -14,12 +14,11 @@ from typing import TYPE_CHECKING, Optional, List, Dict, Tuple, Set
 from enum import IntEnum
 
 from .audience import (
-    ARROW_HIT_PLAYERS,
     BOMB_BLAST_NPCS,
-    BOMB_BLAST_PLAYERS,
     FIRESPY_HIT_PLAYERS,
 )
 from .ap_system import kill_penalty
+from .tiletypes import get_tile_type
 from .protocol.constants import PLO, PLPROP
 from reborn_protocol import PLSTATUS
 from .protocol.packets import (
@@ -33,6 +32,8 @@ from .protocol.packets import (
     build_push_away,
     build_throw_carried,
     build_hit_objects,
+    build_board_modify,
+    build_board_modify2,
 )
 
 if TYPE_CHECKING:
@@ -87,6 +88,16 @@ _SPRITE_TO_TYPE = {
     CarryObjectSprite.NPC: CarryObjectType.NPC,
 }
 
+# FourPlay TInitStatics.cpp:1502: bush/lift blocks, in column order.
+_BLAST_BLOCKS = (
+    ((0x02, 0x12, 0x03, 0x13), (0x2a5, 0x2b5, 0x2a6, 0x2b6)),
+    ((0x1a4, 0x1b4, 0x1a5, 0x1b5), (0x2a7, 0x2b7, 0x2a8, 0x2b8)),
+    ((0x200, 0x210, 0x201, 0x211), (0x70a, 0x71a, 0x70b, 0x71b)),
+    ((0x2ac, 0x2bc, 0x2ad, 0x2bd), (0x6ea, 0x6fa, 0x6eb, 0x6fb)),
+    ((0x22, 0x32, 0x23, 0x33), (0x72a, 0x73a, 0x72b, 0x73b)),
+    ((0x3de, 0x3ee, 0x3df, 0x3ef), (0x72a, 0x73a, 0x72b, 0x73b)),
+)
+
 
 @dataclass
 class Bomb:
@@ -99,6 +110,9 @@ class Bomb:
     power: int
     time_left: float  # Seconds until explosion
     created_at: float = field(default_factory=time.time)
+    in_flight: bool = False
+    landing_position: Optional[Tuple[float, float]] = None
+    flight_path: Tuple[Tuple[str, float, float], ...] = ()
 
     @property
     def expired(self) -> bool:
@@ -119,6 +133,13 @@ class Arrow:
     speed: float = 20.0  # TClient.cpp:3653: DOUBLE_004023d8 = 1 tile/50ms tick
     max_distance: float = 128.0  # GServer Level.cpp:2629
     distance: float = 0.0
+    power: int = 1
+    rebound_ticks: int = -1
+
+    @property
+    def size(self) -> Tuple[float, float]:
+        # FourPlay TInitStatics.cpp:1072: sprites 107..110, scaled by 1/16.
+        return (0.625, 1.875) if self.direction % 2 == 0 else (1.875, 0.625)
 
     @property
     def expired(self) -> bool:
@@ -135,6 +156,18 @@ class Explosion:
     power: int
     player_id: int
     level_name: str
+
+
+@dataclass
+class ThrownObject:
+    player: 'Player'
+    level: 'Level'
+    x: float
+    y: float  # Ground position; the rendered sprite follows a separate arc.
+    direction: int
+    carry_type: Optional[CarryObjectType]
+    ticks_left: int = 9  # FourPlay TPlayer.cpp:7831.
+    bomb: Optional[Bomb] = None
 
 
 class CombatManager:
@@ -154,7 +187,9 @@ class CombatManager:
 
         # Active projectiles by level
         self._bombs: Dict[str, Dict[int, Bomb]] = {}  # level_name -> {bomb_id: Bomb}
+        self._held_bombs: Dict[int, Bomb] = {}
         self._arrows: Dict[str, Dict[int, Arrow]] = {}  # level_name -> {arrow_id: Arrow}
+        self._throws: List[ThrownObject] = []
 
         # ID counters
         self._next_bomb_id = 1
@@ -177,9 +212,7 @@ class CombatManager:
         self._thrown_npc_tasks: Set[asyncio.Task] = set()
 
         # Combat settings
-        self.bomb_damage_radius = 2.5  # Tiles
         self.arrow_damage = 1  # Half hearts
-        self.bomb_base_damage = 2  # Half hearts per power level
         self.sword_damage = [0, 1, 2, 3, 4]  # Damage by sword power level
         # Deviation from FourPlay TPlayer.cpp:2166: bots need automatic revival.
         self.respawn_time = 3.0  # Fallback when no revival input arrives.
@@ -249,6 +282,20 @@ class CombatManager:
                     # Move arrow and check collision
                     await self._update_arrow(arrow, level)
 
+        for thrown in list(self._throws):
+            if await self._update_throw(thrown):
+                if thrown in self._throws:
+                    self._throws.remove(thrown)
+                if (thrown.bomb is not None
+                        and self._held_bombs.get(thrown.player.id) is thrown.bomb):
+                    height = 2.375 - .2 * (9 - thrown.ticks_left)
+                    water_x, water_y = math.floor(thrown.x + 1), math.floor(thrown.y - height + 1)
+                    if (0 <= water_x < thrown.level.WIDTH and 0 <= water_y < thrown.level.HEIGHT
+                            and get_tile_type(thrown.level.get_tile(water_x, water_y)) in (11, 12)):
+                        self._held_bombs.pop(thrown.player.id, None)
+                    else:
+                        thrown.bomb.x, thrown.bomb.y = thrown.x, thrown.y - height + 1.5
+
         # Clean up expired invincibility
         expired_invincible = [
             pid for pid, expire in self._invincible.items()
@@ -276,6 +323,32 @@ class CombatManager:
             return None
 
         # Check if player has bombs
+        held = self._held_bombs.get(player.id)
+        points = list(held.flight_path) if held is not None else []
+        if held is not None and (held.in_flight or held.landing_position is not None):
+            points.append((held.level_name, held.x, held.y))
+            if held.landing_position is not None:
+                points.append((held.level_name, *held.landing_position))
+        matches = [(name, bx, by) for name, bx, by in points
+                   if abs(x - bx) <= 1 and abs(y - by) <= 1]
+        if matches:
+            # TServerCarry.cpp:235: placement belongs to the bomb's level,
+            # even when the thrower stayed in the previous segment.
+            destination, _, _ = min(matches, key=lambda point: (
+                point[0] != held.level_name, (x - point[1]) ** 2 + (y - point[2]) ** 2))
+            self._held_bombs.pop(player.id)
+            # TServerCarry.cpp:245: the client reports the landing placement.
+            self._throws[:] = [obj for obj in self._throws if obj.bomb is not held]
+            held.x, held.y = x, y
+            held.level_name = destination
+            held.in_flight = False
+            held.flight_path = ()
+            held.created_at = time.time()
+            self._bombs.setdefault(held.level_name, {})[held.id] = held
+            await self.server.broadcast_to_level(
+                held.level_name, build_bomb_add(player.id, x, y, held.power, held.time_left),
+                exclude={player.id})
+            return held
         if player.bombs <= 0:
             return None
 
@@ -335,15 +408,34 @@ class CombatManager:
         # Find bomb at position
         for bomb_id, bomb in list(self._bombs[level_name].items()):
             if abs(bomb.x - x) < 0.5 and abs(bomb.y - y) < 0.5:
-                # Only owner can pick up
-                if bomb.player_id == player.id:
-                    del self._bombs[level_name][bomb_id]
-                    player.bombs += 1
-                    await player.send_props({PLPROP.BOMBSCOUNT: player.bombs})
-                    logger.debug(f"Player {player.id} picked up bomb at ({x}, {y})")
+                # TPlayer.cpp:1983-2003: any lying bomb can be carried, fuse intact.
+                del self._bombs[level_name][bomb_id]
+                bomb.in_flight = False
+                bomb.landing_position = None
+                bomb.time_left = max(.05, bomb.time_left - (time.time() - bomb.created_at))
+                self._held_bombs[player.id] = bomb
                 break
 
-    async def _detonate_bomb(self, bomb: Bomb):
+    def discard_held_bomb(self, player_id):
+        """Release retained state when its carrier disconnects or warps."""
+        bomb = self._held_bombs.pop(player_id, None)
+        if bomb is not None:
+            self._throws[:] = [obj for obj in self._throws if obj.bomb is not bomb]
+        return bomb
+
+    async def handle_held_bomb_explosion(self, player, x, y):
+        bomb = self.discard_held_bomb(player.id)
+        if bomb is None:
+            return False
+        bomb.x, bomb.y = x, y
+        if not bomb.in_flight:
+            bomb.level_name = player.level.name
+        player.carrysprite = -1
+        await player.send_props({PLPROP.CARRYSPRITE: -1})
+        await self._detonate_bomb(bomb, exclude={player.id})
+        return True
+
+    async def _detonate_bomb(self, bomb: Bomb, exclude=None):
         """
         Detonate a bomb, creating explosion and dealing damage.
 
@@ -354,20 +446,41 @@ class CombatManager:
         if not level:
             return
 
-        radius = self.bomb_damage_radius + (bomb.power * 0.5)
-        damage = self.bomb_base_damage * bomb.power
+        # FourPlay TServerLevel.cpp:1710: power is the type, not the radius.
+        crosses = [(bomb.x, bomb.y, 2)]
+        if bomb.power == 2:
+            crosses = [(bomb.x + dx, bomb.y + dy, 2)
+                       for dx in (-2, 2) for dy in (-2, 2)]
+            crosses.append((bomb.x, bomb.y, 4))
+        # FourPlay TExplosion.cpp:86: types 1/2 hurt half a heart, type 3 one.
+        damage = 2 if bomb.power == 3 else 1
+        # FourPlay TServerLevel.cpp:1624: cells step two tiles along each arm.
+        # putExplosion (1494) has no wall test; even cells beyond walls exist.
+        cells = set()
+        for x, y, radius in crosses:
+            cells.add((x, y))
+            for dx, dy in ((0, -2), (-2, 0), (0, 2), (2, 0)):
+                cells.update((x + dx * n, y + dy * n)
+                             for n in range(1, radius + 1))
 
         await self.server.broadcast_to_level(
-            bomb.level_name, build_bomb_del(bomb.x, bomb.y)
+            bomb.level_name, build_bomb_del(bomb.x, bomb.y),
+            **({'exclude': exclude} if exclude else {})
         )
 
         # Broadcast explosion effect
-        packet = build_explosion(bomb.x, bomb.y, radius, damage)
-        await self.server.broadcast_to_level(bomb.level_name, packet)
+        for x, y, radius in crosses:
+            packet = build_explosion(x, y, radius, bomb.power)
+            await self.server.broadcast_to_level(
+                bomb.level_name, packet, **({'exclude': exclude} if exclude else {}))
+        await self._destroy_blast_blocks(level, cells)
 
-        # Damage players in radius
-        for player in self.server.audience.players_near(
-                bomb.level_name, bomb.x, bomb.y, radius, BOMB_BLAST_PLAYERS):
+        # FourPlay TExplosion.cpp:62: inclusive cell/player centre distances.
+        for player in self.server.audience.players_on_level(bomb.level_name):
+            if not any(abs(ex + 1.0 - (player.x + 1.5)) <= 1.0 and
+                       abs(ey + 1.0 - (player.y + 2.0)) <= 1.0
+                       for ex, ey in cells):
+                continue
             dx = player.x - bomb.x
             dy = player.y - bomb.y
             distance = (dx * dx + dy * dy) ** 0.5
@@ -402,6 +515,37 @@ class CombatManager:
                     await npc_mgr.on_npc_exploded(npc, attacker)
 
         logger.debug(f"Bomb detonated at ({bomb.x}, {bomb.y}) with radius {radius}")
+
+    async def _destroy_blast_blocks(self, level: 'Level', cells):
+        # FourPlay TServerLevel.cpp:1542: replace only complete matching blocks.
+        offsets = ((0, 0), (0, 1), (1, 0), (1, 1))
+        touched = {(math.floor(x + dx + 0.5), math.floor(y + dy + 0.5))
+                   for x, y in cells for dx, dy in offsets}
+        for tx, ty in sorted(touched):
+            for original, replacement in _BLAST_BLOCKS:
+                for index, (ox, oy) in enumerate(offsets):
+                    if level.get_tile(tx, ty) != original[index]:
+                        continue
+                    x, y = tx - ox, ty - oy
+                    if not (0 <= x < level.WIDTH - 1 and
+                            0 <= y < level.HEIGHT - 1):
+                        continue
+                    if tuple(level.get_tile(x + dx, y + dy)
+                             for dx, dy in offsets) != original:
+                        continue
+                    for (dx, dy), tile in zip(offsets, replacement):
+                        level.set_tile(x + dx, y + dy, tile)
+                    builder = PacketBuilder()
+                    for tile in (replacement[0], replacement[2],
+                                 replacement[1], replacement[3]):
+                        builder.write_gshort(tile)
+                    tiles = builder.build()
+                    gmap = self.server.world.get_gmap_for_level(level.name)
+                    if gmap is None:
+                        packet = build_board_modify(x, y, 2, 2, tiles)
+                    else:
+                        packet = build_board_modify2(gmap[1], gmap[2], x, y, 2, 2, tiles)
+                    await self.server.broadcast_to_level(level.name, packet)
 
     async def handle_arrow_add(self, player: 'Player', x: float, y: float,
                                 flags: int, sprite: int = 0,
@@ -467,7 +611,8 @@ class CombatManager:
             level_name=player.level.name,
             x=player.x,
             y=player.y,
-            direction=direction
+            direction=direction,
+            power=power,
         )
 
         # Store arrow
@@ -507,6 +652,14 @@ class CombatManager:
         arrow.y += dy * move_speed
         arrow.distance += move_speed
 
+        if arrow.rebound_ticks >= 0:
+            # FourPlay TServerFlying.cpp:403: an ordinary shield rebound
+            # lasts four further ticks and cannot hurt a player.
+            arrow.rebound_ticks -= 1
+            if arrow.rebound_ticks < 0:
+                self._arrows.get(arrow.level_name, {}).pop(arrow.id, None)
+                return
+
         # Check wall collision. Use the level's own bounds instead of a bare
         # 64 (Level.WIDTH/HEIGHT today, but this is the source of truth) and
         # math.floor instead of int(), which truncates towards zero and would
@@ -520,11 +673,32 @@ class CombatManager:
                 self._arrows[arrow.level_name].pop(arrow.id, None)
             return
 
-        # Check player collision (a ~1-tile box around the arrow; the shooter
-        # is excluded so an arrow can't hit its own owner)
-        for player in self.server.audience.players_near(
-                arrow.level_name, arrow.x, arrow.y, 1.0, ARROW_HIT_PLAYERS,
-                exclude={arrow.player_id}):
+        if arrow.rebound_ticks >= 0:
+            return
+
+        width, height = arrow.size
+        # FourPlay TServerFlying.cpp:135: strict sprite/body rectangle overlap.
+        for player in self.server.audience.players_on_level(
+                arrow.level_name, exclude={arrow.player_id}):
+            if not (arrow.x + width > player.x + 0.5 and
+                    player.x + 2.5 > arrow.x and
+                    arrow.y + height > player.y + 1.0 and
+                    player.y + 3.0 > arrow.y):
+                continue
+            # FourPlay TServerFlying.cpp:141: idle/walk, opposite flight
+            # direction, any positive shield, and projectile power <= 1.
+            shield = getattr(player, 'shield_power', 0)
+            if (getattr(player, 'gani', 'idle') in ('idle', 'walk') and
+                    player.direction == (arrow.direction + 2) % 4 and
+                    shield > 0 and arrow.power <= 1):
+                arrow.direction = (arrow.direction + 2) % 4
+                if shield == 1:
+                    arrow.rebound_ticks = 3
+                else:
+                    # FourPlay TServerFlying.cpp:181: mirror shields reverse
+                    # the flight axis and retain a live projectile.
+                    arrow.player_id = player.id
+                return
             # Hit! Apply damage and remove arrow
             knockback_x = dx * 2
             knockback_y = dy * 2
@@ -644,8 +818,11 @@ class CombatManager:
 
         logger.debug(f"Player {player.id} took {damage/2.0} damage: {old_hearts} -> {player.hearts}")
 
-        # Grant brief invincibility (1 second)
-        self._invincible[player.id] = time.time() + 1.0
+        # Grant invincibility for the classic hurt window: 40 ticks = 2.0 s in
+        # the official client (FourPlay TPlayer::hurtPlayer, TPlayer.cpp:6545;
+        # pyReborn hurt.py HURT_SECONDS). The server window must not be shorter
+        # or a second hit inside the client's immunity still lands.
+        self._invincible[player.id] = time.time() + 2.0
 
         # Send hurt packet to the victim ONLY (GServer-v2 msgPLI_HURTPLAYER,
         # PlayerClientPackets.cpp:811-829, calls victim->sendPacket(...)
@@ -733,7 +910,10 @@ class CombatManager:
         if not player.connected:
             return
 
-        player.hearts = player.max_hearts
+        # TPlayer.cpp:5581: restart HP depends on alignment.
+        ap = getattr(player, 'ap', 50)
+        player.hearts = (3.0 if ap <= 19 else min(player.max_hearts, 5.0)
+                         if ap <= 39 else player.max_hearts)
         player.client_status = getattr(player, 'client_status', 0) & ~PLSTATUS.DEAD
         # Give both revival paths the same three-second protection window.
         self.set_invincible(player.id, 3.0)
@@ -791,26 +971,30 @@ class CombatManager:
             player.level.name, packet, exclude={player.id}
         )
 
-        velocities = ((0.0, -0.85), (-0.85, 0.0),
-                      (0.0, 0.85), (0.85, 0.0))
-        velocity = velocities[int(direction) & 3]
-        x, y = player.x + 0.5, player.y + 1.0
-        carry_type = _SPRITE_TO_TYPE.get(carrysprite)
-        fly_duration = 0
-        hit = False
         npc_mgr = getattr(self.server, 'npc_manager', None)
-        while fly_duration < 10 and not hit:
-            x += velocity[0] * 2
-            y += velocity[1] * 2
-            fly_duration += 2
-            if npc_mgr is not None:
-                for npc in npc_mgr.get_npcs_on_level(player.level):
-                    # A thrown item's search rectangle is 2x2 tiles.
-                    if abs((npc.x + 0.5) - (x + 1.0)) < 1.5 and \
-                            abs((npc.y + 0.5) - (y + 1.0)) < 1.5:
-                        await npc.hurtAndPush(2, velocity, ScriptEventType.WASPELT,
-                                              player, carry_type)
-                        hit = True
+        # FourPlay TServerPlayer.cpp:1067: ground origin for remote throws.
+        thrown = ThrownObject(
+            player, player.level, player.x + 0.5, player.y + 1.0,
+            int(direction) & 3, _SPRITE_TO_TYPE.get(carrysprite)
+        )
+        if player.id in self._held_bombs:
+            thrown.bomb = self._held_bombs.get(player.id)
+            if thrown.bomb is not None:
+                thrown.bomb.in_flight = True
+                # TServerCarry.cpp:237: bomb placement is sprite y + 1.5.
+                path = ThrownObject(player, thrown.level, thrown.x, thrown.y,
+                                    thrown.direction, thrown.carry_type)
+                points = [(path.level.name, path.x, path.y - 2.375 + 1.5)]
+                dx, dy = ((0, -1), (-1, 0), (0, 1), (1, 0))[path.direction]
+                for tick in range(1, 10):
+                    path.x += dx
+                    path.y += dy
+                    path.ticks_left -= 1
+                    self._handoff_throw(path)
+                    points.append((path.level.name, path.x,
+                                   path.y - (2.375 - .2 * tick) + 1.5))
+                thrown.bomb.flight_path = tuple(points)
+        self._throws.append(thrown)
 
         if int(carrysprite) == CarryObjectSprite.NPC:
             npc_id = getattr(player, 'npc_id', 0)
@@ -825,6 +1009,119 @@ class CombatManager:
                 self._thrown_npc_tasks.add(task)
                 task.add_done_callback(self._thrown_npc_tasks.discard)
             player.npc_id = 0
+
+    def _is_throw_wall(self, thrown: ThrownObject) -> bool:
+        level, x, y = self._throw_probe(thrown)
+        tx, ty = math.floor(x + 0.0001), math.floor(y + 0.0001)
+        if not (0 <= tx < level.WIDTH and 0 <= ty < level.HEIGHT):
+            return True
+        # FourPlay TServerLevel.cpp:2655: type 20 bypasses all throw walls.
+        tile_type = get_tile_type(level.get_tile(tx, ty))
+        if tile_type == 20:
+            return False
+        for bomb in self._bombs.get(level.name, {}).values():
+            if bomb.x + 0.25 <= x < bomb.x + 3.0 and bomb.y <= y < bomb.y + 2.0:
+                return True
+        for chest in level.get_chest_defs():
+            if chest['x'] <= x < chest['x'] + 2 and chest['y'] <= y < chest['y'] + 2:
+                return True
+        # FourPlay TServerLevel.cpp:741: blocking tile types, including beds.
+        return tile_type > 19 or tile_type == 4
+
+    def _throw_probe(self, thrown):
+        level, x, y = thrown.level, thrown.x + 1, thrown.y + 1
+        adjacent = getattr(self.server.world, 'get_adjacent_levels', None)
+        if adjacent is None:
+            return level, x, y
+        direction = ('w' if x < 0 else 'e' if x >= level.WIDTH
+                     else 'n' if y < 0 else 's' if y >= level.HEIGHT else None)
+        if direction is None:
+            return level, x, y
+        neighbors = adjacent(level.name)
+        name = neighbors.get(direction) if isinstance(neighbors, dict) else None
+        target = self.server.world.get_level(name) if name else None
+        if target is None:
+            return level, x, y
+        dx, dy = {'w': (-1, 0), 'e': (1, 0), 'n': (0, -1), 's': (0, 1)}[direction]
+        return target, x - dx * level.WIDTH, y - dy * level.HEIGHT
+
+    async def _update_throw(self, thrown: ThrownObject) -> bool:
+        if (thrown.bomb is not None
+                and self._held_bombs.get(thrown.player.id) is not thrown.bomb):
+            return True
+        # FourPlay TServerCarry.cpp:118 and TInitStatics.cpp:1167: one
+        # ground tile per tick; the sprite's vertical arc does not affect hits.
+        dx, dy = ((0, -1), (-1, 0), (0, 1), (1, 0))[thrown.direction]
+        thrown.x += dx
+        thrown.y += dy
+        thrown.ticks_left -= 1
+        handed_off = self._handoff_throw(thrown)
+        if thrown.bomb is not None:
+            if self._held_bombs.get(thrown.player.id) is not thrown.bomb:
+                return True
+            height = 2.375 - .2 * (9 - thrown.ticks_left)
+            thrown.bomb.x, thrown.bomb.y = thrown.x, thrown.y - height
+            thrown.bomb.level_name = thrown.level.name
+            thrown.bomb.landing_position = thrown.x, thrown.y - height + 1.5
+        if handed_off:
+            return False
+        if self._is_throw_wall(thrown):
+            return True
+
+        # Keep server NPC pelt events (GServer-v2 Level.cpp:2715, 2x2 search).
+        hit = False
+        npc_mgr = getattr(self.server, 'npc_manager', None)
+        if npc_mgr is not None:
+            for npc in npc_mgr.get_npcs_on_level(thrown.level):
+                if (getattr(npc, 'visible', True) and
+                        abs((npc.x + 0.5) - (thrown.x + 1.0)) < 1.5 and
+                        abs((npc.y + 0.5) - (thrown.y + 1.0)) < 1.5):
+                    await npc.hurtAndPush(2, (dx, dy), ScriptEventType.WASPELT,
+                                          thrown.player, thrown.carry_type)
+                    hit = True
+        if hit:
+            return True
+
+        # FourPlay TServerCarry.cpp:181: strict ground/player distances;
+        # damage is one heart, reduced to half at HP <= 1, for every sprite.
+        for player in self.server.audience.players_on_level(
+                thrown.level.name, exclude={thrown.player.id}):
+            if (getattr(player, 'hearts', 0) <= 0 or
+                    self.is_invincible(player.id)):
+                continue
+            if (abs(thrown.x - (player.x + 0.5)) < 2.0 and
+                    abs(thrown.y - (player.y + 1.0)) < 2.0):
+                await self.apply_damage(
+                    player, 1 if player.hearts <= 1.0 else 2,
+                    dx, dy, DamageType.OTHER, thrown.player.id
+                )
+                return True
+        return thrown.ticks_left <= 0
+
+    def _handoff_throw(self, thrown):
+        # TServerCarry.cpp:133-164: transfer to a side level before hit probes.
+        adjacent = getattr(getattr(self.server, 'world', None), 'get_adjacent_levels', None)
+        if adjacent is None:
+            return False
+        level = thrown.level
+        height = 2.375 - .2 * (9 - thrown.ticks_left)
+        sprite_y = thrown.y - height
+        dx, dy = ((0, -1), (-1, 0), (0, 1), (1, 0))[thrown.direction]
+        outside = (dx < 0 and thrown.x <= 0
+                   or dx > 0 and thrown.x >= level.WIDTH
+                   or dy < 0 and sprite_y <= 0
+                   or dy > 0 and sprite_y >= level.HEIGHT)
+        if not outside:
+            return False
+        neighbors = adjacent(level.name)
+        name = neighbors.get(('n', 'w', 's', 'e')[thrown.direction]) if isinstance(neighbors, dict) else None
+        target = self.server.world.get_level(name) if name else None
+        if target is None:
+            return False
+        thrown.x -= dx * level.WIDTH
+        thrown.y -= dy * level.HEIGHT
+        thrown.level = target
+        return True
 
     async def _move_thrown_npc(self, npc, player: 'Player', direction: int):
         dx, dy = ((0.0, -0.9), (-0.9, 0.0),
@@ -966,3 +1263,5 @@ class CombatManager:
         """Clear all combat objects from a level."""
         self._bombs.pop(level_name, None)
         self._arrows.pop(level_name, None)
+        self._held_bombs = {pid: bomb for pid, bomb in self._held_bombs.items()
+                            if bomb.level_name != level_name}

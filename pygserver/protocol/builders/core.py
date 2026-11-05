@@ -94,7 +94,8 @@ def _write_player_prop(builder: 'PacketBuilder', prop_id: int, value) -> None:
         logger.warning("build_player_props: unhandled prop %s (skipped)", prop_id)
         return
     try:
-        payload = encode_value(desc, value, _OUTBOUND_COLORS)
+        payload = (bytes([(int(value) + 32) & 0xff]) if prop_id == PLPROP.CARRYSPRITE
+                   else encode_value(desc, value, _OUTBOUND_COLORS))
     except (TypeError, ValueError) as exc:
         logger.warning("build_player_props: prop %s (%s) value %r not encodable: %s",
                        prop_id, desc.name, value, exc)
@@ -305,10 +306,11 @@ def build_server_text(key: str, value: str) -> bytes:
     return builder.build()
 
 
-def build_default_weapon(weapon_name: str) -> bytes:
-    """Build PLO_DEFAULTWEAPON packet."""
+def build_default_weapon(item_id: int) -> bytes:
+    """Build PLO_DEFAULTWEAPON packet: one gchar LevelItemType id
+    (GServer-v2 Weapon::registerWeaponWithPlayer)."""
     builder = PacketBuilder().write_gchar(PLO.DEFAULTWEAPON)
-    builder.write_gstring(weapon_name)
+    builder.write_gchar(int(item_id))
     builder.write_newline()
     return builder.build()
 
@@ -431,7 +433,7 @@ def build_server_warp(server: str, level: str, x: float, y: float) -> bytes:
 def build_flag_set(flag_name: str, flag_value: str) -> bytes:
     """Build PLO_FLAGSET packet."""
     builder = PacketBuilder().write_gchar(PLO.FLAGSET)
-    builder.write_string(f"{flag_name}={flag_value}")
+    builder.write_string(flag_name if flag_value is True else f"{flag_name}={flag_value}")
     builder.write_newline()
     return builder.build()
 

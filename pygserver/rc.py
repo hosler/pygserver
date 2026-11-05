@@ -758,9 +758,9 @@ class RCManager:
         if hasattr(self.server, 'server_flags'):
             for _ in range(count):
                 pair = reader.read_gstring()
-                if '=' in pair:
-                    key, value = pair.split('=', 1)
-                    self.server.server_flags[key.strip()] = value.strip()
+                key, separator, value = pair.partition('=')
+                if key.strip():
+                    self.server.server_flags[key.strip()] = value.strip() if separator else True
 
         await self._broadcast_rc_message(
             f"{session.player.account_name} updated server flags"

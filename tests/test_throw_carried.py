@@ -6,6 +6,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from pygserver.combat import CarryObjectSprite, CombatManager
+from pygserver.audience import Audience
 from pygserver.level import Level
 from pygserver.npc import NPCManager
 from pygserver.player import Player
@@ -17,6 +18,11 @@ class FakeServer:
         self.npc_manager = NPCManager(self)
         self.combat_manager = CombatManager(self)
         self.broadcasts = []
+        self.audience = Audience(self)
+        self.world = MagicMock()
+
+    def get_player(self, player_id):
+        return None
 
     async def broadcast_to_level(self, name, packet, exclude=None):
         self.broadcasts.append((name, packet, exclude))
@@ -35,7 +41,7 @@ class FakePlayer:
         self.flags = {}
 
 
-def test_throw_lands_after_five_server_iterations():
+def test_throw_lands_after_nine_combat_ticks():
     async def main():
         server = FakeServer()
         level = Level("throw.nw")
@@ -52,7 +58,11 @@ def test_throw_lands_after_five_server_iterations():
         await server.combat_manager.handle_throw_carried(
             player, player.direction, player.carrysprite
         )
-        assert calls == 5  # two client frames per 0.1-second server iteration
+        assert calls == 0
+        for _ in range(9):
+            await server.combat_manager._tick()
+        assert calls == 9
+        assert not server.combat_manager._throws
         assert server.broadcasts[0][2] == {player.id}
 
     asyncio.run(main())
@@ -71,13 +81,14 @@ def test_throw_hits_npc_and_scopes_pelt_flag(sprite, flag):
         server = FakeServer()
         level = Level("throw.nw")
         player = FakePlayer(server, level)
-        # First rightward iteration moves the 2x2 box to x=12.2.
+        # First rightward tick moves the ground position to x=11.5.
         target = server.npc_manager.create_npc(level=level, x=12.5, y=11)
         server.npc_manager.attach_gs1(
             target,
             f"if (waspelt) {{ this.hit = 1; this.right = peltwith{flag}; }}",
         )
         await server.combat_manager.handle_throw_carried(player, 3, sprite)
+        await server.combat_manager._tick()
         assert target.hearts == 2.0
         assert target.gs1_scopes["this"]["hit"] == 1.0
         assert target.gs1_scopes["this"]["right"] == 1.0

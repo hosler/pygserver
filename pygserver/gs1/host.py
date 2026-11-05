@@ -238,6 +238,12 @@ class GS1Host(Host):
         player = ctx.player
         npc = (ctx.this_obj.owner
                if isinstance(ctx.this_obj, _GS1ObjectRef) else ctx.this_obj)
+        if name == "params":
+            params = getattr(ctx, "action_params", [])
+            if not indices:
+                return params
+            index = indices[0]
+            return params[index] if 0 <= index < len(params) else ""
         reader = _BUILTINS.get(name)
         if reader is not None:
             return reader(self, name, indices, ctx, npc, player)
@@ -377,7 +383,7 @@ class GS1Host(Host):
             dynamic = to_str(args[0]).strip('"') if args else ""
             namespace, dot, key = dynamic.partition(".")
             scope = NAMESPACES.get(namespace) if dot else None
-            if scope is None:
+            if scope in ("server", "client", None):
                 key = dynamic
             value = ctx.vars.get(scope, key)
             return 0.0 if value is UNSET else value

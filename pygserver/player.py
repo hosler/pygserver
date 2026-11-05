@@ -55,6 +55,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# GServer-v2/server/src/player/PlayerClient.cpp:221: no sends or receives.
+PLAYER_DATA_TIMEOUT = 300.0
+
 
 class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
              CommunicationHandlers, FileHandlers, MiscHandlers):
@@ -115,15 +118,17 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
             # Main packet loop
             while self.connected:
                 try:
-                    data = await self.session.read(timeout=300.0)  # 5 minutes
+                    data = await self.session.read(timeout=30.0)
                 except asyncio.TimeoutError:
-                    logger.info(f"Player {self.id} timed out")
-                    break
+                    if time.time() - self.last_data_time > PLAYER_DATA_TIMEOUT:
+                        logger.info(f"Player {self.id} timed out")
+                        break
+                    continue
 
                 if not data:
                     break
 
-                self.last_packet_time = time.time()
+                self.last_data_time = self.last_packet_time = time.time()
                 await self._process_data(data)
 
         except ConnectionResetError:
@@ -131,7 +136,10 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
         except Exception as e:
             logger.error(f"Player {self.id} error: {e}")
         finally:
-            await self._cleanup()
+            try:
+                await self._cleanup()
+            finally:
+                await self.session.close()
 
     async def _cleanup(self):
         """Clean up player resources on disconnect."""
@@ -316,6 +324,10 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
                 await self._send_level(self.level)
             return
 
+        manager = getattr(self.server, 'combat_manager', None)
+        if manager is not None and manager.discard_held_bomb(self.id) is not None:
+            self.carrysprite = -1
+            await self.send_props({PLPROP.CARRYSPRITE: -1})
         old_level = self.level
         old_gmap_info = (
             self.server.world.get_gmap_for_level(old_level.name)
@@ -555,6 +567,7 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
 _STATE_ALIASES: Dict[str, Tuple[str, str]] = {
     # --- transport ----------------------------------------------------------
     'connected': ('session', 'connected'),
+    'last_data_time': ('session', 'last_data_time'),
     '_codec': ('session', 'codec'),
     '_buffer': ('session', 'buffer'),
     '_reader': ('session', 'reader'),

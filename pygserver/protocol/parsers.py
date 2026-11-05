@@ -1,11 +1,13 @@
 """Packet parsing helpers."""
 
 import logging
+from dataclasses import replace
 from typing import List, Tuple
 from reborn_protocol.props import (
     COLORS_NEWWORLD,
     PLAYER_PROPS,
     StreamPolicy,
+    Wire,
     parse_prop_stream,
     preset_power_image,
     with_gif_fallback,
@@ -150,7 +152,7 @@ _INBOUND_PROP_HANDLERS = {
     # SPRITE and DIRECTION are the same prop id (17).
     PLPROP.SPRITE: _store(PLPROP.SPRITE),
     PLPROP.STATUS: _store(PLPROP.STATUS),
-    PLPROP.CARRYSPRITE: _store(PLPROP.CARRYSPRITE),
+    PLPROP.CARRYSPRITE: lambda props, value: props.__setitem__(PLPROP.CARRYSPRITE, value[0] - 32),
     PLPROP.CURLEVEL: _store(PLPROP.CURLEVEL),
     PLPROP.CARRYNPC: _store(PLPROP.CARRYNPC),
     PLPROP.GMAPLEVELX: _store(PLPROP.GMAPLEVELX),
@@ -170,7 +172,9 @@ _INBOUND_PROP_HANDLERS = {
 # Client->server prop streams carry no ordering promise, so unlike the client's
 # reader this does not use ascending ids to detect a desync; it just stops at an
 # id outside the enum, as it always has.
-_INBOUND_STREAM = StreamPolicy(table=PLAYER_PROPS, max_prop_id=100,
+_CARRY_PLAYER_PROPS = dict(PLAYER_PROPS)
+_CARRY_PLAYER_PROPS[PLPROP.CARRYSPRITE] = replace(PLAYER_PROPS[PLPROP.CARRYSPRITE], wire=Wire.RAW)
+_INBOUND_STREAM = StreamPolicy(table=_CARRY_PLAYER_PROPS, max_prop_id=100,
                                handle_empty=frozenset({PLPROP.CURCHAT}))
 
 

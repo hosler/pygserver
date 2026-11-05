@@ -110,11 +110,11 @@ def _b_playerswimming(self, name, indices, ctx, npc, player):
 
 
 def _b_carrying(self, name, indices, ctx, npc, player):
-    return player is not None and int(getattr(player, "carrysprite", 0) or 0) != 0
+    return player is not None and int(getattr(player, "carrysprite", -1)) != -1
 
 
 def _b_carries_object(self, name, indices, ctx, npc, player):
-    sprite = int(getattr(player, "carrysprite", 0) or 0) if player is not None else 0
+    sprite = int(getattr(player, "carrysprite", -1)) if player is not None else -1
     return sprite == int(_CARRY_SPRITE[name])
 
 

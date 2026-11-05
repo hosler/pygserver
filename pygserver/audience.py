@@ -4,7 +4,8 @@ pygserver.audience - one spatial-query service for "who is affected by this".
 Every "which players/NPCs/baddies does this event reach" question used to be
 answered by its own inline loop (level broadcast, join roster, bomb blast, baddy
 blast, the GS1 host's explosion), and those loops did not agree on either the
-membership source or the shape of the affected area. This module owns both.
+membership source or the shape of the affected area. This module provides
+membership and shared shapes; combat.py owns sprite and explosion-cell tests.
 
 Membership. `players_on_level` is the single definition of "attached to this
 level", and it reads the level's own player set (`Level.get_player_ids`), which
@@ -19,10 +20,9 @@ which set `Player.level` in the same synchronous step.
 Shapes are an explicit, named policy per event, NOT normalized, because the
 choice is a gameplay hitbox:
 
-- `Shape.CIRCLE` - euclidean `distance < radius`. What our bomb blast and baddy
-  blast have always used.
-- `Shape.BOX` - axis-aligned `|dx| < radius and |dy| < radius`. What our arrow
-  and firespy hit tests have always used, and the shape GServer-v2 itself uses
+- `Shape.CIRCLE` - euclidean `distance < radius`. Used for NPC/baddy blasts.
+- `Shape.BOX` - axis-aligned `|dx| < radius and |dy| < radius`. Used for
+  firespy hits, and the shape GServer-v2 itself uses
   for its audience query (Level::findInRangePlayers, server/src/level/Level.cpp:
   3025, `abs(dx) <= syncx && abs(dy) <= syncy` - inclusive there, strict here,
   kept strict so no existing hit test changes by a boundary tile).
@@ -37,10 +37,9 @@ tests a PLUS shape - two 1-tile-wide strips, one vertical of height
 only to NPCs (`hurtAndPush(..., EXPLODED)`); players and baddies take no
 server-side blast damage there at all, since the reference server trusts the
 client's own PLI_HURTPLAYER / PLI_BADDYHURT report. pygserver is deliberately
-authoritative for damage instead, so there is no reference shape to copy for its
-player/baddy blast and the historical circle is kept as an explicit policy
-below. The plus shape is documented rather than implemented because no call site
-uses it yet.
+authoritative for damage instead. Player bomb hits use the official client's
+cross of explosion cells, and arrow hits use sprite/body rectangles, both in
+combat.py. NPC/baddy blasts retain the circle policies below.
 """
 
 import math
@@ -78,16 +77,11 @@ def contains(shape: Shape, cx: float, cy: float, radius: float,
 # gameplay hitbox, so they are declared here instead of hidden in a loop.
 # =============================================================================
 
-BOMB_BLAST_PLAYERS = Shape.CIRCLE
 BOMB_BLAST_NPCS = Shape.CIRCLE
 BOMB_BLAST_BADDIES = Shape.CIRCLE
-ARROW_HIT_PLAYERS = Shape.BOX
 FIRESPY_HIT_PLAYERS = Shape.BOX
-# gs1_host's putexplosion (gs1_host._explode) damages players in a BOX while the
-# bomb path above uses a CIRCLE. That disagreement is real and unresolved; it is
-# recorded here so nothing quietly picks one. The boundary IS inclusive: at
-# radius 3 the edge and corner players are in range, and reading this as a
-# strict box drops the blast's entire outer ring.
+# GS1 putexplosion retains its inclusive box policy. Bombs use cell tests
+# in combat.py; the two callers have separate collision rules.
 GS1_EXPLOSION_PLAYERS = Shape.BOX_INCLUSIVE
 
 

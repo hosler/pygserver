@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 from reborn_protocol.gs2.compiler import Gs2Compiler as GS2Compiler, find_compiler
 
 from .protocol.packets import (
+    build_default_weapon,
     build_gani_script,
     build_load_gani,
     build_load_script_bytecode,
@@ -609,7 +610,13 @@ class GS2ScriptManager:
     async def announce_weapon(self, player: 'Player', name: str) -> bool:
         """Push a compiled weapon to a player: PLO_NPCWEAPONADD carrying the
         image and joined-class list, then the PLO_LOADSCRIPT header. The client
-        pulls the bytecode itself with PLI_UPDATESCRIPT."""
+        pulls the bytecode itself with PLI_UPDATESCRIPT. Built-in item weapons
+        (bow, bomb, ...) are a bare PLO_DEFAULTWEAPON id instead."""
+        from .items import DEFAULT_WEAPON_IDS
+        default = DEFAULT_WEAPON_IDS.get(name)
+        if default is not None and self.get_weapon(name) is None:
+            await player.send_raw(build_default_weapon(int(default)))
+            return True
         script = self.get_weapon(name)
         if script is None:
             return False

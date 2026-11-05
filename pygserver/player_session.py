@@ -9,6 +9,7 @@ send_packet / disconnect to this and keeps no transport state of its own.
 
 import asyncio
 import logging
+import time
 from typing import Optional, Union
 
 from reborn_protocol.codec import Gen2Codec
@@ -26,6 +27,7 @@ class PlayerSession:
         self.reader = reader
         self.writer = writer
         self.connected = True
+        self.last_data_time = time.time()
         self.codec: Optional[Union[ServerCodec, Gen2Codec]] = None
         self.buffer = PacketBuffer()
 
@@ -61,8 +63,7 @@ class PlayerSession:
             encoded = (self.codec.send_packet(data)
                        if isinstance(self.codec, Gen2Codec)
                        else self.codec.encode_packet(data))
-            self.writer.write(encoded)
-            await self.writer.drain()
+            await self._write(encoded)
         except Exception as e:
             logger.error(f"Send error: {e}")
             self.connected = False
@@ -76,8 +77,13 @@ class PlayerSession:
         encoded = (self.codec.send_packet(data)
                    if isinstance(self.codec, Gen2Codec)
                    else self.codec.encode_packet(data, is_login_response=True))
+        await self._write(encoded)
+
+    async def _write(self, encoded: bytes):
+        """Record activity only after the encoded data is sent successfully."""
         self.writer.write(encoded)
         await self.writer.drain()
+        self.last_data_time = time.time()
 
     async def close(self):
         """Close the socket, ignoring an already-broken connection."""

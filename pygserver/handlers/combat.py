@@ -132,6 +132,10 @@ class CombatHandlers:
         y = reader.read_gchar() / 2.0 if reader.remaining() else self.y
         power = reader.read_gchar() if reader.remaining() else 2
 
+        manager = getattr(self.server, 'combat_manager', None)
+        if manager is not None and await manager.handle_held_bomb_explosion(self, x, y):
+            return
+
         # Broadcast explosion effect
         from ..protocol.packets import build_explosion
         packet = build_explosion(x, y, radius, power)

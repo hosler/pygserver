@@ -152,6 +152,10 @@ class ServerConfig:
                             config.url = value
                         elif key == 'serverport':
                             config.port = int(scalar)
+                        elif key == 'villager_count':
+                            # pygserver-only option: how many VillagerNPCs
+                            # spawn on the start level (server.py:291).
+                            config.villager_count = int(scalar)
                         elif key == 'serverip':
                             config.serverip = value
                         elif key == 'localip':

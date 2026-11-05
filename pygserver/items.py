@@ -15,6 +15,7 @@ from typing import TYPE_CHECKING, Optional, List, Dict, Tuple, Set
 from .protocol.constants import PLO, PLPROP, LevelItemType
 from .protocol.packets import (
     PacketBuilder,
+    build_default_weapon,
     build_item_add,
     build_item_del,
     build_level_chest,
@@ -27,6 +28,9 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+# GServer-v2 LevelItem.h:66: server expiry is 8200 milliseconds.
+ITEM_LIFETIME = 8.2
+
 
 @dataclass
 class LevelItem:
@@ -37,7 +41,8 @@ class LevelItem:
     y: float
     item_type: LevelItemType
     created_at: float = field(default_factory=time.time)
-    despawn_time: float = 60.0  # Seconds until despawn (0 = never)
+    despawn_time: float = ITEM_LIFETIME  # Seconds until despawn (0 = never)
+    layer: int = 0
 
     @property
     def expired(self) -> bool:
@@ -61,6 +66,22 @@ class LevelChest:
     def chest_id(self) -> str:
         """Unique chest identifier for save/load."""
         return f"{self.level_name}:{self.x},{self.y}"
+
+
+# Items that grant a built-in weapon on take (GServer-v2 LevelItem.cpp
+# getItemPlayerProp -> Player::addWeapon(LevelItemType); Server.cpp default
+# weapon list). The weapon is named by the item name, lowercase as in
+# LevelItem.h ItemNames, and reaches the client as PLO_DEFAULTWEAPON.
+DEFAULT_WEAPON_ITEMS = {
+    LevelItemType.BOW: 'bow',
+    LevelItemType.BOMB: 'bomb',
+    LevelItemType.SUPERBOMB: 'superbomb',
+    LevelItemType.FIREBALL: 'fireball',
+    LevelItemType.FIREBLAST: 'fireblast',
+    LevelItemType.NUKESHOT: 'nukeshot',
+    LevelItemType.JOLTBOMB: 'joltbomb',
+}
+DEFAULT_WEAPON_IDS = {name: item for item, name in DEFAULT_WEAPON_ITEMS.items()}
 
 
 # Item type to player stat mapping
@@ -130,7 +151,7 @@ class ItemManager:
         self._running = False
 
         # Settings
-        self.item_despawn_time = 60.0  # Default despawn time
+        self.item_despawn_time = ITEM_LIFETIME
         self.max_items_per_level = 100  # Prevent item spam
 
     async def start(self):
@@ -151,8 +172,8 @@ class ItemManager:
         logger.info("Item manager stopped")
 
     async def _tick_loop(self):
-        """Main item tick loop (runs every 1 second)."""
-        tick_interval = 1.0
+        """Expire items at the gameplay tick cadence."""
+        tick_interval = 0.05
 
         while self._running:
             try:
@@ -178,7 +199,8 @@ class ItemManager:
     async def spawn_item(self, level: 'Level', x: float, y: float,
                          item_type: LevelItemType,
                          despawn_time: Optional[float] = None,
-                         exclude_player_id: Optional[int] = None) -> Optional[LevelItem]:
+                         exclude_player_id: Optional[int] = None,
+                         layer: int = 0) -> Optional[LevelItem]:
         """
         Spawn an item on a level.
 
@@ -210,6 +232,7 @@ class ItemManager:
             x=x,
             y=y,
             item_type=item_type,
+            layer=layer,
             despawn_time=despawn_time if despawn_time is not None else self.item_despawn_time
         )
 
@@ -275,14 +298,24 @@ class ItemManager:
         # Find item at position
         for item_id, item in list(self._items[level_name].items()):
             if abs(item.x - x) < 1.0 and abs(item.y - y) < 1.0:
+                if item.expired:
+                    await self.remove_item(level_name, item.x, item.y)
+                    return False
+                # TServerLevel.cpp:1416: same layer and remaining time <160.
+                ticks = int((time.time() - item.created_at) / .05 + 1e-9)
+                if 164 - ticks >= 160 or item.layer != getattr(player, 'layer', 0):
+                    return False
+                # TServerLevel.cpp:1419: use player/item centres, not packet xy.
+                if not (abs(player.x + 1.5 - (item.x + 1.0)) < 2.0
+                        and abs(player.y + 2.0 - (item.y + 1.0)) < 2.0):
+                    return False
+                # Claim before awaiting the grant so concurrent takes grant once.
+                del self._items[level_name][item_id]
                 # Apply item effect
                 await self.give_item_to_player(player, item.item_type)
 
-                # Remove item
-                del self._items[level_name][item_id]
-
                 # Broadcast removal
-                packet = build_item_del(x, y)
+                packet = build_item_del(item.x, item.y)
                 await self.server.broadcast_to_level(level_name, packet)
 
                 logger.debug(f"Player {player.id} picked up {item.item_type.name}")
@@ -298,6 +331,13 @@ class ItemManager:
             player: Player receiving item
             item_type: Type of item
         """
+        weapon = DEFAULT_WEAPON_ITEMS.get(item_type)
+        if weapon is not None:
+            if not player.has_weapon(weapon):
+                player.add_weapon(weapon)
+                await player.send_raw(build_default_weapon(int(item_type)))
+            return
+
         if item_type not in ITEM_EFFECTS:
             logger.debug(f"Item {item_type.name} has no effect defined")
             return

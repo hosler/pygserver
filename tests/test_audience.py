@@ -9,10 +9,8 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 from pygserver.audience import (
-    ARROW_HIT_PLAYERS,
     BOMB_BLAST_BADDIES,
     BOMB_BLAST_NPCS,
-    BOMB_BLAST_PLAYERS,
     FIRESPY_HIT_PLAYERS,
     GS1_EXPLOSION_PLAYERS,
     Audience,
@@ -73,13 +71,10 @@ def test_box_is_axis_aligned():
 
 
 def test_named_policies_keep_the_historical_shapes():
-    assert BOMB_BLAST_PLAYERS is Shape.CIRCLE
     assert BOMB_BLAST_NPCS is Shape.CIRCLE
     assert BOMB_BLAST_BADDIES is Shape.CIRCLE
-    assert ARROW_HIT_PLAYERS is Shape.BOX
     assert FIRESPY_HIT_PLAYERS is Shape.BOX
-    # gs1_host's putexplosion disagrees with the bomb path; recorded, not fixed.
-    assert GS1_EXPLOSION_PLAYERS is not BOMB_BLAST_PLAYERS
+    assert GS1_EXPLOSION_PLAYERS is Shape.BOX_INCLUSIVE
 
 
 # -- membership -------------------------------------------------------------
