@@ -58,7 +58,7 @@ class TestPacketBuilders:
         """Test building bomb add packet."""
         from pygserver.protocol.packets import build_bomb_add
 
-        packet = build_bomb_add(1, 10.0, 20.0, 1, 5)  # Added time_left param (int)
+        packet = build_bomb_add(1, 10.0, 20.0, 1, 5)  # Fuse is passed as exact wire ticks.
         assert isinstance(packet, bytes)
 
     def test_build_arrow_add(self):

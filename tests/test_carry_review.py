@@ -13,6 +13,7 @@ from pygserver.gs1.builtins import _b_carrying, _b_carries_object
 from pygserver.handlers.combat import CombatHandlers
 from pygserver.level import Level
 from pygserver.player import Player
+from pygserver.protocol.constants import PLO
 from pygserver.server import GameServer
 from pygserver.world import GMap, World
 
@@ -85,7 +86,7 @@ def test_warp_releases_held_bomb_and_carry_state(arena):
     assert player.level is target
 
 
-def test_reported_held_blast_applies_damage_and_board_changes_once(arena):
+def test_reported_held_blast_relays_and_changes_board_without_player_damage(arena):
     server, level, manager, add = arena
     carrier = add(2)
     victim = add(3, x=9.5, y=9)
@@ -102,8 +103,18 @@ def test_reported_held_blast_applies_damage_and_board_changes_once(arena):
         await CombatHandlers._handle_explosion(carrier, packet.build())
         await CombatHandlers._handle_explosion(carrier, packet.build())
     asyncio.run(report())
-    assert victim.hearts == 2.5
-    victim.send_raw.assert_awaited_once()
+    # TExplosion.cpp:48-96: victims apply their own explosion damage locally.
+    assert victim.hearts == carrier.hearts == 3
+    victim.send_raw.assert_not_awaited()
+    victim.send_props.assert_not_awaited()
+    carrier.send_raw.assert_not_awaited()
+    calls = server.broadcast_to_level.await_args_list
+    assert sum(call.args[1][0] == PLO.BOARDMODIFY + 32 for call in calls) == 1
+    relays = [call for call in calls if call.args[1][0] == PLO.EXPLOSION + 32]
+    assert len(relays) == 2
+    assert all(call.kwargs['exclude'] == {carrier.id} for call in relays)
+    assert not any(call.args[1][0] in (PLO.HURTPLAYER + 32, PLO.BOMBDEL + 32)
+                   for call in calls)
     assert carrier.id not in manager._held_bombs
     assert tuple(level.get_tile(x, y) for x, y in ((10, 10), (10, 11), (11, 10), (11, 11))) == replacement
 

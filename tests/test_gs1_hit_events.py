@@ -235,8 +235,11 @@ def test_bomb_explosion_fires_exploded_on_npc_in_radius():
 
         bomb = Bomb(id=1, player_id=0, level_name=level.name,
                     x=10, y=10, power=1, time_left=0)
-        await server.combat_manager._detonate_bomb(bomb)
+        server.combat_manager._bombs[level.name] = {bomb.id: bomb}
+        await server.combat_manager._tick()
 
+        assert not server.combat_manager.get_bombs_on_level(level.name)
+        assert not server.broadcasts  # Expiry runs NPC effects without a relay.
         assert target.gs1_scopes["this"]["hit"] == 1.0
         assert target.hearts < 3.0
         assert "hit" not in far.gs1_scopes["this"]  # out of radius

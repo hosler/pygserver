@@ -39,14 +39,15 @@ def test_client_bomb_landing_precedes_server_simulation(monkeypatch, direction, 
         assert result is bomb and player.bombs == 9
         player.send_props.assert_not_awaited()
         server.broadcast_to_level.assert_awaited_once_with(
-            level.name, build_bomb_add(player.id, x, y, 1, bomb.time_left), exclude={player.id})
+            level.name, build_bomb_add(player.id, x, y, 1, round(bomb.time_left / .05) - 1), exclude={player.id})
         assert not manager._throws and player.id not in manager._held_bombs
-        manager._detonate_bomb = AsyncMock()
+        # Clients own detonation; the server timer only expires level state.
+        manager._expire_bomb = AsyncMock()
         for _ in range(12):
             await manager._tick()
         assert list(manager._bombs[level.name].values()) == [bomb]
         assert server.broadcast_to_level.await_count == 1
-        manager._detonate_bomb.assert_not_awaited()
+        manager._expire_bomb.assert_not_awaited()
     asyncio.run(run())
 
 

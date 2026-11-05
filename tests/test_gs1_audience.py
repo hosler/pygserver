@@ -6,16 +6,15 @@ Two things these pin that nothing else does:
   level NAME through world.get_level - so a level the world does not hold
   (detached, or hand-built by a test) has to keep working. Both paths are
   exercised here.
-* putexplosion's player box is INCLUSIVE while audience.contains is strict for
-  every shape it has, so the boundary ring is a hitbox the migration could
-  silently have dropped. It is pinned tile-by-tile below.
+* putexplosion relays the effect and leaves player damage to each client,
+  including players at the boundary and corners of the former server box.
 
 Uses real Level/Audience instances against a small FakeServer, per the
 test_gs1_hit_events.py idiom.
 """
 import asyncio
+from unittest.mock import AsyncMock
 
-from pygserver.audience import GS1_EXPLOSION_PLAYERS, Shape, contains
 from pygserver.gs1_host import (
     compile_gs1,
     leader_player_for_level,
@@ -47,6 +46,7 @@ class FakePlayer:
 class FakeCombatMgr:
     def __init__(self):
         self.damaged = []
+        self.blast_level_objects = AsyncMock()
 
     async def apply_damage(self, player, dmg, kx, ky, dtype=None, attacker=None):
         self.damaged.append(player.id)
@@ -193,7 +193,7 @@ def test_leader_is_none_on_an_empty_level():
     assert leader_player_for_level(server, server.add_level("t.nw")) is None
 
 
-# -- putexplosion hitbox -----------------------------------------------------
+# -- client-owned putexplosion damage -----------------------------------------------------
 
 def _explode_and_collect(radius, *players):
     """Run `putexplosion radius,30,30` and return the damaged player ids."""
@@ -210,36 +210,39 @@ def _explode_and_collect(radius, *players):
     return asyncio.run(main())
 
 
-def test_explosion_boundary_is_inclusive():
-    """A player exactly `radius` tiles out is hit. Reusing audience.contains,
-    which is strict, would have shrunk the blast by this whole outer ring."""
+def test_explosion_boundary_players_keep_server_hearts():
+    # TExplosion.cpp:48-96: each victim client applies its own damage.
     on_edge = FakePlayer(pid=1, x=33.0, y=30.0)
     just_outside = FakePlayer(pid=2, x=33.0625, y=30.0)  # +1/16 tile, one wire step
 
-    assert _explode_and_collect(3, on_edge, just_outside) == [1]
+    assert _explode_and_collect(3, on_edge, just_outside) == []
 
 
-def test_explosion_is_a_box_not_a_circle():
-    """The diagonal corner is 4.24 tiles from a radius-3 blast, so a circle
-    would miss it - the box policy is what puts it in range."""
+def test_explosion_corner_players_keep_server_hearts():
+    # Script explosions use the same client damage authority as timed bombs.
     corner = FakePlayer(pid=1, x=33.0, y=33.0)
 
-    assert _explode_and_collect(3, corner) == [1]
-    assert not contains(Shape.CIRCLE, 30.0, 30.0, 3, 33.0, 33.0)
+    assert _explode_and_collect(3, corner) == []
 
 
-def test_explosion_still_misses_players_off_the_box():
+def test_explosion_near_and_far_players_keep_server_hearts():
     far = FakePlayer(pid=2, x=50.0, y=50.0)
     near = FakePlayer(pid=1, x=30.0, y=31.0)
 
-    assert _explode_and_collect(3, near, far) == [1]
+    assert _explode_and_collect(3, near, far) == []
 
 
-def test_explosion_shape_policy_still_matches_the_box_implemented_here():
-    """_explosion_targets now defers to audience.contains, so the policy is the
-    single definition of this hitbox. Pinned because flipping it to a strict
-    BOX silently drops the blast's outer ring (see the boundary test above)."""
-    assert GS1_EXPLOSION_PLAYERS is Shape.BOX_INCLUSIVE
+def test_script_explosion_runs_level_object_effects():
+    async def main():
+        server = FakeServer()
+        level = server.add_level("t.nw")
+        npc = make_npc("if (created) { putexplosion 3,30,30; }", level)
+        run_npc_event(npc, "created", server, None)
+        await asyncio.sleep(0)
+        server.combat_manager.blast_level_objects.assert_awaited_once_with(
+            level, 30, 30, 3, 1)
+        assert len(server.broadcasts) == 1
+    asyncio.run(main())
 
 
 # -- coordinate frames -------------------------------------------------------

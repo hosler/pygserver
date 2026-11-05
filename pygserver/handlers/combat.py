@@ -20,13 +20,14 @@ class CombatHandlers:
         reader = PacketReader(data)
         x = reader.read_gchar() / 2.0
         y = reader.read_gchar() / 2.0
-        # {GCHAR player_power}{GCHAR timer}: power is bits 0-1, timer is
-        # 50ms increments (+50ms) - see GServer-v2 msgPLI_BOMBADD
-        power = (reader.read_gchar() & 0x03) if reader.remaining() else 1
-        time_left = (reader.read_gchar() * 0.05 + 0.05) if reader.remaining() else 3.0
+        # FourPlay TClient.cpp:1661-1680: retain the player-owner bit.
+        # GServer-v2 msgPLI_BOMBADD relays the already compensated ticks.
+        power = (reader.read_gchar() & 0x0f) if reader.remaining() else 1
+        timer_ticks = reader.read_gchar() if reader.remaining() else 59
 
         if hasattr(self.server, 'combat_manager'):
-            await self.server.combat_manager.handle_bomb_add(self, x, y, power, time_left)
+            await self.server.combat_manager.handle_bomb_add(
+                self, x, y, power, timer_ticks=timer_ticks)
 
     @handles(PLI.BOMBDEL)
     async def _handle_bomb_del(self, data: bytes):
@@ -112,17 +113,11 @@ class CombatHandlers:
         """Handle PLI_EXPLOSION packet.
 
         Wire format (GServer-v2 msgPLI_EXPLOSION, PlayerClientPackets.cpp:
-        829-844): {GCHAR radius}{GCHAR x*2}{GCHAR y*2}{GCHAR power} - radius
-        comes first and is a raw byte (not a half-tile value). Previously
-        this read x/y before radius/power (wrong field order) and had no
-        `self.level` guard, so it raised AttributeError for any player not
-        currently on a level, and it broadcast back to the sender too.
+        829-844): {GCHAR radius}{GCHAR x*2}{GCHAR y*2}{GCHAR power_flags}.
+        Radius comes first and is a raw byte, not a half-tile value.
 
-        The PLO_EXPLOSION relay GServer actually sends also prepends a
-        (short) owner id that build_explosion() here does not write; leave
-        that as-is since pyReborn's parser (pyReborn/pyreborn/packets.py
-        parse_explosion) expects [x][y][radius][power] with no owner id, and
-        the client side is owned by another team.
+        GServer-v2 msgPLI_EXPLOSION prefixes the sender id on relay;
+        FourPlay TClient.cpp:5461-5473 reads that id before radius/x/y/flags.
         """
         if not self.level:
             return
@@ -133,15 +128,18 @@ class CombatHandlers:
         power = reader.read_gchar() if reader.remaining() else 2
 
         manager = getattr(self.server, 'combat_manager', None)
-        if manager is not None and await manager.handle_held_bomb_explosion(self, x, y):
+        if manager is not None and await manager.handle_held_bomb_explosion(
+                self, x, y, radius, power):
             return
 
         # Broadcast explosion effect
         from ..protocol.packets import build_explosion
-        packet = build_explosion(x, y, radius, power)
+        packet = build_explosion(self.id, x, y, radius, power)
         await self.server.broadcast_to_level(
             self.level.name, packet, exclude={self.id}
         )
+        if manager is not None:
+            await manager.blast_level_objects(self.level, x, y, radius, power, self.id)
 
     @handles(PLI.HITOBJECTS)
     async def _handle_hit_objects(self, data: bytes):

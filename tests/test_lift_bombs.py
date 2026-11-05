@@ -61,9 +61,10 @@ def test_nonowner_pickup_pauses_remaining_fuse_without_refunding_ammo(monkeypatc
     assert player.bombs == 0
     player.send_props.assert_not_awaited()
     monkeypatch.setattr('time.time', lambda: 110)
-    manager._detonate_bomb = AsyncMock()
+    # Held bombs wait for the client report, outside the server expiry timer.
+    manager._expire_bomb = AsyncMock()
     asyncio.run(manager._tick())
-    manager._detonate_bomb.assert_not_awaited()
+    manager._expire_bomb.assert_not_awaited()
 
 
 def test_replacement_resumes_same_fuse_without_inventory_cost(monkeypatch):
@@ -92,7 +93,8 @@ def test_fuse_stays_paused_through_flight(monkeypatch):
     asyncio.run(manager.handle_bomb_del(player, 10, 10))
     asyncio.run(manager.handle_throw_carried(player, 3, 0))
     manager._is_throw_wall = lambda thrown: False
-    manager._detonate_bomb = AsyncMock()
+    # Held bombs wait for the client report, outside the server expiry timer.
+    manager._expire_bomb = AsyncMock()
     monkeypatch.setattr('time.time', lambda: 110)
 
     async def fly():
@@ -103,7 +105,7 @@ def test_fuse_stays_paused_through_flight(monkeypatch):
     assert bomb.time_left == 2
     assert (bomb.x, bomb.y) == pytest.approx((29.5, 21.925))
     assert not manager._throws
-    manager._detonate_bomb.assert_not_awaited()
+    manager._expire_bomb.assert_not_awaited()
 
 
 def test_clear_level_discards_carried_bombs(monkeypatch):

@@ -913,9 +913,11 @@ def test_updateboard_broadcasts_region():
     asyncio.run(main())
 
 
-def test_putexplosion_damages_players_in_radius():
+def test_putexplosion_leaves_player_damage_to_clients():
     async def main():
         cm = _FakeCombatMgr()
+        from unittest.mock import AsyncMock
+        cm.blast_level_objects = AsyncMock()
         near = FakePlayer(pid=1)
         near.x, near.y = 30.0, 30.0
         far = FakePlayer(pid=2)
@@ -930,7 +932,9 @@ def test_putexplosion_damages_players_in_radius():
         npc = make_npc("if (created) { putexplosion 3,30,30; }", level)
         run_npc_event(npc, "created", Server(), None)
         await asyncio.sleep(0)
-        assert [d[0] for d in cm.damaged] == [1]  # only the near player
+        # FourPlay TExplosion.cpp:48-96: the victim client owns damage.
+        assert cm.damaged == []
+        cm.blast_level_objects.assert_awaited_once_with(level, 30, 30, 3, 1)
 
     asyncio.run(main())
 

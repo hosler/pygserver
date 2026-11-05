@@ -5,7 +5,6 @@ import math
 
 from reborn_protocol.gs1.values import to_num
 
-from ...audience import GS1_EXPLOSION_PLAYERS, contains
 from ..execution import _schedule
 from ..host import NPC_CHARPROP, PLAYER_CHARPROP, PLAYER_PROP_WIRE, PLPROP, _NPC_GATTRIB_PROPS, _PLAYER_GATTRIB_PROPS, _charprop_target  # noqa: F401  - kept: original import block (star-import consumers rely on it)
 import asyncio  # noqa: F401  - kept: original import block (star-import consumers rely on it)
@@ -24,25 +23,12 @@ def _c_putbomb(self, a, npc, player, ctx):
         return
     try:
         from ...protocol.packets import build_bomb_add
-        pid = getattr(player, "id", 0) if player is not None else 0
+        # GServer-v2 Level.cpp:2085: script bombs have owner 0, no player flag.
+        # Its default three-second fuse is sent as 60 ticks.
         _schedule(self.server.broadcast_to_level(lvl.name, build_bomb_add(
-            pid, to_num(a[1]), to_num(a[2]), int(to_num(a[0])), 55)))
+            0, to_num(a[1]), to_num(a[2]), int(to_num(a[0])) & 7, 60)))
     except Exception:
         logger.debug("putbomb failed", exc_info=True)
-
-def _explosion_targets(players, x, y, radius):
-    """Those of `players` inside a putexplosion blast centred on (x, y).
-
-    The hitbox is audience.GS1_EXPLOSION_PLAYERS: a BOX (unlike the bomb path's
-    CIRCLE) with an INCLUSIVE boundary, so a player standing exactly `radius`
-    tiles out is hit -- reading it as strict drops the blast's whole outer ring.
-    tests/test_gs1_audience.py pins both the boundary and the shape policy.
-    """
-    return [
-        p for p in players
-        if contains(GS1_EXPLOSION_PLAYERS, x, y, radius,
-                    to_num(getattr(p, "x", 0)), to_num(getattr(p, "y", 0)))
-    ]
 
 def _explode(self, ctx, radius, power, x, y):
     lvl = self._level_of(ctx)
@@ -51,19 +37,14 @@ def _explode(self, ctx, radius, power, x, y):
     try:
         from ...protocol.packets import build_explosion
         _schedule(self.server.broadcast_to_level(
-            lvl.name, build_explosion(x, y, radius, power)))
+            lvl.name, build_explosion(0, x, y, radius, power & 7)))
     except Exception:
         logger.debug("explosion broadcast failed", exc_info=True)
     cm = getattr(self.server, "combat_manager", None)
-    if cm is None or not hasattr(cm, "apply_damage"):
-        return
-    try:
-        from ...combat import DamageType
-        dtype = DamageType.BOMB
-    except Exception:
-        dtype = None
-    for p in _explosion_targets(self._players_on_level(ctx), x, y, radius):
-        _schedule(cm.apply_damage(p, power * 2, 0, 0, dtype))
+    if cm is not None:
+        # GServer-v2 Level.cpp:2211: script explosions inform clients and
+        # affect NPCs; TExplosion.cpp:48-96 leaves player damage to clients.
+        _schedule(cm.blast_level_objects(lvl, x, y, radius, power & 7))
 
 def _c_putexplosion(self, a, npc, player, ctx):
     # putexplosion radius,x,y  (power=1)

@@ -256,16 +256,12 @@ class CombatManager:
         current_time = time.time()
 
         # Process bombs
-        for level_name, bombs in list(self._bombs.items()):
-            expired_bombs = []
-            for bomb_id, bomb in list(bombs.items()):
-                if bomb.expired:
-                    expired_bombs.append(bomb)
-                    del bombs[bomb_id]
+        for bombs in list(self._bombs.values()):
+            expired_bombs = [bomb for bomb in list(bombs.values()) if bomb.expired]
 
-            # Detonate expired bombs
+            # Expire only server-maintained level objects
             for bomb in expired_bombs:
-                await self._detonate_bomb(bomb)
+                await self._expire_bomb(bomb)
 
         # Process arrows
         for level_name, arrows in list(self._arrows.items()):
@@ -305,7 +301,8 @@ class CombatManager:
             del self._invincible[pid]
 
     async def handle_bomb_add(self, player: 'Player', x: float, y: float,
-                               power: int, time_left: float = 3.0) -> Optional[Bomb]:
+                               power: int, time_left: float = 3.0, *,
+                               timer_ticks: Optional[int] = None) -> Optional[Bomb]:
         """
         Handle a player placing a bomb.
 
@@ -313,14 +310,19 @@ class CombatManager:
             player: Player placing the bomb
             x: X position in tiles
             y: Y position in tiles
-            power: Bomb power (affects damage and radius)
-            time_left: Fuse time in seconds
+            power: Bomb type and player-owner flag byte
+            time_left: Fuse time in seconds for server callers
+            timer_ticks: Original client byte, relayed unchanged when supplied
 
         Returns:
             The created Bomb, or None if failed
         """
         if not player.level:
             return None
+
+        power &= 0x0f
+        if timer_ticks is not None:
+            time_left = (timer_ticks + 1) * 0.05
 
         # Check if player has bombs
         held = self._held_bombs.get(player.id)
@@ -344,9 +346,14 @@ class CombatManager:
             held.in_flight = False
             held.flight_path = ()
             held.created_at = time.time()
+            held.power = power & 7
+            if timer_ticks is not None:
+                held.time_left = time_left
+            else:
+                timer_ticks = max(0, round(held.time_left / 0.05) - 1)
             self._bombs.setdefault(held.level_name, {})[held.id] = held
             await self.server.broadcast_to_level(
-                held.level_name, build_bomb_add(player.id, x, y, held.power, held.time_left),
+                held.level_name, build_bomb_add(player.id, x, y, power, timer_ticks),
                 exclude={player.id})
             return held
         if player.bombs <= 0:
@@ -367,7 +374,7 @@ class CombatManager:
             level_name=player.level.name,
             x=x,
             y=y,
-            power=power,
+            power=power & 7,
             time_left=time_left
         )
 
@@ -377,7 +384,9 @@ class CombatManager:
         self._bombs[player.level.name][bomb_id] = bomb
 
         # Broadcast bomb to level
-        packet = build_bomb_add(player.id, x, y, power, time_left)
+        if timer_ticks is None:
+            timer_ticks = max(0, round(time_left / 0.05) - 1)
+        packet = build_bomb_add(player.id, x, y, power, timer_ticks)
         await self.server.broadcast_to_level(
             player.level.name, packet, exclude={player.id}
         )
@@ -423,7 +432,7 @@ class CombatManager:
             self._throws[:] = [obj for obj in self._throws if obj.bomb is not bomb]
         return bomb
 
-    async def handle_held_bomb_explosion(self, player, x, y):
+    async def handle_held_bomb_explosion(self, player, x, y, radius, power):
         bomb = self.discard_held_bomb(player.id)
         if bomb is None:
             return False
@@ -432,89 +441,78 @@ class CombatManager:
             bomb.level_name = player.level.name
         player.carrysprite = -1
         await player.send_props({PLPROP.CARRYSPRITE: -1})
-        await self._detonate_bomb(bomb, exclude={player.id})
+        # Other clients removed their copies on pickup. The carrier already
+        # exploded locally: relay once, excluding it (GServer-v2
+        # PlayerClientPackets.cpp msgPLI_EXPLOSION:829-844).
+        power = (power & 7) | 8
+        await self.server.broadcast_to_level(
+            bomb.level_name, build_explosion(player.id, x, y, radius, power),
+            exclude={player.id})
+        level = self.server.world.get_level(bomb.level_name)
+        if level is not None:
+            await self.blast_level_objects(level, x, y, radius, power, player.id)
         return True
 
-    async def _detonate_bomb(self, bomb: Bomb, exclude=None):
-        """
-        Detonate a bomb, creating explosion and dealing damage.
-
-        Args:
-            bomb: The bomb to detonate
-        """
+    async def _expire_bomb(self, bomb: Bomb):
+        """Expire server bomb state and affect only level objects."""
+        self._bombs.get(bomb.level_name, {}).pop(bomb.id, None)
         level = self.server.world.get_level(bomb.level_name)
         if not level:
             return
 
-        # FourPlay TServerLevel.cpp:1710: power is the type, not the radius.
+        # FourPlay TServerLevel.cpp:1310-1337, 1691-1725: EVERY client ticks
+        # and explodes its own copy; chain detonation is local too (1497-1500).
+        # Receivers call putBomb (TClient.cpp:3562-3576), which unconditionally
+        # enables ticking (TServerLevel.cpp:1087-1104).
+        # TExplosion.cpp:48-96 hurts only the victim's local player, whose
+        # CURPOWER prop reports the result. No timed-path sendExplosion call
+        # (TClient.cpp:1386). GServer-v2 Level.cpp:682-702 runs NPC effects
+        # without sending PLO_BOMBDEL/PLO_EXPLOSION or hurting players.
         crosses = [(bomb.x, bomb.y, 2)]
         if bomb.power == 2:
             crosses = [(bomb.x + dx, bomb.y + dy, 2)
                        for dx in (-2, 2) for dy in (-2, 2)]
             crosses.append((bomb.x, bomb.y, 4))
-        # FourPlay TExplosion.cpp:86: types 1/2 hurt half a heart, type 3 one.
-        damage = 2 if bomb.power == 3 else 1
+        await self.blast_level_objects(
+            level, bomb.x, bomb.y, crosses[-1][2], bomb.power,
+            bomb.player_id, crosses=crosses)
+
+    async def blast_level_objects(self, level: 'Level', x: float, y: float,
+                                  radius: int, power: int, player_id: int = 0,
+                                  *, crosses=None):
+        """Update the board, NPCs and baddies; clients own player damage."""
+        power &= 7
+        damage = 2 if power == 3 else 1
+        if crosses is None:
+            crosses = [(x, y, radius)]
         # FourPlay TServerLevel.cpp:1624: cells step two tiles along each arm.
         # putExplosion (1494) has no wall test; even cells beyond walls exist.
         cells = set()
-        for x, y, radius in crosses:
-            cells.add((x, y))
+        for cx, cy, arm_radius in crosses:
+            cells.add((cx, cy))
             for dx, dy in ((0, -2), (-2, 0), (0, 2), (2, 0)):
-                cells.update((x + dx * n, y + dy * n)
-                             for n in range(1, radius + 1))
-
-        await self.server.broadcast_to_level(
-            bomb.level_name, build_bomb_del(bomb.x, bomb.y),
-            **({'exclude': exclude} if exclude else {})
-        )
-
-        # Broadcast explosion effect
-        for x, y, radius in crosses:
-            packet = build_explosion(x, y, radius, bomb.power)
-            await self.server.broadcast_to_level(
-                bomb.level_name, packet, **({'exclude': exclude} if exclude else {}))
+                cells.update((cx + dx * n, cy + dy * n)
+                             for n in range(1, arm_radius + 1))
         await self._destroy_blast_blocks(level, cells)
 
-        # FourPlay TExplosion.cpp:62: inclusive cell/player centre distances.
-        for player in self.server.audience.players_on_level(bomb.level_name):
-            if not any(abs(ex + 1.0 - (player.x + 1.5)) <= 1.0 and
-                       abs(ey + 1.0 - (player.y + 2.0)) <= 1.0
-                       for ex, ey in cells):
-                continue
-            dx = player.x - bomb.x
-            dy = player.y - bomb.y
-            distance = (dx * dx + dy * dy) ** 0.5
-            # Apply damage with knockback away from explosion
-            knockback_x = dx / (distance + 0.1) * 2  # Prevent division by zero
-            knockback_y = dy / (distance + 0.1) * 2
-            await self.apply_damage(
-                player, damage, knockback_x, knockback_y,
-                DamageType.BOMB, bomb.player_id
-            )
-
-        # Damage baddies in radius
         if hasattr(self.server, 'baddy_manager'):
             await self.server.baddy_manager.handle_explosion(
-                bomb.level_name, bomb.x, bomb.y, radius, damage
-            )
+                level.name, x, y, radius, damage)
 
-        # Damage NPCs in radius and fire `exploded` (scripting-gs1-events.md:
-        # "Triggered when an NPC is touched by an explosion" - GServer-v2
-        # Level.cpp:2137/2142/2192 hurtAndPush(..., ScriptEventType::EXPLODED)).
+        # GServer-v2 Level.cpp addExplosion: NPC hurtAndPush fires EXPLODED;
+        # keep both NPC damage and the event when the server timer expires.
         npc_mgr = getattr(self.server, 'npc_manager', None)
         if npc_mgr is not None and hasattr(npc_mgr, 'get_npcs_on_level'):
             attacker = None
             if hasattr(self.server, 'get_player'):
-                attacker = self.server.get_player(bomb.player_id)
+                attacker = self.server.get_player(player_id)
             for npc in self.server.audience.npcs_near(
-                    level, bomb.x, bomb.y, radius, BOMB_BLAST_NPCS):
+                    level, x, y, radius, BOMB_BLAST_NPCS):
                 npc.hearts = max(0.0, npc.hearts - damage / 2.0)
                 if hasattr(npc, 'mark_dirty'):
                     npc.mark_dirty()
                 if hasattr(npc_mgr, 'on_npc_exploded'):
                     await npc_mgr.on_npc_exploded(npc, attacker)
-
-        logger.debug(f"Bomb detonated at ({bomb.x}, {bomb.y}) with radius {radius}")
 
     async def _destroy_blast_blocks(self, level: 'Level', cells):
         # FourPlay TServerLevel.cpp:1542: replace only complete matching blocks.

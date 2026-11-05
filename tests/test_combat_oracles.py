@@ -41,21 +41,34 @@ def arena():
     return server, level, manager, player
 
 
-@pytest.mark.parametrize('power,hearts', [(1, 2.5), (2, 2.5), (3, 2.0)])
-@pytest.mark.parametrize('dx,dy,hit', [
-    (0, 0, True), (4, 0, True), (-4, 0, True),
-    (0, 4, True), (0, -4, True), (1, 0, True),
-    (1.001, 1.001, False), (5.001, 0, False),
+def assert_no_server_bomb_damage(server, *players):
+    # FourPlay TExplosion.cpp:48-96: victims hurt themselves locally.
+    forbidden = {PLO.EXPLOSION, PLO.BOMBDEL, PLO.HURTPLAYER}
+    assert all(PacketReader(call.args[1]).read_gchar() not in forbidden
+               for call in server.broadcast_to_level.await_args_list)
+    for player in players:
+        assert player.hearts == 3.0
+        player.send_raw.assert_not_awaited()
+        player.send_props.assert_not_awaited()
+
+
+@pytest.mark.parametrize('power', [1, 2, 3])
+@pytest.mark.parametrize('dx,dy', [
+    (0, 0), (4, 0), (-4, 0), (0, 4), (0, -4), (1, 0),
+    (1.001, 1.001), (5.001, 0),
 ])
-def test_bomb_cross_cells_and_damage(power, hearts, dx, dy, hit):
+def test_bomb_cross_cells_and_damage(power, dx, dy):
     async def run():
         server, level, manager, player = arena()
         target = player(2, 19.5 + dx, 19.0 + dy)
-        # Type 2 also covers the diagonal and the more distant arm position.
-        expected_hit = hit or power == 2
-        await manager._detonate_bomb(Bomb(1, 1, level.name, 20, 20, power, 0))
-        assert target.hearts == (hearts if expected_hit else 3.0)
-        assert target.send_raw.await_count == int(expected_hit)
+        server.baddy_manager = SimpleNamespace(handle_explosion=AsyncMock())
+        bomb = Bomb(1, 1, level.name, 20, 20, power, 0)
+        manager._bombs[level.name] = {bomb.id: bomb}
+        await manager._tick()
+        assert not manager.get_bombs_on_level(level.name)
+        assert_no_server_bomb_damage(server, target)
+        server.baddy_manager.handle_explosion.assert_awaited_once_with(
+            level.name, 20, 20, 4 if power == 2 else 2, 2 if power == 3 else 1)
     asyncio.run(run())
 
 
@@ -64,16 +77,21 @@ def test_bomb_type_two_has_corner_crosses_and_eight_tile_arms():
         server, level, manager, player = arena()
         targets = [player(2, 25.5, 17), player(3, 27.5, 19),
                    player(4, 25.5, 25)]
-        await manager._detonate_bomb(Bomb(1, 1, level.name, 20, 20, 2, 0))
-        assert [p.hearts for p in targets] == [2.5, 2.5, 3.0]
-        explosions = []
-        for call in server.broadcast_to_level.await_args_list:
-            reader = PacketReader(call.args[1])
-            if reader.read_gchar() == PLO.EXPLOSION:
-                explosions.append(tuple(reader.read_gchar() for _ in range(4)))
-        assert sorted(explosions) == sorted([
-            (36, 36, 2, 2), (36, 44, 2, 2),
-            (44, 36, 2, 2), (44, 44, 2, 2), (40, 40, 4, 2)])
+        # Preserve the cells needed for server board effects, including corners.
+        blocks = [(26, 18), (28, 20)]
+        for x, y in blocks:
+            for (dx, dy), tile in zip(((0, 0), (0, 1), (1, 0), (1, 1)),
+                                      (2, 0x12, 3, 0x13)):
+                level.set_tile(x + dx, y + dy, tile)
+        bomb = Bomb(1, 1, level.name, 20, 20, 2, 0)
+        manager._bombs[level.name] = {bomb.id: bomb}
+        await manager._tick()
+        assert not manager.get_bombs_on_level(level.name)
+        assert_no_server_bomb_damage(server, *targets)
+        for x, y in blocks:
+            assert tuple(level.get_tile(x + dx, y + dy)
+                         for dx, dy in ((0, 0), (0, 1), (1, 0), (1, 1))) == (
+                             0x2a5, 0x2b5, 0x2a6, 0x2b6)
     asyncio.run(run())
 
 
@@ -93,8 +111,8 @@ def test_bomb_crosses_walls_and_replaces_complete_lift_blocks(original, replacem
         offsets = ((0, 0), (0, 1), (1, 0), (1, 1))
         for (dx, dy), tile in zip(offsets, original):
             level.set_tile(24 + dx, 20 + dy, tile)
-        await manager._detonate_bomb(Bomb(1, 1, level.name, 20, 20, 1, 0))
-        assert target.hearts == 2.5
+        await manager._expire_bomb(Bomb(1, 1, level.name, 20, 20, 1, 0))
+        assert_no_server_bomb_damage(server, target)
         assert tuple(level.get_tile(24 + dx, 20 + dy)
                      for dx, dy in offsets) == replacement
         packets = [c.args[1] for c in server.broadcast_to_level.await_args_list]

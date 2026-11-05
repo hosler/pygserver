@@ -14,18 +14,21 @@ from typing import Any, Dict, List, Tuple  # noqa: F401  - kept: original import
 
 logger = logging.getLogger(__name__)
 
-def build_bomb_add(player_id: int, x: float, y: float, power: int, time_left: float) -> bytes:
+def build_bomb_add(player_id: int, x: float, y: float, power: int, timer_ticks: int) -> bytes:
     """Build PLO_BOMBADD packet.
 
-    Format: {GSHORT owner_id}{GCHAR x*2}{GCHAR y*2}{GCHAR power}{GCHAR timer}
-    timer is 50ms increments (+50ms base); time_left is seconds.
+    Format: {GSHORT owner_id}{GCHAR x*2}{GCHAR y*2}{GCHAR power_flags}{GCHAR timer_ticks}
+    FourPlay TClient.cpp:5430-5448 and GServer-v2 Level.cpp:2085.
+    Bits 0-2 hold the type; bit 3 attributes damage to the player owner
+    (TClient.cpp:1661-1680, 3571-3574). Relay ticks without a seconds conversion:
+    TServerLevel.cpp:1116-1121 already subtracts five ticks at the sender.
     """
     builder = PacketBuilder().write_gchar(PLO.BOMBADD)
     builder.write_gshort(player_id)
     builder.write_gchar(int(x * 2))
     builder.write_gchar(int(y * 2))
-    builder.write_gchar(int(power) & 0x03)
-    builder.write_gchar(max(0, int(time_left / 0.05) - 1))
+    builder.write_gchar(int(power) & 0x0f)
+    builder.write_gchar(timer_ticks)
     builder.write_newline()
     return builder.build()
 
@@ -64,13 +67,18 @@ def build_arrow_add(player_id: int, x: float, y: float, flags: int,
     return builder.build()
 
 
-def build_explosion(x: float, y: float, radius: int, power: int) -> bytes:
-    """Build PLO_EXPLOSION packet."""
+def build_explosion(player_id: int, x: float, y: float, radius: int, power: int) -> bytes:
+    """Build {GSHORT owner_id}{GCHAR radius}{GCHAR x*2}{GCHAR y*2}{GCHAR power_flags}.
+
+    FourPlay TClient.cpp:5461-5473; GServer-v2 Level.cpp:2211.
+    Player-owned explosions carry bit 3; script explosions use owner 0.
+    """
     builder = PacketBuilder().write_gchar(PLO.EXPLOSION)
+    builder.write_gshort(player_id)
+    builder.write_gchar(int(radius))
     builder.write_gchar(int(x * 2))
     builder.write_gchar(int(y * 2))
-    builder.write_gchar(int(radius))
-    builder.write_gchar(int(power))
+    builder.write_gchar(int(power) & 0x0f)
     builder.write_newline()
     return builder.build()
 
