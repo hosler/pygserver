@@ -14,6 +14,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, List, Dict, Tuple, Callable
 from enum import IntEnum
 
+from .attachments import absolute_position
+
 from .audience import BOMB_BLAST_BADDIES, Audience
 from .protocol.constants import PLO, BDPROP, BDMODE
 from .protocol.packets import PacketBuilder, build_baddy_props, build_baddy_hurt
@@ -275,8 +277,8 @@ class BaddyManager:
         nearest_distance = float('inf')
 
         for player in self.server.audience.players_on_level(level.name):
-            dx = player.x - baddy.x
-            dy = player.y - baddy.y
+            dx = absolute_position(player)[0] - baddy.x
+            dy = absolute_position(player)[1] - baddy.y
             distance = math.sqrt(dx * dx + dy * dy)
 
             if distance < nearest_distance:
@@ -296,7 +298,7 @@ class BaddyManager:
             if nearest_player and nearest_distance < baddy.detection_range:
                 # Move towards player
                 baddy.target_player_id = nearest_player.id
-                await self._move_towards_target(baddy, nearest_player.x, nearest_player.y, delta_time)
+                await self._move_towards_target(baddy, absolute_position(nearest_player)[0], absolute_position(nearest_player)[1], delta_time)
 
                 # Check for attack
                 if nearest_distance < 1.5 and baddy.attack_cooldown <= 0:
@@ -311,7 +313,7 @@ class BaddyManager:
         elif baddy.mode == BDMODE.SWARM:
             # Aggressive mode - always chase
             if nearest_player:
-                await self._move_towards_target(baddy, nearest_player.x, nearest_player.y, delta_time)
+                await self._move_towards_target(baddy, absolute_position(nearest_player)[0], absolute_position(nearest_player)[1], delta_time)
                 if nearest_distance < 1.5 and baddy.attack_cooldown <= 0:
                     await self._attack_player(baddy, nearest_player)
 
@@ -389,8 +391,8 @@ class BaddyManager:
         baddy.attack_cooldown = 1.0  # 1 second cooldown
 
         # Calculate knockback direction
-        dx = player.x - baddy.x
-        dy = player.y - baddy.y
+        dx = absolute_position(player)[0] - baddy.x
+        dy = absolute_position(player)[1] - baddy.y
         distance = max(0.1, math.sqrt(dx * dx + dy * dy))
         knockback_x = (dx / distance) * 2
         knockback_y = (dy / distance) * 2
@@ -508,8 +510,8 @@ class BaddyManager:
 
         # Knockback away from the explicit GS1 origin when supplied, otherwise
         # from the attacking player (ordinary client-reported combat).
-        origin_x = player.x if from_x is None else from_x
-        origin_y = player.y if from_y is None else from_y
+        origin_x = absolute_position(player)[0] if from_x is None else from_x
+        origin_y = absolute_position(player)[1] if from_y is None else from_y
         dx = baddy.x - origin_x
         dy = baddy.y - origin_y
         distance = max(0.1, math.sqrt(dx * dx + dy * dy))

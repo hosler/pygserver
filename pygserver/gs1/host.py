@@ -19,6 +19,7 @@ import math
 import re
 import time
 
+from ..attachments import absolute_position
 from reborn_protocol.coords import (
     LEVEL_SIZE, segment_index,
 )
@@ -191,6 +192,8 @@ class _GS1ObjectRef:
         attr = table.get(name)
         if attr is None:
             return UNSET
+        if self.kind == "player" and attr in ('x', 'y'):
+            return host_value(absolute_position(self.target)[attr == 'y'])
         return host_value(getattr(self.target, attr, 0))
 
     def set(self, name, value):
@@ -248,7 +251,9 @@ class GS1Host(Host):
         if reader is not None:
             return reader(self, name, indices, ctx, npc, player)
         if name in PLAYER_ATTR and player is not None:
-            value = getattr(player, PLAYER_ATTR[name], 0)
+            attr = PLAYER_ATTR[name]
+            value = (absolute_position(player)[attr == 'y'] if attr in ('x', 'y')
+                     else getattr(player, attr, 0))
             # The player wire/state scale is 0/2/3; NPC glove power is 0/1/2.
             return self._coerce(value)
         if name in NPC_ATTR and npc is not None:
@@ -502,6 +507,10 @@ class GS1Host(Host):
             npc.mark_dirty()
 
     def _set_player_attr(self, player, attr, value, ctx=None):
+        if attr in ('x', 'y') and getattr(player, 'attach_npc', (0, 0))[1]:
+            # Script coordinates are absolute; retain offsets in wire state.
+            base = absolute_position(player)[attr == 'y'] - getattr(player, attr)
+            value = to_num(value) - base
         cur = getattr(player, attr, None)
         if isinstance(cur, str) or attr in ("chat", "nickname", "account_name",
                                             "head_image", "body_image",
@@ -577,8 +586,9 @@ class GS1Host(Host):
         level = getattr(player, "level", None)
         if level is None:
             return False
-        x = math.floor(to_num(getattr(player, "x", 0)) + 1.5)
-        y = math.floor(to_num(getattr(player, "y", 0)) + 2.0)
+        px, py = absolute_position(player)
+        x = math.floor(to_num(px) + 1.5)
+        y = math.floor(to_num(py) + 2.0)
         tile_id = level.get_tile(x, y) if hasattr(level, "get_tile") else 0
         return tiletypes.get_tile_type(tile_id) in (tiletypes.WATER, tiletypes.LAVA)
 
@@ -617,7 +627,9 @@ class GS1Host(Host):
             rect = getter()
             if isinstance(rect, (tuple, list)) and len(rect) >= 4:
                 return tuple(to_num(v) for v in rect[:4])
-        x, y = to_num(getattr(obj, "x", 0)) * 16, to_num(getattr(obj, "y", 0)) * 16
+        px, py = (absolute_position(obj) if player else
+                  (getattr(obj, "x", 0), getattr(obj, "y", 0)))
+        x, y = to_num(px) * 16, to_num(py) * 16
         if player:
             return x + 8, y + 16, 32, 32
         shape = getattr(obj, "shape", None)
@@ -633,8 +645,8 @@ class GS1Host(Host):
             return []
         x, y = to_num(args[0]), to_num(args[1])
         players = self._players_on_level(ctx)
-        players.sort(key=lambda p: (to_num(getattr(p, "x", 0)) - x) ** 2
-                     + (to_num(getattr(p, "y", 0)) - y) ** 2)
+        players.sort(key=lambda p: (to_num(absolute_position(p)[0]) - x) ** 2
+                     + (to_num(absolute_position(p)[1]) - y) ** 2)
         return players
 
     def _nearest_player(self, args, ctx, return_id):

@@ -13,6 +13,8 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, List, Dict, Tuple, Set
 from enum import IntEnum
 
+from .attachments import absolute_position
+
 from .audience import (
     BOMB_BLAST_NPCS,
     FIRESPY_HIT_PLAYERS,
@@ -586,30 +588,15 @@ class CombatManager:
         arrow_id = self._next_arrow_id
         self._next_arrow_id += 1
 
-        # Simulate flight from the server's own tracked player.x/y, NOT the
-        # wire-reported x/y. player.x/y is kept authoritative and always in
-        # the current level's LOCAL 0-63 space by _handle_player_props (every
-        # movement update stores it there, gmap or not - see player.warp()'s
-        # PLO_PLAYERWARP2 use of local coords for gmap segments). The client-
-        # reported x/y, on the other hand, is whatever coordinate frame the
-        # client happens to be using for its own rendering - on a GMAP,
-        # pyReborn's Client.player.x/y are WORLD coordinates (local + grid*64,
-        # unlike Client.move()'s explicit local_x/local_y conversion), so a
-        # PLI_ARROWADD sent while standing on a gmap segment carried e.g.
-        # x=94 for a level whose Level.WIDTH is 64 - the bounds check below
-        # saw that as instantly out-of-map and dropped the arrow before it
-        # ever reached the player-hit check, so PvP arrows always dealt zero
-        # damage on gmap levels (ammo still decremented since that happens
-        # above, unconditionally). Trusting our own authoritative position
-        # instead - matching the "server is authoritative here by design"
-        # policy in _update_arrow's docstring - fixes flight/collision
-        # regardless of what frame the firing client's x/y happens to be in.
+        # Simulate from the absolute level-local position, including the NPC
+        # displacement while attached. ARROWADD axes may be world coordinates
+        # on a gmap, so they cannot serve as the flight/collision origin.
         arrow = Arrow(
             id=arrow_id,
             player_id=player.id,
             level_name=player.level.name,
-            x=player.x,
-            y=player.y,
+            x=absolute_position(player)[0],
+            y=absolute_position(player)[1],
             direction=direction,
             power=power,
         )
@@ -679,10 +666,11 @@ class CombatManager:
         # FourPlay TServerFlying.cpp:135: strict sprite/body rectangle overlap.
         for player in self.server.audience.players_on_level(
                 arrow.level_name, exclude={arrow.player_id}):
-            if not (arrow.x + width > player.x + 0.5 and
-                    player.x + 2.5 > arrow.x and
-                    arrow.y + height > player.y + 1.0 and
-                    player.y + 3.0 > arrow.y):
+            px, py = absolute_position(player)
+            if not (arrow.x + width > px + 0.5 and
+                    px + 2.5 > arrow.x and
+                    arrow.y + height > py + 1.0 and
+                    py + 3.0 > arrow.y):
                 continue
             # FourPlay TServerFlying.cpp:141: idle/walk, opposite flight
             # direction, any positive shield, and projectile power <= 1.
@@ -777,7 +765,9 @@ class CombatManager:
         # (damage is client-authoritative in classic), but that lets a
         # modified client hurt anyone anywhere on the level; 6 tiles is
         # generous for sword reach + movement latency.
-        if abs(attacker.x - target.x) > 6.0 or abs(attacker.y - target.y) > 6.0:
+        ax, ay = absolute_position(attacker)
+        tx, ty = absolute_position(target)
+        if abs(ax - tx) > 6.0 or abs(ay - ty) > 6.0:
             logger.debug(f"Rejecting hurt from {attacker.id} on {target_id}: "
                          f"out of range")
             return
@@ -1003,7 +993,7 @@ class CombatManager:
         npc_mgr = getattr(self.server, 'npc_manager', None)
         # FourPlay TServerPlayer.cpp:1067: ground origin for remote throws.
         thrown = ThrownObject(
-            player, player.level, player.x + 0.5, player.y + 1.0,
+            player, player.level, absolute_position(player)[0] + 0.5, absolute_position(player)[1] + 1.0,
             int(direction) & 3, _SPRITE_TO_TYPE.get(carrysprite)
         )
         if player.id in self._held_bombs:
@@ -1029,7 +1019,7 @@ class CombatManager:
             npc_id = getattr(player, 'npc_id', 0)
             carried_npc = npc_mgr.get_npc(npc_id) if npc_mgr and npc_id else None
             if carried_npc is not None:
-                carried_npc.x, carried_npc.y = player.x, player.y
+                carried_npc.x, carried_npc.y = absolute_position(player)[0], absolute_position(player)[1]
                 carried_npc.visible = True
                 carried_npc.mark_dirty()
                 task = asyncio.create_task(
@@ -1118,8 +1108,8 @@ class CombatManager:
             if (getattr(player, 'hearts', 0) <= 0 or
                     self.is_invincible(player.id)):
                 continue
-            if (abs(thrown.x - (player.x + 0.5)) < 2.0 and
-                    abs(thrown.y - (player.y + 1.0)) < 2.0):
+            if (abs(thrown.x - (absolute_position(player)[0] + 0.5)) < 2.0 and
+                    abs(thrown.y - (absolute_position(player)[1] + 1.0)) < 2.0):
                 await self.apply_damage(
                     player, 1 if player.hearts <= 1.0 else 2,
                     dx, dy, DamageType.OTHER, thrown.player.id

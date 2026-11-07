@@ -123,8 +123,10 @@ class CombatHandlers:
             return
         reader = PacketReader(data)
         radius = reader.read_gchar() if reader.remaining() else 4
-        x = reader.read_gchar() / 2.0 if reader.remaining() else self.x
-        y = reader.read_gchar() / 2.0 if reader.remaining() else self.y
+        from ..attachments import absolute_position
+        px, py = absolute_position(self)
+        x = reader.read_gchar() / 2.0 if reader.remaining() else px
+        y = reader.read_gchar() / 2.0 if reader.remaining() else py
         power = reader.read_gchar() if reader.remaining() else 2
 
         manager = getattr(self.server, 'combat_manager', None)

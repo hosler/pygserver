@@ -11,6 +11,8 @@ import time
 from typing import TYPE_CHECKING, Optional, Dict, Any, List, Set, Callable
 from dataclasses import dataclass, field
 
+from .attachments import absolute_position
+
 from .protocol.constants import PLI, PLO, PLPROP, PLPERM
 from .protocol.packets import (
     PacketBuilder,
@@ -541,8 +543,8 @@ class RCManager:
         return {
             PLPROP.NICKNAME: player.nickname,
             PLPROP.CURLEVEL: player.level.name if player.level else "",
-            PLPROP.X2: player.x,
-            PLPROP.Y2: player.y,
+            PLPROP.X2: absolute_position(player)[0],
+            PLPROP.Y2: absolute_position(player)[1],
             PLPROP.CURPOWER: int(player.hearts * 2),
             # MAXPOWER is FULL hearts on the wire (unlike CURPOWER's halves)
             # - GServer-v2 PlayerProps.cpp:171-186.

@@ -12,6 +12,8 @@ import random
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, List, Dict, Tuple, Set
 
+from .attachments import absolute_position
+
 from .protocol.constants import PLO, PLPROP, LevelItemType
 from .protocol.packets import (
     PacketBuilder,
@@ -306,8 +308,8 @@ class ItemManager:
                 if 164 - ticks >= 160 or item.layer != getattr(player, 'layer', 0):
                     return False
                 # TServerLevel.cpp:1419: use player/item centres, not packet xy.
-                if not (abs(player.x + 1.5 - (item.x + 1.0)) < 2.0
-                        and abs(player.y + 2.0 - (item.y + 1.0)) < 2.0):
+                if not (abs(absolute_position(player)[0] + 1.5 - (item.x + 1.0)) < 2.0
+                        and abs(absolute_position(player)[1] + 2.0 - (item.y + 1.0)) < 2.0):
                     return False
                 # Claim before awaiting the grant so concurrent takes grant once.
                 del self._items[level_name][item_id]
@@ -477,9 +479,9 @@ class ItemManager:
         # level from spawn — a playtester grabbed chests 16 tiles away. The
         # player pos is the sprite's top-left; allow a couple tiles of slack for
         # sprite size + movement latency, same spirit as combat's range cap.
-        if abs(player.x - x) > 3.0 or abs(player.y - y) > 3.0:
+        if abs(absolute_position(player)[0] - x) > 3.0 or abs(absolute_position(player)[1] - y) > 3.0:
             logger.debug(f"Rejecting chest open from {player.id} at "
-                         f"({player.x:.1f},{player.y:.1f}) on chest ({x},{y}): "
+                         f"({absolute_position(player)[0]:.1f},{absolute_position(player)[1]:.1f}) on chest ({x},{y}): "
                          f"out of range")
             return False
 

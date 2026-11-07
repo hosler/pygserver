@@ -12,6 +12,8 @@ import time
 from typing import TYPE_CHECKING, Optional, Dict, Any, List, Callable
 from pathlib import Path
 
+from .attachments import absolute_position
+
 from .protocol.packets import PacketBuilder, build_npc_props
 from .protocol.constants import PLO, NPCPROP
 
@@ -886,10 +888,11 @@ class NPCManager:
         if touching is None:
             touching = set()
         current = set()
+        px, py = absolute_position(player)
         for npc in self.get_npcs_on_level(player.level):
             if not getattr(npc, 'visible', True):
                 continue
-            if abs(npc.x - player.x) < 2.0 and abs(npc.y - player.y) < 2.0:
+            if abs(npc.x - px) < 2.0 and abs(npc.y - py) < 2.0:
                 current.add(npc.id)
                 if npc.id not in touching:
                     await self.on_player_touches(player, npc)

@@ -46,6 +46,7 @@ class AudienceServer:
 
     def add_player(self, level, player_id, x=0.0, y=0.0):
         player = MagicMock()
+        player.attach_npc = (0, 0)
         player.id = player_id
         player.x, player.y = x, y
         player.send_raw = AsyncMock()

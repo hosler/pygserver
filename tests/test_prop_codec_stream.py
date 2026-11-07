@@ -130,7 +130,7 @@ def test_props_inside_the_gattrib_range_are_not_read_as_strings():
             + _gchar(PLPROP.CURLEVEL) + _gstring("start.nw"))
     props = parse_player_props(data)
     assert props[PLPROP.CURLEVEL] == "start.nw"
-    assert PLPROP.ATTACHNPC not in props
+    assert props[PLPROP.ATTACHNPC] == (1, 9)
 
 
 def test_headimage_uses_the_headgif_form_not_a_plain_string():
@@ -187,6 +187,7 @@ def _plyradd_packet():
     client._send_packet = AsyncMock()
 
     player = MagicMock()
+    player.attach_npc = (0, 0)
     player.send_packet = AsyncMock()
     player.id = 7
     player.connection_type = 0

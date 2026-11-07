@@ -15,6 +15,8 @@ from pathlib import Path
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, List, Dict, Any
 
+from .attachments import absolute_position
+
 from .protocol.constants import PLTYPE
 
 if TYPE_CHECKING:
@@ -570,8 +572,7 @@ class AccountManager:
         # Save position
         if player.level:
             account.level_name = player.level.name
-            account.x = player.x
-            account.y = player.y
+            account.x, account.y = absolute_position(player)
 
         self._save_account(account)
         logger.debug(f"Saved player data to account {account.account_name}")

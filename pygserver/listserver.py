@@ -20,6 +20,8 @@ from reborn_protocol import (
 )
 from reborn_protocol.props import PLAYER_PROPS, encode_value
 
+from .attachments import absolute_position
+
 if TYPE_CHECKING:
     from .server import GameServer
     from .player import Player
@@ -567,8 +569,8 @@ class ServerListClient:
             (PLPROP.ACCOUNTNAME, player.account_name),
             (PLPROP.NICKNAME, player.nickname),
             (PLPROP.CURLEVEL, player.level.name if player.level else ""),
-            (PLPROP.X, player.x),
-            (PLPROP.Y, player.y),
+            (PLPROP.X, absolute_position(player)[0]),
+            (PLPROP.Y, absolute_position(player)[1]),
             (PLPROP.ALIGNMENT, getattr(player, 'ap', 0)),
             (PLPROP.IPADDR, 0),  # 0, not the real IP, for privacy
         ):

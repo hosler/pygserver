@@ -125,6 +125,12 @@ def _b_carriesnpc(self, name, indices, ctx, npc, player):
     return bool(carried_npc)
 
 
+def _b_attached(self, name, indices, ctx, npc, player):
+    # TServerPlayerProperties.cpp:74-78: attached means attached to actionnpc.
+    return (npc is not None and player is not None and
+            getattr(player, 'attach_npc', (0, 0)) == (0, npc.id))
+
+
 def _b_sprite(self, name, indices, ctx, npc, player):
     if npc is None:
         return UNSET
@@ -216,6 +222,7 @@ _BUILTINS = {
     "playeronline": _b_playeronline, "isweapon": _b_isweapon,
     "playerswimming": _b_playerswimming,
     "carrying": _b_carrying, "carriesnpc": _b_carriesnpc,
+    "attached": _b_attached, "player.attached": _b_attached,
     "sprite": _b_sprite, "timeout": _b_timeout,
     "weaponsenabled": _b_weaponsenabled, "playeronhorse": _b_playeronhorse,
     "playerismale": _b_player_gender, "playerisfemale": _b_player_gender,

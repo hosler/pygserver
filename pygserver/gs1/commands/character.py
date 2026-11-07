@@ -5,6 +5,7 @@ import time
 
 from reborn_protocol.gs1.values import to_num, to_str
 
+from ...attachments import absolute_position
 from ..host import (
     NPC_CHARPROP, PLAYER_CHARPROP, PLAYER_PROP_WIRE, PLPROP, _CLASSIC_COLOR_INDEX, _NPC_GATTRIB_PROPS, _PLAYER_GATTRIB_PROPS, _charprop_target,
 )
@@ -492,15 +493,14 @@ def _c_setlevel2(self, a, npc, player, ctx):
     if player is None or not a or not hasattr(player, "warp"):
         return
     lvl = to_str(a[0])
-    x = to_num(a[1]) if len(a) > 1 else getattr(player, "x", 30)
-    y = to_num(a[2]) if len(a) > 2 else getattr(player, "y", 30)
+    x = to_num(a[1]) if len(a) > 1 else absolute_position(player)[0]
+    y = to_num(a[2]) if len(a) > 2 else absolute_position(player)[1]
     _schedule(player.warp(lvl, x, y))
 
 def _c_setlevel(self, a, npc, player, ctx):
     if player is None or not a or not hasattr(player, "warp"):
         return
-    _schedule(player.warp(to_str(a[0]), getattr(player, "x", 30),
-                          getattr(player, "y", 30)))
+    _schedule(player.warp(to_str(a[0]), *absolute_position(player)))
 
 def _c_noop(self, a, npc, player, ctx):
     pass

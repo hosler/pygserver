@@ -5,6 +5,7 @@ import math
 
 from reborn_protocol.gs1.values import to_num
 
+from ...attachments import absolute_position
 from ..execution import _schedule
 from ..host import NPC_CHARPROP, PLAYER_CHARPROP, PLAYER_PROP_WIRE, PLPROP, _NPC_GATTRIB_PROPS, _PLAYER_GATTRIB_PROPS, _charprop_target  # noqa: F401  - kept: original import block (star-import consumers rely on it)
 import asyncio  # noqa: F401  - kept: original import block (star-import consumers rely on it)
@@ -106,7 +107,11 @@ def _normalized_push(target, from_x, from_y, distance=1.0):
 def _player_hurt_push(target, from_x, from_y):
     # Server::hitPlayer pushes four tiles, converts to pixels (*16), then
     # recentres both wire components at 64.
-    dx, dy = _normalized_push(target, from_x, from_y, 4.0)
+    x, y = absolute_position(target)
+    dx, dy = x - to_num(from_x), y - to_num(from_y)
+    length = math.hypot(dx, dy)
+    if length:
+        dx, dy = dx / length * 4.0, dy / length * 4.0
     return int(dx * 16) + 64, int(dy * 16) + 64
 
 def _c_hitobjects(self, a, npc, player, ctx):

@@ -31,7 +31,7 @@ class Character:
     """The body in the world: position, stats, gear and animation."""
 
     def __init__(self):
-        # Position (in tiles)
+        # Wire position in tiles: NPC-relative when attached, level-local otherwise.
         self.x = 0.0
         self.y = 0.0
         self.direction = 2  # Down
@@ -39,6 +39,7 @@ class Character:
         # Retained until a carried-NPC throw consumes it.  Clients normally
         # clear CARRYNPC separately from sending THROWCARRIED.
         self.npc_id = 0
+        self.attach_npc = (0, 0)
 
         # Stats
         self.hearts = 3.0

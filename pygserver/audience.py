@@ -46,6 +46,8 @@ import math
 from enum import Enum, auto
 from typing import Callable, Iterable, List, Optional, Set, TYPE_CHECKING
 
+from .attachments import absolute_position
+
 if TYPE_CHECKING:
     from .level import Level
     from .player import Player
@@ -142,7 +144,7 @@ class Audience:
         """Players on `level_name` inside `shape` of `radius` around (x, y)."""
         return [
             p for p in self.players_on_level(level_name, exclude)
-            if contains(shape, x, y, radius, p.x, p.y)
+            if contains(shape, x, y, radius, absolute_position(p)[0], absolute_position(p)[1])
         ]
 
     def npcs_near(self, level: 'Level', x: float, y: float, radius: float,

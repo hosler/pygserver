@@ -59,6 +59,7 @@ class TestDefaultWeaponItems:
         from pygserver.player import Player
 
         player = MagicMock()
+        player.attach_npc = (0, 0)
         player.weapons = []
         player.has_weapon = lambda n: Player.has_weapon(player, n)
         player.add_weapon = lambda n: Player.add_weapon(player, n)

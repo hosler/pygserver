@@ -22,6 +22,7 @@ import logging
 import time
 from typing import TYPE_CHECKING, Optional, Dict, Any, Set, Tuple
 
+from .attachments import absolute_position, clear_attachment
 from .handlers import (
     CombatHandlers,
     CommunicationHandlers,
@@ -79,6 +80,7 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
         self.session = PlayerSession(reader, writer)
         self.identity = Identity()
         self.character = Character()
+        self._last_absolute_position = (self.x, self.y)
         self.inventory = Inventory()
         self.status = Status()
         self.login_service = LoginService(self)
@@ -327,10 +329,16 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
                 # warp packet for position, full level re-send so the client
                 # (which may have already reset its local level state for the
                 # bogus name) recovers name/board/entities.
-                await self.send_raw(build_warp(self.x, self.y, self.level.name))
+                await self.send_raw(build_warp(*absolute_position(self), self.level.name))
                 await self._send_level(self.level)
             return
 
+        # TServerPlayer.cpp:140-160: level teardown breaks attachment links.
+        if (getattr(self, 'npc_id', 0) or getattr(self, 'attach_npc', (0, 0))[1]
+                or getattr(self, '_attachment_position_unknown', False)):
+            await self.send_props({PLPROP.CARRYNPC: 0, PLPROP.ATTACHNPC: (0, 0)})
+        self.npc_id = 0
+        clear_attachment(self)
         manager = getattr(self.server, 'combat_manager', None)
         if manager is not None and manager.discard_held_bomb(self.id) is not None:
             self.carrysprite = -1
@@ -369,6 +377,7 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
                     await new_leader.send_raw(build_is_leader())
         self.x = x
         self.y = y
+        self._last_absolute_position = (x, y)
         self.level = level
         level.add_player(self)
 
@@ -415,9 +424,9 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
         gmap_info = self.server.world.get_gmap_for_level(level.name)
         if gmap_info:
             _, gx, gy = gmap_info
-            warp_packet = build_warp2(self.x, self.y, level.name, gx, gy)
+            warp_packet = build_warp2(*absolute_position(self), level.name, gx, gy)
         else:
-            warp_packet = build_warp(self.x, self.y, level.name)
+            warp_packet = build_warp(*absolute_position(self), level.name)
 
         combined = level_name_pkt + announcement + board_packet + warp_packet
         await self.send_raw(combined)
@@ -510,6 +519,8 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
             PLPROP.NICKNAME: self.nickname,
             PLPROP.X2: self.x,
             PLPROP.Y2: self.y,
+            PLPROP.CARRYNPC: self.npc_id,
+            PLPROP.ATTACHNPC: getattr(self, '_attachment_wire', self.attach_npc),
             PLPROP.DIRECTION: self.direction,
             PLPROP.SPRITE: self.sprite,
             PLPROP.GANI: self.gani,
@@ -593,6 +604,7 @@ _STATE_ALIASES: Dict[str, Tuple[str, str]] = {
     'direction': ('character', 'direction'),
     'carrysprite': ('character', 'carrysprite'),
     'npc_id': ('character', 'npc_id'),
+    'attach_npc': ('character', 'attach_npc'),
     'hearts': ('character', 'hearts'),
     'max_hearts': ('character', 'max_hearts'),
     'rupees': ('character', 'rupees'),

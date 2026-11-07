@@ -12,6 +12,8 @@ import time
 from typing import Dict, Optional, Set, List
 from pathlib import Path
 
+from .attachments import absolute_position, clear_attachment
+
 from .audience import Audience
 from .ap_system import regen_step
 from .config import ServerConfig
@@ -377,7 +379,7 @@ class GameServer:
         for player in list(self.get_players_on_level(level.name)):
             for npc_id in retired_npc_ids:
                 await player.send_raw(build_npc_del(npc_id))
-            await player.warp(level.name, player.x, player.y)
+            await player.warp(level.name, *absolute_position(player))
 
     async def _handle_connection(self, reader: asyncio.StreamReader,
                                   writer: asyncio.StreamWriter):
@@ -417,6 +419,8 @@ class GameServer:
 
     async def _remove_player(self, player: Player):
         """Remove a player from the server."""
+        player.npc_id = 0
+        clear_attachment(player)
         manager = getattr(self, 'combat_manager', None)
         if manager is not None:
             manager.discard_held_bomb(player.id)

@@ -4,6 +4,7 @@ import logging
 
 from reborn_protocol import PLSTATUS
 
+from ..attachments import absolute_position, set_attachment
 from ..protocol.constants import PLI, PLO, PLPROP
 from ..protocol.packets import (
     PacketReader,
@@ -23,6 +24,7 @@ logger = logging.getLogger(__name__)
 # is relayed as a (power, image) pair.
 _RELAYED_PROPS = {
     PLPROP.CARRYSPRITE: 'carrysprite',
+    PLPROP.CARRYNPC: 'npc_id',
     PLPROP.DIRECTION: 'direction',
     PLPROP.SPRITE: 'sprite',
     PLPROP.GANI: 'gani',
@@ -66,7 +68,16 @@ class MovementHandlers:
         props = parse_player_props(data)
         pending_revive = getattr(self, 'pending_revive', None)
 
-        # Update position
+        # Capture the last absolute position before replacing any wire axes.
+        absolute_position(self)
+        if PLPROP.ATTACHNPC in props:
+            kind, npc_id = props[PLPROP.ATTACHNPC]
+            if npc_id <= 0 or kind == 0:
+                set_attachment(self, props[PLPROP.ATTACHNPC])
+            else:
+                props.pop(PLPROP.ATTACHNPC)
+
+        # Store NPC-relative axes while attached, level-local axes otherwise.
         if PLPROP.X2 in props:
             self.x = props[PLPROP.X2]
         elif PLPROP.X in props:
@@ -76,6 +87,7 @@ class MovementHandlers:
             self.y = props[PLPROP.Y2]
         elif PLPROP.Y in props:
             self.y = props[PLPROP.Y] / 2.0
+        absolute_position(self)
 
         if PLPROP.DIRECTION in props:
             self.direction = props[PLPROP.DIRECTION]
@@ -159,10 +171,13 @@ class MovementHandlers:
             # dropped every movement update from classic-prop senders, so
             # other players saw them frozen at their spawn position. Relay
             # as X2/Y2 (self.x/y were normalized above) whichever arrived.
+            # Preserve NPC-relative offsets verbatim while attached.
             if PLPROP.X in props or PLPROP.X2 in props:
                 broadcast_props[PLPROP.X2] = self.x
             if PLPROP.Y in props or PLPROP.Y2 in props:
                 broadcast_props[PLPROP.Y2] = self.y
+            if PLPROP.ATTACHNPC in props:
+                broadcast_props[PLPROP.ATTACHNPC] = props[PLPROP.ATTACHNPC]
             position_changed = (
                 PLPROP.X in props or PLPROP.X2 in props
                 or PLPROP.Y in props or PLPROP.Y2 in props

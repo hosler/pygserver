@@ -11,6 +11,8 @@ import time
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, List, Dict
 
+from .attachments import absolute_position
+
 from .protocol.constants import PLO, PLPROP
 from .protocol.packets import PacketBuilder, build_horse_add, build_horse_del
 
@@ -300,8 +302,8 @@ class HorseManager:
 
         # Place horse at player position
         if player.level:
-            horse.x = player.x
-            horse.y = player.y
+            horse.x = absolute_position(player)[0]
+            horse.y = absolute_position(player)[1]
             horse.level_name = player.level.name
             horse.direction = player.direction
 
@@ -348,8 +350,8 @@ class HorseManager:
 
         # Place dead horse at position
         if player.level:
-            horse.x = player.x
-            horse.y = player.y
+            horse.x = absolute_position(player)[0]
+            horse.y = absolute_position(player)[1]
             horse.level_name = player.level.name
 
         logger.info(f"Horse {horse.id} died")
@@ -433,8 +435,8 @@ class HorseManager:
             self._horses[old_level.name].pop(horse.id, None)
 
         horse.level_name = new_level.name
-        horse.x = player.x
-        horse.y = player.y
+        horse.x = absolute_position(player)[0]
+        horse.y = absolute_position(player)[1]
 
         if new_level.name not in self._horses:
             self._horses[new_level.name] = {}
