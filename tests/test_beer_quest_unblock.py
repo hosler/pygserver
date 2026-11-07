@@ -110,8 +110,8 @@ def find_npc_at(server, level, x, y):
 
 
 def test_beer_quest_sets_drunkguard_on_player():
-    """Sanity: 1 touch to open the quest + 5 beers delivered should flip
-    beerquest off and drunkguard on, on the PLAYER (bare flags live on
+    """Sanity: 1 touch to open the quest + 5 beers delivered should set
+    client.lc_done and drunkguard on the PLAYER (bare flags live on
     player.flags per gs1_host.run_npc_event)."""
     async def main():
         server, level = load_chicken_cave_entrance()
@@ -123,16 +123,16 @@ def test_beer_quest_sets_drunkguard_on_player():
         level.add_player(player)
         server._players[player.id] = player
 
-        # 1st touch: beerquest isn't set yet, opens the quest (no beer consumed).
+        # 1st touch: client.lc_started isn't set yet, opens the quest (no beer consumed).
         await server.npc_manager.on_player_touches(player, beer_guard)
-        assert player.flags.get("beerquest")
+        assert player.flags.get("client.lc_started")
 
         # 5 more touches, each delivering one beer.
         for _ in range(5):
             await server.npc_manager.on_player_touches(player, beer_guard)
 
         assert player.flags.get("drunkguard"), player.flags
-        assert not player.flags.get("beerquest"), player.flags
+        assert player.flags.get("client.lc_done"), player.flags
 
     asyncio.run(main())
 
