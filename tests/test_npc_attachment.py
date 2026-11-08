@@ -12,6 +12,7 @@ from pygserver.level import Level
 from pygserver.protocol.constants import PLPROP, PLO
 from pygserver.protocol.packets import PacketReader, parse_player_props
 from pygserver.server import GameServer
+from pygserver.world import GMap, World
 from .test_player_props_inbound import make_player, props_payload, relayed_props
 
 
@@ -59,6 +60,97 @@ def test_attachnpc_stored_separately_and_relay_axes_are_relative():
     assert player.attach_npc == (0, 0)
     assert relayed_props(server)[PLPROP.Y2] == 19.5
     assert absolute_position(player) == (8.75, 19.5)
+
+
+@pytest.fixture
+def attachment_gmap():
+    server, player = make_player()
+    server.world = World(server)
+    server.world.add_level(player.level)
+    gmap = GMap('overworld')
+    gmap.width = gmap.height = 3
+    gmap.grid = {(gx, gy): f'segment_{gx}_{gy}.nw'
+                 for gx in range(3) for gy in range(3)}
+    gmap.grid[(1, 1)] = player.level.name
+    server.world.add_gmap(gmap)
+    return server, player, gmap
+
+
+@pytest.mark.parametrize('grid, expected', [
+    ((2, 1), (72.75, 21.625)),
+    ((1, 2), (8.75, 85.625)),
+    ((0, 1), (-55.25, 21.625)),
+    ((1, 0), (8.75, -42.375)),
+], ids=['east', 'south', 'west', 'north'])
+def test_attachment_in_neighbour_segment_uses_player_frame(attachment_gmap, grid, expected):
+    server, player, gmap = attachment_gmap
+    other_level = Level(gmap.get_level_at(*grid))
+    npc = SimpleNamespace(id=9, x=10, y=20, level=other_level)
+    other_level._npcs[9] = npc
+    server.npc_manager.get_npc.return_value = npc
+    asyncio.run(player._handle_player_props(props_payload([
+        (PLPROP.ATTACHNPC, (0, 9)), (PLPROP.X2, -1.25), (PLPROP.Y2, 1.625)])))
+    assert player.attach_npc == (0, 9)
+    assert absolute_position(player) == expected
+    server.npc_manager.get_npc.assert_called_with(9)
+    for props in (relayed_props(server), packet_props(player.build_props_packet())):
+        assert props[PLPROP.ATTACHNPC] == (0, 9)
+        assert (props[PLPROP.X2], props[PLPROP.Y2]) == (-1.25, 1.625)
+
+
+@pytest.mark.parametrize('grid, start, end, before, after', [
+    ((2, 1), (63.5, 20), (.5, 20), (62.25, 21.625), (63.25, 21.625)),
+    ((1, 2), (10, 63.5), (10, .5), (8.75, 65.125), (8.75, 66.125)),
+], ids=['east', 'south'])
+def test_attached_npc_crosses_segment_boundary(attachment_gmap, grid, start, end,
+                                             before, after):
+    server, player, gmap = attachment_gmap
+    npc = SimpleNamespace(id=9, x=start[0], y=start[1], level=player.level)
+    player.level._npcs[9] = npc
+    server.npc_manager.get_npc.return_value = npc
+    asyncio.run(player._handle_player_props(props_payload([
+        (PLPROP.ATTACHNPC, (0, 9)), (PLPROP.X2, -1.25), (PLPROP.Y2, 1.625)])))
+    assert absolute_position(player) == before
+    server.npc_manager.get_npc.assert_not_called()
+
+    other_level = Level(gmap.get_level_at(*grid))
+    player.level.remove_npc(npc)
+    other_level._npcs[9] = npc
+    npc.level = other_level
+    npc.x, npc.y = end
+    assert absolute_position(player) == after
+    assert player.attach_npc == (0, 9)
+
+    other_level.remove_npc(npc)
+    player.level._npcs[9] = npc
+    npc.level = player.level
+    npc.x, npc.y = start
+    assert absolute_position(player) == before
+    assert player._attachment_wire == (0, 9)
+
+
+@pytest.mark.parametrize('different_gmap', [False, True])
+def test_attachment_outside_gmap_keeps_last_position(attachment_gmap, different_gmap):
+    server, player, gmap = attachment_gmap
+    other_level = Level(gmap.grid.pop((2, 1)))
+    if different_gmap:
+        other_gmap = GMap('elsewhere')
+        other_gmap.width = other_gmap.height = 3
+        other_gmap.grid[(2, 1)] = other_level.name
+        server.world.add_gmap(other_gmap)
+    npc = SimpleNamespace(id=9, x=10, y=20, level=other_level)
+    other_level._npcs[9] = npc
+    server.npc_manager.get_npc.return_value = npc
+    player.x, player.y = 8.75, 21.625
+    asyncio.run(player._handle_player_props(props_payload([
+        (PLPROP.ATTACHNPC, (0, 9)), (PLPROP.X2, -1.25), (PLPROP.Y2, 1.625)])))
+    assert player.attach_npc == (0, 0)
+    assert absolute_position(player) == (8.75, 21.625)
+    for props in (relayed_props(server), packet_props(player.build_props_packet())):
+        assert props[PLPROP.ATTACHNPC] == (0, 9)
+        assert (props[PLPROP.X2], props[PLPROP.Y2]) == (-1.25, 1.625)
+    npc.x, npc.y = 11, 22
+    assert absolute_position(player) == (8.75, 21.625)
 
 
 @pytest.mark.parametrize('elsewhere', [False, True])
