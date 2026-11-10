@@ -9,12 +9,14 @@ import asyncio
 import logging
 import os
 import hashlib
+import time
 import zlib
 from pathlib import Path
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, List, Dict, Tuple, BinaryIO
 
 from .protocol.constants import PLO
+from .text_safety import has_control_chars
 from .protocol.packets import (
     PacketBuilder,
     build_file,
@@ -109,6 +111,15 @@ class FileSystem:
         self.large_file_threshold = 32000
         self.chunk_size = 32000
         self.max_file_size = 10 * 1024 * 1024  # 10MB max
+
+        # Lowercase name -> files under the public roots (see _find_file).
+        self._public_index: Dict[str, List[Path]] = {}
+        self._public_index_time = float('-inf')
+        # (public roots, {directory: mtime_ns}) recorded by the last scan, and
+        # whether any of those mtimes was too fresh to trust (see
+        # _public_tree_changed).
+        self._public_signature: Optional[tuple] = None
+        self._public_signature_racy = True
 
         # Create directories
         self._ensure_directories()
@@ -499,37 +510,195 @@ class FileSystem:
     # Utility Methods
     # =========================================================================
 
-    def _find_file(self, filename: str) -> Optional[Path]:
+    # Folders a game client may read from by name. The reference binds the whole
+    # `world/` tree recursively and answers PLI_WANTFILE / PLI_UPDATEFILE from
+    # FileCategory::ALL, i.e. every regular file under it, looked up by file
+    # name alone and case-insensitively (Server.cpp:491-530 loadFolderConfig,
+    # FileSystem.cpp:76-116 bind, :442-454 infoi, Player.cpp:577 sendFile,
+    # PlayerClientPackets.cpp:962). foldersconfig.txt only sorts those files
+    # into categories; its patterns are relative to `world/`.
+    # Our worlds also keep content in sibling folders of `world/` (the
+    # `images/ gani/ sounds/` of the native layout, and `bodies/ heads/ swords/
+    # shields/ hats/` that pyReborn's LocalWorld links beside it), so the
+    # public roots are `world/` plus these names plus the first folder of every
+    # foldersconfig.txt pattern, each searched recursively. Never public:
+    # PRIVATE_DIRS, i.e. accounts/, config/, logs/, weapons/, npcs/,
+    # scripts/ (the script SOURCE) and the other server-side folders, nor
+    # serverflags.txt or anything outside the server folder.
+    CLIENT_FILE_DIRS = (
+        'world', 'levels', 'gani', 'ganis', 'images', 'sounds',
+        'bodies', 'heads', 'swords', 'shields', 'hats', 'global')
+    PRIVATE_DIRS = frozenset((
+        'accounts', 'config', 'logs', 'weapons', 'npcs', 'scripts', 'guilds',
+        'execscripts', 'translations', 'documents', 'snapshots', 'tools'))
+
+    # Where PLI_PUTNPC looks for its script: FileCategory::FILE by bare name
+    # (PlayerClientPackets.cpp:769), i.e. the world folder. The private
+    # scripts/ folder is never read for a client-chosen name.
+    NPC_SCRIPT_DIRS = ('world',)
+
+    # A name missing from the index triggers a re-scan only if a public
+    # directory changed since the last scan (a stat per known directory), and
+    # at most this often, so a file added while the server runs is found
+    # without a request flood re-walking the tree on the event loop.
+    INDEX_RESCAN_SECONDS = 1.0
+    # A directory modified this recently when it was scanned may take a further
+    # change inside the same timestamp tick, so the next miss re-scans again.
+    _MTIME_SETTLE_NS = 2_000_000_000
+
+    @staticmethod
+    def is_bare_filename(name) -> bool:
+        """True for a plain file name: no separator, `..`, NUL, control
+        character or leading dot."""
+        if not isinstance(name, str) or not name or len(name) > 255:
+            return False
+        if name.startswith('.') or '..' in name:
+            return False
+        if '/' in name or '\\' in name:
+            return False
+        return not has_control_chars(name)
+
+    def _folders_config_dirs(self) -> List[str]:
+        """First folder of each foldersconfig.txt pattern (`heads/*` -> heads).
+
+        Server.cpp:497-512 reads `<category> <glob>` lines after dropping `#`
+        comments. A glob with no folder (`*.png`) names `world/` itself.
         """
-        Find a file by name in file directories.
+        try:
+            text = (self.base_path / 'config' / 'foldersconfig.txt').read_text(
+                encoding='latin-1')
+        except OSError:
+            return []
+        names: List[str] = []
+        for line in text.splitlines():
+            parts = line.split('#', 1)[0].split(None, 1)
+            if len(parts) != 2 or '/' not in parts[1].replace('\\', '/'):
+                continue
+            first = parts[1].replace('\\', '/').split('/', 1)[0].strip()
+            if (first and first not in ('.', '..') and not set(first) & set('*?[')
+                    and first.lower() not in self.PRIVATE_DIRS
+                    and first not in names):
+                names.append(first)
+        return names
 
-        Args:
-            filename: Filename to find
+    def public_dirs(self) -> List[Path]:
+        """Existing public root folders, in search order (`world/` first)."""
+        names = list(self.CLIENT_FILE_DIRS)
+        names += [n for n in self._folders_config_dirs() if n not in names]
+        roots = []
+        for name in names:
+            if name.lower() in self.PRIVATE_DIRS:
+                continue
+            root = self.base_path / name
+            if root.is_dir():
+                roots.append(root)
+        return roots
 
-        Returns:
-            Path to file, or None if not found
-        """
-        # Clean filename
-        filename = filename.replace('..', '').strip('/')
-        name = Path(filename).name
+    def _rebuild_public_index(self) -> Dict[str, List[Path]]:
+        """Walk every public root and key each regular file by lowercase name."""
+        index: Dict[str, List[Path]] = {}
+        roots = self.public_dirs()
+        mtimes: Dict[str, int] = {}
+        scan_start = time.time_ns()
+        for root in roots:
+            try:
+                resolved_root = root.resolve()
+            except OSError:
+                continue
+            for dirpath, dirnames, filenames in os.walk(root):
+                try:
+                    # Before this directory's files are classified, so a change
+                    # after the listing shows up as a newer mtime next time.
+                    mtimes[dirpath] = os.stat(dirpath).st_mtime_ns
+                except OSError:
+                    pass
+                dirnames.sort()
+                for filename in sorted(filenames):
+                    if not self.is_bare_filename(filename):
+                        continue
+                    path = Path(dirpath) / filename
+                    try:
+                        if not path.is_file():
+                            continue
+                        path.resolve().relative_to(resolved_root)
+                    except (OSError, ValueError):
+                        continue    # a link leaving the folder
+                    index.setdefault(filename.lower(), []).append(path)
+        self._public_index = index
+        self._public_signature = (tuple(roots), mtimes)
+        self._public_signature_racy = any(
+            scan_start - m < self._MTIME_SETTLE_NS for m in mtimes.values())
+        self._public_index_time = time.monotonic()
+        return index
 
-        # Check each directory
-        for dir_path in self.file_dirs.values():
-            file_path = dir_path / name
-            if file_path.exists() and file_path.is_file():
-                return file_path
+    def _public_tree_changed(self) -> bool:
+        """Whether a public folder was added, removed or modified since the
+        last scan. Adding, removing or renaming an entry bumps its directory's
+        mtime (a new subfolder bumps its parent's), so a stat of each directory
+        the scan saw is enough; no file is opened or resolved."""
+        if self._public_signature is None or self._public_signature_racy:
+            return True
+        roots, mtimes = self._public_signature
+        if tuple(self.public_dirs()) != roots:
+            return True
+        for dirpath, mtime in mtimes.items():
+            try:
+                if os.stat(dirpath).st_mtime_ns != mtime:
+                    return True
+            except OSError:
+                return True
+        return False
 
-        # Check base path
-        file_path = self.base_path / name
-        if file_path.exists() and file_path.is_file():
-            return file_path
-
-        # Check with full path
-        file_path = self.base_path / filename
-        if file_path.exists() and file_path.is_file():
-            return file_path
-
+    def _lookup_public(self, filename: str) -> Optional[Path]:
+        candidates = self._public_index.get(filename.lower(), ())
+        for path in candidates:
+            if path.name == filename and path.is_file():
+                return path
+        for path in candidates:
+            if path.is_file():
+                return path
         return None
+
+    def _find_file(self, filename: str, dirs=None,
+                   strict: bool = False) -> Optional[Path]:
+        """Resolve a client-supplied file name to a file inside a public folder.
+
+        The name is reduced to its final component (the reference does the
+        same, Player.cpp:577) unless `strict`, in which case anything that is
+        not already a bare name is refused. By default every public root
+        (`public_dirs`) is searched recursively and case-insensitively, with an
+        exact-case match preferred; the server root, a full relative path,
+        accounts/, config/, weapons/ and serverflags.txt cannot be reached. A
+        symlink leaving its folder is refused. With `dirs`, only those folders
+        directly under base_path are searched, non-recursively (PLI_PUTNPC).
+        """
+        if not isinstance(filename, str):
+            return None
+        if not strict:
+            filename = filename.replace('\\', '/').rsplit('/', 1)[-1]
+        if not self.is_bare_filename(filename):
+            return None
+
+        if dirs is not None:
+            for dirname in dirs:
+                directory = self.base_path / dirname
+                file_path = directory / filename
+                try:
+                    if not file_path.is_file():
+                        continue
+                    file_path.resolve().relative_to(directory.resolve())
+                except (OSError, ValueError):
+                    continue
+                return file_path
+            return None
+
+        found = self._lookup_public(filename)
+        if found is None and (time.monotonic() - self._public_index_time
+                              >= self.INDEX_RESCAN_SECONDS
+                              and self._public_tree_changed()):
+            self._rebuild_public_index()
+            found = self._lookup_public(filename)
+        return found
 
     def _calculate_checksum(self, file_path: Path) -> int:
         """

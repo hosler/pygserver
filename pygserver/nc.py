@@ -5,15 +5,15 @@ Handles NPC control connections and NC packet processing.
 Based on GServer-v2 TPlayerNC.cpp implementation.
 """
 
-import asyncio
 import logging
-from typing import TYPE_CHECKING, Optional, Dict, Any, List, Set, Callable
-from dataclasses import dataclass, field
+from typing import TYPE_CHECKING, Optional, Dict, List, Set, Callable
+from dataclasses import dataclass
 
-from .protocol.constants import PLI, PLO, NPCPROP
+from .irc import guntokenize
+from .protocol.constants import PLI, NPCBLOCKFLAG, NPCVISFLAG
 from .protocol.packets import (
-    PacketBuilder,
     PacketReader,
+    build_nc_level_dump,
     build_nc_level_list,
     build_nc_npc_attributes,
     build_nc_npc_add,
@@ -34,6 +34,14 @@ if TYPE_CHECKING:
     from .npc import NPC
 
 logger = logging.getLogger(__name__)
+
+# GServer-v2 CommonTypes.h:145: smallest NPC id NC_NPCADD accepts.
+NPCID_GEN_MANUAL = 3
+# Largest id the 3-byte GINT used by every NPC packet can carry (codec
+# write_gint3 clamps above it, which would alias distinct NPCs on the wire).
+# The reference has no error text for this bound; the message mirrors the
+# "must be greater than" one it does have (PlayerNCPackets.cpp:410-414).
+NPCID_MAX = 3682399
 
 
 @dataclass
@@ -152,46 +160,62 @@ class NCManager:
     # =========================================================================
 
     async def _handle_npc_get(self, session: NCSession, data: bytes):
-        """Handle NC_NPCGET - Get NPC details."""
-        reader = PacketReader(data)
-        npc_id = reader.read_gint3()
+        """Handle NC_NPCGET - Get NPC details (PlayerNCPackets.cpp:42)."""
+        # An empty packet is the npc-server's keep-alive poll (:50-53).
+        if not data:
+            return
+        npc_id = PacketReader(data).read_gint3()
 
         npc = self.server.npc_manager.get_npc(npc_id)
         if npc:
             session.editing_npc = npc_id
-
-            # Send NPC attributes
-            attrs = self._build_npc_attributes(npc)
-            packet = build_nc_npc_attributes(npc_id, attrs)
-            await session.player.send_raw(packet)
+            await session.player.send_raw(
+                build_nc_npc_attributes(self._variable_dump(npc)))
 
             logger.debug(f"NC {session.player.account_name} editing NPC {npc_id}")
 
     async def _handle_npc_delete(self, session: NCSession, data: bytes):
-        """Handle NC_NPCDELETE - Delete an NPC."""
-        reader = PacketReader(data)
-        npc_id = reader.read_gint3()
+        """Handle NC_NPCDELETE - Delete an NPC (PlayerNCPackets.cpp:64).
+
+        The reference only deletes database NPCs; pygserver keeps no such
+        distinction, so any NPC the manager holds can be removed.
+        """
+        npc_id = PacketReader(data).read_gint3()
 
         npc = self.server.npc_manager.get_npc(npc_id)
         if npc:
-            level_name = npc.level.name if npc.level else ""
-            self.server.npc_manager.remove_npc(npc_id)
-
-            # Notify all NC sessions
-            packet = build_nc_npc_delete(npc_id)
-            await self._broadcast_to_ncs(packet)
+            await self.server.npc_manager.destroy_npc(npc)
+            await self._broadcast_to_ncs(build_nc_npc_delete(npc_id))
+            await self._send_to_ncs(
+                f"NPC {npc.name} deleted by {session.player.account_name}")
 
             logger.info(f"NC {session.player.account_name} deleted NPC {npc_id}")
 
     async def _handle_npc_reset(self, session: NCSession, data: bytes):
-        """Handle NC_NPCRESET - Reset an NPC."""
-        reader = PacketReader(data)
-        npc_id = reader.read_gint3()
+        """Handle NC_NPCRESET - Reset an NPC (PlayerNCPackets.cpp:88).
+
+        The reference restores a recorded initial state; pygserver records
+        none, so this clears the script-visible state (flags and the NPC-scoped
+        GS1 variables), re-attaches its script and fires `created`.
+        """
+        npc_id = PacketReader(data).read_gint3()
 
         npc = self.server.npc_manager.get_npc(npc_id)
         if npc:
-            # Reset NPC to initial state
-            npc.reset()
+            if npc.level is not None:
+                from .protocol.packets import build_npc_del
+                await self.server.broadcast_to_level(
+                    npc.level.name, build_npc_del(npc.id))
+            npc.flags.clear()
+            npc.gs1_scopes = {"this": {}, "thiso": {}}
+            if npc.gs1_source:
+                self.server.npc_manager.attach_gs1(npc, npc.gs1_source)
+            else:
+                await self.server.npc_manager._trigger_created(npc)
+            npc._script_dirty = True
+            npc.mark_dirty()
+            await self._send_to_ncs(
+                f"NPC script of {npc.name} reset by {session.player.account_name}")
             logger.info(f"NC {session.player.account_name} reset NPC {npc_id}")
 
     async def _handle_npc_script_get(self, session: NCSession, data: bytes):
@@ -212,7 +236,9 @@ class NCManager:
         """Handle NC_NPCSCRIPTSET - Set NPC script."""
         reader = PacketReader(data)
         npc_id = reader.read_gint3()
-        script = reader.remaining().decode('latin-1', errors='replace')
+        # PlayerNCPackets.cpp:226: the script arrives gtokenized.
+        script = "\n".join(guntokenize(
+            reader.remaining().decode('latin-1', errors='replace')))
 
         npc = self.server.npc_manager.get_npc(npc_id)
         if npc:
@@ -226,101 +252,158 @@ class NCManager:
             logger.info(f"NC {session.player.account_name} updated script for NPC {npc_id}")
 
     async def _handle_npc_warp(self, session: NCSession, data: bytes):
-        """Handle NC_NPCWARP - Warp an NPC."""
+        """Handle NC_NPCWARP - Warp an NPC (PlayerNCPackets.cpp:113)."""
         reader = PacketReader(data)
         npc_id = reader.read_gint3()
         x = reader.read_gchar() / 2.0
         y = reader.read_gchar() / 2.0
-        level_name = reader.remaining().decode('latin-1', errors='replace')
+        level_name = reader.remaining().decode('latin-1', errors='replace').strip()
 
-        npc = self.server.npc_manager.get_npc(npc_id)
-        if npc:
-            await self.server.npc_manager.warp_npc(npc_id, level_name, x, y)
-            logger.info(f"NC {session.player.account_name} warped NPC {npc_id} to {level_name}")
+        manager = self.server.npc_manager
+        npc = manager.get_npc(npc_id)
+        if npc is None:
+            return
+        if npc.level is not None and level_name == npc.level.name:
+            # Same level: only the position changes (:152-160).
+            npc.x, npc.y = x, y
+            npc.mark_dirty()
+        elif self.server.world.get_level(level_name) is not None:
+            # warp_npc detaches the NPC first, so check the target exists.
+            await manager.warp_npc(npc, level_name, x, y)
+        else:
+            return
+        logger.info(f"NC {session.player.account_name} warped NPC {npc_id} to {level_name}")
 
     async def _handle_npc_flags_get(self, session: NCSession, data: bytes):
-        """Handle NC_NPCFLAGSGET - Get NPC flags."""
+        """Handle NC_NPCFLAGSGET - Get NPC flags (PlayerNCPackets.cpp:183)."""
         reader = PacketReader(data)
         npc_id = reader.read_gint3()
 
         npc = self.server.npc_manager.get_npc(npc_id)
         if npc:
-            packet = build_nc_npc_flags(npc_id, npc.flags)
-            await session.player.send_raw(packet)
+            flags = [f"{name}={value}" if value != "" else name
+                     for name, value in npc.flags.items()]
+            await session.player.send_raw(build_nc_npc_flags(npc_id, flags))
 
     async def _handle_npc_flags_set(self, session: NCSession, data: bytes):
-        """Handle NC_NPCFLAGSSET - Set NPC flags."""
+        """Handle NC_NPCFLAGSSET - Replace NPC flags (PlayerNCPackets.cpp:241).
+
+        The flag list is a toCSV row of `flag` / `flag=value` entries.
+        """
         reader = PacketReader(data)
         npc_id = reader.read_gint3()
-        flags_str = reader.remaining().decode('latin-1', errors='replace')
+        flags = guntokenize(reader.remaining().decode('latin-1', errors='replace'))
 
         npc = self.server.npc_manager.get_npc(npc_id)
         if npc:
-            # Parse flags
             npc.flags.clear()
-            for line in flags_str.split('\n'):
-                if '=' in line:
-                    key, value = line.split('=', 1)
-                    npc.flags[key.strip()] = value.strip()
+            for entry in flags:
+                name, _, value = entry.partition('=')
+                if name.strip():
+                    npc.flags[name.strip()] = value.strip()
 
+            await self._send_to_ncs(
+                f"NPC flags of {npc.name} updated by {session.player.account_name}")
             logger.info(f"NC {session.player.account_name} updated flags for NPC {npc_id}")
 
     async def _handle_npc_add(self, session: NCSession, data: bytes):
-        """Handle NC_NPCADD - Add a new NPC."""
-        reader = PacketReader(data)
-        x = reader.read_gchar() / 2.0
-        y = reader.read_gchar() / 2.0
-        level_name = reader.read_string()
-        image = reader.read_string()
-        script = reader.remaining().decode('latin-1', errors='replace')
+        """Handle NC_NPCADD - Add a new NPC (PlayerNCPackets.cpp:359).
 
-        # Get level
-        level = self.server.world.get_level(level_name)
-        if not level:
-            logger.warning(f"NC add NPC failed: level {level_name} not found")
+        The body is one CSV row: name, id, type, scripter, level, x, y.
+        """
+        fields = guntokenize(data.decode('latin-1', errors='replace'))
+        fields += [""] * (7 - len(fields))
+        name, raw_id, npc_type, scripter, level_name, raw_x, raw_y = (
+            value.strip() for value in fields[:7])
+
+        manager = self.server.npc_manager
+        if not name:
+            await self._send_to_ncs("Error adding database npc: NPC name cannot be empty")
+            return
+        if manager.get_npc_by_name(name) is not None:
+            await self._send_to_ncs("Error adding database npc: NPC name already exists")
+            return
+        try:
+            npc_id = int(raw_id)
+            x, y = float(raw_x or 0), float(raw_y or 0)
+        except ValueError:
+            await self._send_to_ncs("Error adding database npc: invalid NPC id or position")
+            return
+        if npc_id < NPCID_GEN_MANUAL:
+            await self._send_to_ncs(
+                f"Error adding database npc: NPC ID must be greater than {NPCID_GEN_MANUAL}")
+            return
+        if npc_id > NPCID_MAX:
+            await self._send_to_ncs(
+                f"Error adding database npc: NPC ID must be less than {NPCID_MAX + 1}")
+            return
+        if manager.get_npc(npc_id) is not None:
+            await self._send_to_ncs("Error adding database npc: NPC ID already exists")
             return
 
-        # Create NPC
-        npc = await self.server.npc_manager.create_npc(
-            level=level,
-            x=x,
-            y=y,
-            image=image,
-            script=script
-        )
+        # An unknown or empty level leaves the NPC unattached (:371-387).
+        level = self.server.world.get_level(level_name) if level_name else None
+        npc = manager.create_npc(name=name, level=level, x=x, y=y, npc_id=npc_id)
+        npc.script_type = npc_type
+        npc.scripter = scripter
+        npc.mark_dirty()
 
-        # Notify NC sessions
-        packet = build_nc_npc_add(npc.id, level_name, x, y, image)
-        await self._broadcast_to_ncs(packet)
-
+        await self._broadcast_to_ncs(build_nc_npc_add(
+            npc.id, name, npc_type, level.name if level else ""))
+        await self._send_to_ncs(f"NPC {name} added by {session.player.account_name}")
         logger.info(f"NC {session.player.account_name} created NPC {npc.id} on {level_name}")
 
     async def _handle_local_npcs_get(self, session: NCSession, data: bytes):
-        """Handle NC_LOCALNPCSGET - Get NPCs on a level."""
-        reader = PacketReader(data)
-        level_name = reader.remaining().decode('latin-1', errors='replace')
+        """Handle NC_LOCALNPCSGET - Dump the NPCs on a level
+        (PlayerNCPackets.cpp:526)."""
+        level_name = data.decode('latin-1', errors='replace').strip()
+        if not level_name:
+            return
 
         level = self.server.world.get_level(level_name)
         if not level:
             return
 
-        npcs = level.get_npcs()
-        for npc in npcs:
-            attrs = self._build_npc_attributes(npc)
-            packet = build_nc_npc_attributes(npc.id, attrs)
-            await session.player.send_raw(packet)
+        lines = [f"Variables dump from level {level.name}"]
+        for npc in level.get_npcs():
+            lines.append("")
+            lines.extend(self._variable_dump(npc))
+            lines.append("")
+        await session.player.send_raw(build_nc_level_dump(lines))
 
-    def _build_npc_attributes(self, npc: 'NPC') -> Dict[int, Any]:
-        """Build NPC attributes dict for NC."""
-        return {
-            NPCPROP.ID: npc.id,
-            NPCPROP.X: npc.x,
-            NPCPROP.Y: npc.y,
-            NPCPROP.IMAGE: npc.image,
-            NPCPROP.SCRIPT: npc.gs1_source or "",
-            NPCPROP.VISFLAGS: npc.vis_flags,
-            NPCPROP.BLOCKFLAGS: npc.block_flags,
-        }
+    @staticmethod
+    def _variable_dump(npc: 'NPC') -> List[str]:
+        """NPC variable dump lines, after NPC::getVariableDump (NPC.cpp:2144).
+
+        Only the properties pygserver tracks are listed.
+        """
+        label = npc.name or f"npcs[{npc.id}]"
+        visibility = "visible" if npc.vis_flags & NPCVISFLAG.VISIBLE else "hidden"
+        if npc.vis_flags & NPCVISFLAG.DRAWOVERPLAYER:
+            visibility += ", drawoverplayer"
+        if npc.vis_flags & NPCVISFLAG.DRAWUNDERPLAYER:
+            visibility += ", drawunderplayer"
+        blocking = "noblock" if npc.block_flags & NPCBLOCKFLAG.NOBLOCK else "block"
+
+        lines = [f"Variables dump from npc {label}", ""]
+        script_type = getattr(npc, 'script_type', '')
+        if script_type:
+            lines.append(f"{label}.type: {script_type}")
+        scripter = getattr(npc, 'scripter', '')
+        if scripter:
+            lines.append(f"{label}.scripter: {scripter}")
+        lines += [
+            f"{label}.level: {npc.level.name if npc.level else ''}",
+            f"{label}.pos: {npc.x:.2f}, {npc.y:.2f}, 0",
+            "",
+            "Attributes:",
+            f"{label}.id: {npc.id}",
+            f"{label}.image: {npc.image}",
+            f"{label}.script: size: {len(npc.gs1_source or '')}",
+            f"{label}.visibility flags: {visibility}",
+            f"{label}.blocking flags: {blocking}",
+        ]
+        return lines
 
     # =========================================================================
     # Class Management Handlers
@@ -449,6 +532,7 @@ class NCManager:
         manager = await self._require_gs2_manager(session, "weapon")
         if manager is None:
             return
+        existing = manager.get_weapon(weapon_name) is not None
         try:
             manager.upsert_weapon(weapon_name, image, script)
         except OSError as error:
@@ -461,6 +545,10 @@ class NCManager:
             if weapon_name.lower() in {
                     held.lower() for held in (getattr(player, 'weapons', []) or [])}:
                 await manager.announce_weapon(player, weapon_name)
+
+        # server/src/player/packets/PlayerNCPackets.cpp:677-679.
+        if not existing:
+            await self._handle_weapon_list_get(session, b"")
 
         logger.info(f"NC {session.player.account_name} updated weapon {weapon_name}")
 
@@ -521,6 +609,10 @@ class NCManager:
     # Utility Methods
     # =========================================================================
 
+    async def _send_to_ncs(self, message: str):
+        """Server::sendToNC (Server.h:611): first line only, to every NC."""
+        await self._broadcast_to_ncs(build_rc_chat(message.split('\n', 1)[0]))
+
     async def _broadcast_to_ncs(self, packet: bytes, exclude: Optional[Set[int]] = None):
         """
         Broadcast a packet to all NC sessions.
@@ -541,9 +633,8 @@ class NCManager:
         Args:
             npc: The NPC that changed
         """
-        attrs = self._build_npc_attributes(npc)
-        packet = build_nc_npc_attributes(npc.id, attrs)
-        await self._broadcast_to_ncs(packet)
+        await self._broadcast_to_ncs(
+            build_nc_npc_attributes(self._variable_dump(npc)))
 
     async def notify_npc_deleted(self, npc_id: int):
         """

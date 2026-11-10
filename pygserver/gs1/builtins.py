@@ -6,6 +6,7 @@ from reborn_protocol.gs1.values import to_num
 from reborn_protocol.gs1.host_shared import tokens_count
 
 from ..combat import CarryObjectSprite
+from . import objects
 from .host import (
     NPC_ATTR, PLAYER_ATTR, _NW_CLOCK_FIELDS, _PELTWITH_TYPE, _SHOTBY_SOURCE,
     _nw_clock_value,
@@ -69,6 +70,13 @@ def _b_save(self, name, indices, ctx, npc, player):
 
 def _b_playerscount(self, name, indices, ctx, npc, player):
     return float(len(self._players_on_level(ctx)))
+
+
+def _b_count(self, name, indices, ctx, npc, player):
+    # allplayerscount / npcscount / compuscount / bombscount / arrowscount /
+    # itemscount / exploscount / horsescount / signscount (GS1Variables.cpp
+    # counts; objects.py has the per-array source lists).
+    return objects.count_of(self, name, ctx)
 
 
 def _b_timevar2(self, name, indices, ctx, npc, player):
@@ -217,6 +225,7 @@ def _b_compsdead(self, name, indices, ctx, npc, player):
 _BUILTINS = {
     "tiles": _b_tiles, "board": _b_board,
     "tokenscount": _b_tokenscount, "save": _b_save,
+    **{n: _b_count for n in objects.COUNTS},
     "playerscount": _b_playerscount, "timevar2": _b_timevar2,
     "playerfreezetime": _b_playerfreezetime, "playerlevel": _b_playerlevel,
     "playeronline": _b_playeronline, "isweapon": _b_isweapon,

@@ -39,6 +39,7 @@ def world(tmp_path):
     server.world = SimpleNamespace(
         get_level=lambda name: level if name == level.name else None,
         get_all_levels=lambda: [level],
+        get_gmap_for_level=lambda name: None,
         reload_level=AsyncMock(return_value=level),
     )
     server.players = {}
@@ -216,10 +217,28 @@ def test_npc_move_uses_old_position_signed_deltas_and_50ms_ticks(world):
     server.npc_manager._npcs[npc.id] = npc
     assert run(dispatch_trigger_command(
         server, player, "gr.npc.move,257,-2,3,0.15,7")) is True
+    # NPC.cpp:485-565: clients from 2.3 on get PLO_MOVE2 with four pixel
+    # coordinates, each gshort((abs(pixels) << 1) | sign): 160, 320, -32, 48.
+    expected = (bytes([PLO.MOVE2 + 32]) + b' "!'
+                + bytes([34, 96, 37, 32, 32, 97, 32, 128, 32, 35, 39, 10]))
+    player.send_raw.assert_awaited_once_with(expected)
+    assert (npc.x, npc.y) == (8, 23)
+
+
+def test_npc_move_uses_the_classic_layout_for_pre_2_3_clients(world):
+    from reborn_protocol.codec import Gen2Codec
+    server, player, level = world
+    server.config.triggerhack_levels = True
+    player.session.codec = Gen2Codec()
+    npc = NPC(257)
+    npc.x, npc.y = 10, 20
+    level.add_npc(npc)
+    server.npc_manager._npcs[npc.id] = npc
+    assert run(dispatch_trigger_command(
+        server, player, "gr.npc.move,257,-2,3,0.15,7")) is True
     expected = (bytes([PLO.MOVE + 32]) + b' "!'
                 + bytes([52, 72, 128, 138, 32, 35, 39, 10]))
-    server.broadcast_to_level.assert_awaited_once_with(level.name, expected)
-    assert (npc.x, npc.y) == (8, 23)
+    player.send_raw.assert_awaited_once_with(expected)
 
 
 @pytest.mark.parametrize("action", [

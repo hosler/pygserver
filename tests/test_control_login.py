@@ -31,8 +31,9 @@ def make_server(staff=()):
     server.irc_manager = None
     server.gs2_manager = MagicMock()
     server.gs2_manager.announce_weapons = AsyncMock()
+    # Player.cpp:689 admits RC/NC from staff whose admin-IP range matches.
     account = SimpleNamespace(
-        admin_rights=0, is_banned=False, ban_reason="")
+        admin_rights=0, admin_ip="127.0.0.1", is_banned=False, ban_reason="")
     server.account_manager = MagicMock()
     server.account_manager.get_account.return_value = account
     server.account_manager.load_player_from_account = MagicMock()
@@ -42,6 +43,7 @@ def make_server(staff=()):
 def make_login_player(server, player_id, account, client_type):
     player = Player(server, player_id, AsyncMock(), MagicMock())
     server.players[player_id] = player
+    player.session.writer.get_extra_info.return_value = ("127.0.0.1", 50000)
     player.session.read = AsyncMock(return_value=login_frame(
         username=account, client_type=client_type))
     player.login_service.send_login_response = AsyncMock()
@@ -106,7 +108,7 @@ def test_nonstaff_rc2_login_is_denied_without_a_session():
 
     assert asyncio.run(player._handle_login()) is True
 
-    player.disconnect.assert_awaited_once_with("You do not have RC access.")
+    player.disconnect.assert_awaited_once_with("You do not have RC rights.")
     assert server.rc_manager.get_session(player.id) is None
     assert player.logged_in is False
 
@@ -122,6 +124,109 @@ def test_nc_login_selects_gen2_and_registers_session():
     assert player.connection_type == PLTYPE.NC
     assert isinstance(player.session.codec, Gen2Codec)
     assert server.nc_manager.get_session(player.id) is not None
+
+
+def make_wire_player(server, client_type, connected, account="player"):
+    """A player whose session records the frames the real login flow emits.
+
+    Nothing in Player or LoginService is replaced: send_raw/send_packet and
+    LoginService.send_login_response run for real, and the recorder sits at
+    the session boundary. The first frame is the plain-zlib login response, so
+    every packet that must lead the login has to be inside it.
+    """
+    from pygserver.listserver import ServerListClient
+    server.listserver = ServerListClient(server)
+    server.listserver.connected = connected
+    server.listserver._send_packet = AsyncMock()
+    player = make_login_player(server, 2, account, client_type)
+    del player.send_raw
+    del player.login_service.send_login_response
+    trace = []
+
+    def ids(data):
+        return [chunk[0] - 32 for chunk in data.split(b"\n") if chunk]
+
+    async def login_frame_sent(data):
+        trace.append(("login-frame", ids(data)))
+
+    async def frame_sent(data):
+        trace.append(("frame", ids(data)))
+
+    async def weapons_announced(target):
+        trace.append(("weapons", []))
+
+    player.session.send_login_response = login_frame_sent
+    player.session.send = frame_sent
+    server.gs2_manager.announce_weapons.side_effect = weapons_announced
+    return player, trace
+
+
+def flat_ids(trace):
+    return [packet for _, packets in trace for packet in packets]
+
+
+@pytest.mark.parametrize('client_type', [0, 4, 5, 8])
+@pytest.mark.parametrize('connected', [True, False])
+def test_game_login_leads_with_serverlist_connected_then_reset_then_props(
+        client_type, connected):
+    # GServer-v2 PlayerClient.cpp:487-492 (origin/beta4): SERVERLISTCONNECTED
+    # when connected, PLO_RESETCLIENT, then the Stage-1 PLO_PLAYERPROPS.
+    server = make_server()
+    player, trace = make_wire_player(server, client_type, connected)
+
+    assert asyncio.run(player._handle_login()) is True
+
+    # Literal wire ids: 190 = PLO_SERVERLISTCONNECTED, 194 = PLO_RESETCLIENT.
+    lead = [190, 194] if connected else [194]
+    first_kind, first = trace[0]
+    assert first_kind == "login-frame"
+    assert first[:len(lead) + 1] == lead + [PLO.PLAYERPROPS]
+    ids = flat_ids(trace)
+    assert ids.count(194) == 1
+    assert ids.count(190) == int(connected)
+    assert PLO.SERVERLISTCONNECTED == 190
+    # Weapons are announced only after the reset has gone out.
+    weapons = next(i for i, (kind, _) in enumerate(trace) if kind == "weapons")
+    assert weapons > 0 and 194 in flat_ids(trace[:weapons])
+    assert player.logged_in
+
+
+@pytest.mark.parametrize(('client_type', 'frame'), [(1, True), (6, False)])
+@pytest.mark.parametrize('connected', [True, False])
+def test_rc_login_resets_first_then_reports_serverlist(client_type, frame, connected):
+    # PlayerRC.cpp:233-252 (origin/beta4): reset, welcome text, then
+    # SERVERLISTCONNECTED. No NC counterpart exists.
+    server = make_server(staff=("hosler",))
+    account = "hosler" if frame else "admin"
+    if not frame:
+        server.config.staff = ["admin"]
+    player, trace = make_wire_player(server, client_type, connected, account)
+    if frame:
+        player.session.read.return_value = framed_login(client_type, include_key=False)
+
+    assert asyncio.run(player._handle_login()) is True
+
+    expected = [194, PLO.SERVERLISTCONNECTED] if connected else [194]
+    assert trace[0][0] == "login-frame"
+    assert trace[0][1][:len(expected) + 1] == expected + [PLO.PLAYERPROPS]
+    assert flat_ids(trace).count(194) == 1
+
+
+@pytest.mark.parametrize('connected', [True, False])
+def test_nc_login_sends_neither_reset_nor_serverlist_connected(connected):
+    # PlayerNC.cpp:181-221 (origin/beta4) has no PLO_RESETCLIENT and no
+    # SERVERLISTCONNECTED.
+    server = make_server(staff=("hosler",))
+    server.nc_manager = NCManager(server)
+    player, trace = make_wire_player(server, 3, connected, "hosler")
+    player.session.read.return_value = framed_login(3, include_key=False)
+
+    assert asyncio.run(player._handle_login()) is True
+
+    ids = flat_ids(trace)
+    assert trace[0][1][0] == PLO.PLAYERPROPS
+    assert 194 not in ids
+    assert PLO.SERVERLISTCONNECTED not in ids
 
 
 def test_nc_weapon_list_request_and_reply_round_trip_through_gen2():

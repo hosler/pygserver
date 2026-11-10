@@ -126,12 +126,11 @@ def build_hit_objects(source_id: int, power: int, x: float, y: float,
     return builder.build()
 
 
-def build_fire_spy(player_id: int, x: float, y: float) -> bytes:
-    """Build PLO_FIRESPY packet."""
+def build_fire_spy(player_id: int, length_power: int) -> bytes:
+    """Build PLO_FIRESPY: {GSHORT owner}{GCHAR length << 3 | power}."""
     builder = PacketBuilder().write_gchar(PLO.FIRESPY)
     builder.write_gshort(player_id)
-    builder.write_gchar(int(x * 2))
-    builder.write_gchar(int(y * 2))
+    builder.write_gchar(length_power)
     builder.write_newline()
     return builder.build()
 

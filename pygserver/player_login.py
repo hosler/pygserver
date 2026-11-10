@@ -28,9 +28,11 @@ from reborn_protocol.constants import PLTYPE
 from .protocol.constants import PLPROP
 from .spar_rating import decay_deviation
 from .protocol.packets import (
+    build_clear_weapons,
     build_flag_set,
     build_has_npc_server,
     build_player_props,
+    build_serverlist_connected,
     build_rc_chat,
     build_rc_max_upload_filesize,
     build_staff_guilds,
@@ -166,11 +168,14 @@ class LoginService:
         is_rc = bool(connection_type & PLTYPE.ANYRC)
         is_nc = connection_type == PLTYPE.NC
 
+        # Player.cpp:686-694 sends the same PLO_DISCMESSAGE to RC and NC.
         if is_rc and not player.server.register_rc_session(player):
-            await player.disconnect("You do not have RC access.")
+            logger.info(f"Refused RC login for {player.account_name}")
+            await player.disconnect("You do not have RC rights.")
             return
         if is_nc and not player.server.register_nc_session(player):
-            await player.disconnect("You do not have NC access.")
+            logger.info(f"Refused NC login for {player.account_name}")
+            await player.disconnect("You do not have RC rights.")
             return
 
         # GServer-v2/server/src/player/PlayerClient.cpp:453-471: whole days
@@ -183,13 +188,32 @@ class LoginService:
                 player.elo_deviation = decay_deviation(player.elo_deviation, days)
                 player.last_spar_time = now
 
-        await self.send_login_response()
+        listserver = getattr(player.server, 'listserver', None)
+
+        # The client reads the first frame as plain zlib, so the leading
+        # packets have to ride in the login-response frame itself.
+        # PlayerClient.cpp:487-492 (new tree): SERVERLISTCONNECTED when the
+        # list server is up, then the reset, then the Stage-1 props.
+        # PlayerRC.cpp:233-252: reset first, SERVERLISTCONNECTED after the
+        # welcome text. PlayerNC.cpp:181-221 sends neither.
+        connected = bool(listserver and listserver.connected)
+        serverlist_connected = build_serverlist_connected() if connected else b''
+        if connection_type & PLTYPE.ANYCLIENT:
+            lead = serverlist_connected + build_clear_weapons()
+        elif is_rc:
+            lead = build_clear_weapons() + serverlist_connected
+        else:
+            lead = b''
+
+        await self.send_login_response(lead)
 
         player.logged_in = True
         player.login_time = time.time()
         logger.info(f"Player {player.id} logged in as {player.account_name}")
 
-        listserver = getattr(player.server, 'listserver', None)
+        # Registered only once logged_in is set: the server's disconnect path
+        # calls remove_player only for logged-in players, so a failed
+        # login-response send must not leave a ghost on the list server.
         if listserver:
             await listserver.add_player(player)
 
@@ -237,8 +261,12 @@ class LoginService:
         await manager.broadcast_chat(
             f"New RC: {player.account_name}", exclude={player.id})
 
-    async def send_login_response(self):
-        """Send PLO_PLAYERPROPS with the player's initial state."""
+    async def send_login_response(self, lead: bytes = b''):
+        """Send PLO_PLAYERPROPS with the player's initial state.
+
+        `lead` is bundled ahead of the props in the same frame (see
+        complete_login).
+        """
         player = self.player
         logger.debug(f"Sending login response for player {player.id}")
 
@@ -267,7 +295,7 @@ class LoginService:
             PLPROP.RATING: (player.elo_rating, player.elo_deviation),
         }
 
-        await player.session.send_login_response(build_player_props(props))
+        await player.session.send_login_response(lead + build_player_props(props))
         # GServer-v2/server/src/player/Player.cpp:754-760 sends a bare
         # PLO_HASNPCSERVER only to game clients when an NPC server is present.
         # pygserver's serverside mode IS that NPC server (server.py

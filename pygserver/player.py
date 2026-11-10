@@ -288,8 +288,10 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
             return
 
         # Check for RC/NC packets
-        if packet_id >= 51 and packet_id <= 98:
-            # RC packet
+        if (51 <= packet_id <= 98 or packet_id in (
+                PLI.RC_LARGEFILESTART, PLI.RC_LARGEFILEEND, PLI.RC_FOLDERDELETE)):
+            # RC packet (the large-file and folder-delete ids sit above the main
+            # block; GServer-v2 PlayerRCPackets.cpp:1523,1537,1567)
             if hasattr(self.server, 'rc_manager'):
                 await self.server.rc_manager.handle_packet(self, packet_id, packet_body)
             return
@@ -402,6 +404,15 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
         # Notify NPCs
         await self.server.npc_manager.on_player_enters(self, level)
 
+    @staticmethod
+    def _board_layer_packets(level):
+        from .protocol.packets import build_board_layer_raw
+        packets = bytearray()
+        for layer, tiles in sorted(level.board_layers.items()):
+            packet = build_board_layer_raw(layer, bytes(tiles))
+            packets.extend(build_raw_data_announcement(len(packet)) + packet)
+        return bytes(packets)
+
     async def _send_level(self, level: 'Level'):
         """Send level data to player."""
         logger.info(f"Sending level {level.name} to player {self.id}")
@@ -428,7 +439,7 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
         else:
             warp_packet = build_warp(*absolute_position(self), level.name)
 
-        combined = level_name_pkt + announcement + board_packet + warp_packet
+        combined = level_name_pkt + announcement + board_packet + self._board_layer_packets(level) + warp_packet
         await self.send_raw(combined)
 
         # If this level is a GMAP segment, announce the .gmap name. That makes the
@@ -601,6 +612,7 @@ _STATE_ALIASES: Dict[str, Tuple[str, str]] = {
     # --- character ----------------------------------------------------------
     'x': ('character', 'x'),
     'y': ('character', 'y'),
+    'z': ('character', 'z'),
     'direction': ('character', 'direction'),
     'carrysprite': ('character', 'carrysprite'),
     'npc_id': ('character', 'npc_id'),

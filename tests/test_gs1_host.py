@@ -1001,7 +1001,7 @@ def test_hitnpc_uses_halfhearts_and_normalized_push_direction():
         run_npc_event(source, "created", Server(), None)
         await asyncio.sleep(0)
         assert target.hearts == 1.5
-        assert (target.hurt_dx, target.hurt_dy) == (19, 25)
+        assert target.hurt_dxdy == (19, 25)
 
     asyncio.run(main())
 

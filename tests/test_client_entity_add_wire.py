@@ -19,14 +19,14 @@ def encoded_string(value):
 
 
 def test_putnpc_decodes_file_image_and_position(tmp_path):
-    script = tmp_path / "scripts" / "guard.txt"
+    script = tmp_path / "world" / "guard.txt"
     script.parent.mkdir()
     script.write_text("setimg scripted.png;\r\n", encoding="latin-1")
     level = MagicMock(name="level")
     level.name = "test.nw"
     level.add_npc.side_effect = lambda npc: setattr(npc, "level", level)
     server = MagicMock()
-    server.config = ServerConfig(putnpc_enabled=True)
+    server.config = ServerConfig(putnpc_enabled=True, serverside=False)
     server.broadcast_to_level = AsyncMock()
     from pygserver.filesystem import FileSystem
     from pygserver.npc import NPCManager

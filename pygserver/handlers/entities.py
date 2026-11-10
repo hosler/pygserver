@@ -1,13 +1,28 @@
 """Baddies, client-created level NPCs, and the player's weapon list."""
 
 import logging
+import os
 from pathlib import Path
 
-from ..protocol.constants import PLI, BDPROP, BDMODE
-from ..protocol.packets import PacketReader, build_baddy_props
+from ..protocol.constants import PLI, PLO, PLTYPE, NPCPROP, BDPROP, BDMODE, LevelItemType
+from ..protocol.packets import (
+    PacketReader, build_baddy_props, build_default_weapon,
+    build_npc_del, build_npc_del2, build_npc_props,
+)
+from ..text_safety import has_control_chars, sanitize_value, strip_control_chars
 from .registry import handles
 
 logger = logging.getLogger(__name__)
+
+
+def _level_mod_time(level) -> float:
+    """Modification time of a level's file (Level::modTime, LevelLoader.cpp:
+    268); 0 for a level with no file behind it."""
+    path = getattr(level, 'file_path', None)
+    try:
+        return os.stat(path).st_mtime if path else 0.0
+    except OSError:
+        return 0.0
 
 
 class EntityHandlers:
@@ -31,14 +46,15 @@ class EntityHandlers:
             elif prop_id == BDPROP.TYPE:
                 props[prop_id] = reader.read_gchar()
             elif prop_id == BDPROP.POWERIMAGE:
-                props[prop_id] = (reader.read_gchar(), reader.read_gstring())
+                props[prop_id] = (reader.read_gchar(),
+                                  strip_control_chars(reader.read_gstring()))
             elif prop_id == BDPROP.MODE:
                 props[prop_id] = reader.read_gchar()
             elif prop_id in (BDPROP.ANI, BDPROP.DIR):
                 props[prop_id] = reader.read_gchar()
             elif prop_id in (BDPROP.VERSESIGHT, BDPROP.VERSEHURT,
                               BDPROP.VERSEATTACK):
-                props[prop_id] = reader.read_gstring()
+                props[prop_id] = strip_control_chars(reader.read_gstring())
             else:
                 break
 
@@ -110,7 +126,8 @@ class EntityHandlers:
         y = reader.read_gchar() / 2.0
         baddy_type = reader.read_gchar()
         power = min(reader.read_gchar(), 12)
-        image = reader.remaining().decode('latin-1', errors='replace')
+        image = strip_control_chars(
+            reader.remaining().decode('latin-1', errors='replace'))
         if image and not Path(image).suffix:
             image += ".gif"
 
@@ -126,18 +143,25 @@ class EntityHandlers:
     @handles(PLI.PUTNPC)
     async def _handle_putnpc(self, data: bytes):
         """Create a level NPC from {image}{scriptfile}{x*2}{y*2}."""
-        if not self.level or not getattr(self.server.config, 'putnpc_enabled', False):
+        if (not self.level or getattr(self.server.config, 'serverside', True)
+                or not getattr(self.server.config, 'putnpc_enabled', False)):
             return
 
         reader = PacketReader(data)
-        image = reader.read_gstring()
+        image = strip_control_chars(reader.read_gstring())
         scriptfile = reader.read_gstring()
         x = reader.read_gchar() / 2.0
         y = reader.read_gchar() / 2.0
 
         filesystem = getattr(self.server, 'filesystem', None)
         manager = getattr(self.server, 'npc_manager', None)
-        script_path = filesystem._find_file(scriptfile) if filesystem else None
+        # PlayerClientPackets.cpp:769 looks the script up by bare name in the
+        # file folders only. The name is client-supplied, so it must be a bare
+        # name resolved inside the world folder: never a path, which would
+        # let a client broadcast accounts/ or config/ files as NPC code.
+        script_path = (
+            filesystem._find_file(scriptfile, dirs=filesystem.NPC_SCRIPT_DIRS,
+                                  strict=True) if filesystem else None)
         if script_path is None or manager is None:
             return
 
@@ -161,8 +185,105 @@ class EntityHandlers:
     @handles(PLI.WEAPONADD)
     async def _handle_weapon_add(self, data: bytes):
         """Handle PLI_WEAPONADD packet (client requesting to add weapon)."""
+        # PlayerClientPackets.cpp:890-945: every form is binary and mode-gated.
+        if getattr(self.server.config, 'serverside', True):
+            return
         reader = PacketReader(data)
-        weapon_name = reader.remaining().decode('latin-1', errors='replace')
+        kind = reader.read_gchar()
+        manager = getattr(self.server, 'gs2_manager', None)
+        if kind == 0:
+            # Player.cpp:1087-1092: default weapons are gated by this option.
+            if not getattr(self.server.config, 'defaultweapons', True):
+                return
+            item_id = reader.read_gchar_signed()
+            try:
+                name = LevelItemType(item_id).name.lower()
+            except ValueError:
+                return
+            if item_id < 0:
+                return
+            self.add_weapon(name)
+            await self.send_raw(build_default_weapon(item_id))
+            return
+        npc = self.server.npc_manager.get_npc(reader.read_gint3())
+        if npc is None or npc.level is None or manager is None:
+            return
+        # NPC.cpp:2120-2144 extracts the first literal toweapons argument.
+        source = npc.gs1_source
+        start = source.find('toweapons')
+        if start < 0:
+            return
+        start += len('toweapons')
+        ends = [pos for delimiter in (';', '}')
+                if (pos := source.find(delimiter, start)) >= 0]
+        if not ends:
+            return
+        name = source[start:min(ends)].strip()
+        if not name:
+            return
+        if has_control_chars(name):
+            return
+        old = manager.get_weapon(name)
+        # PlayerClientPackets.cpp:922-935: a missing weapon is created; an
+        # existing one is replaced only when it is older than the level the
+        # NPC sits in, so touching the NPC cannot undo a newer (e.g. NC) edit.
+        if old is None or old.mod_time < _level_mod_time(npc.level):
+            weapon = manager.upsert_classic_weapon(name, npc.image, source)
+        else:
+            weapon = old
+        if old is not None and old is not weapon:
+            for other in self.server.players.values():
+                if name in other.weapons:
+                    await manager.announce_weapon(other, name)
+        self.add_weapon(name)
+        await manager.announce_weapon(self, name)
 
-        if weapon_name and weapon_name not in self.weapons:
-            self.weapons.append(weapon_name)
+    @handles(PLI.NPCPROPS)
+    async def _handle_npc_props(self, data: bytes):
+        # PlayerClientPackets.cpp:189-210: same level, no leader/owner test.
+        if getattr(self.server.config, 'serverside', True):
+            return
+        reader = PacketReader(data)
+        npc = self.server.npc_manager.get_npc(reader.read_gint3())
+        if npc is None or npc.level is not self.level:
+            return
+        from reborn_protocol.props import NPC_PROPS, decode_value, payload_len
+        raw = reader.remaining()
+        updates = {}
+        position = 0
+        while position < len(raw):
+            prop_id = raw[position] - 32
+            position += 1
+            descriptor = NPC_PROPS.get(prop_id)
+            if descriptor is None:
+                await self.disconnect('Corrupted packet received.')
+                return
+            width = payload_len(descriptor, raw, position, colors_len=8)
+            if position + width > len(raw):
+                await self.disconnect('Corrupted packet received.')
+                return
+            value, position = decode_value(descriptor, raw, position, colors_len=8)
+            # Choke point for client-settable NPC strings (see text_safety).
+            updates.update(npc.apply_client_prop(prop_id, sanitize_value(value)))
+        if updates:
+            await self.server.broadcast_to_world(
+                npc.level.name, build_npc_props(npc.id, updates), exclude={self.id})
+
+    @handles(PLI.NPCDEL)
+    async def _handle_npc_del(self, data: bytes):
+        # PlayerClientPackets.cpp:783-794: no level, ownership or staff test.
+        if getattr(self.server.config, 'serverside', True):
+            return
+        npc = self.server.npc_manager.get_npc(PacketReader(data).read_gint3())
+        if npc is None:
+            return
+        level = npc.level
+        await self.server.npc_manager.destroy_npc(npc, notify=False)
+        if level is not None:
+            # Server.cpp:1610-1638 also invalidates copies outside this level.
+            for other in list(self.server.players.values()):
+                if not other.connection_type & PLTYPE.ANYCLIENT:
+                    continue
+                packet = (build_npc_del(npc.id) if other.level is level else
+                          build_npc_del2(level.name, npc.id))
+                await other.send_raw(packet)

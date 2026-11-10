@@ -100,13 +100,22 @@ async def _npc_move(server, player, fields, action):
         return False
     npc = server.npc_manager.get_npc(npc_id)
     if npc is not None:
-        packet = (PacketBuilder().write_gchar(PLO.MOVE).write_gint3(npc_id)
-                  .write_gchar(int(npc.x * 2)).write_gchar(int(npc.y * 2))
-                  .write_gchar(dx * 2 + 100).write_gchar(dy * 2 + 100)
-                  .write_gshort(ticks).write_gchar(options)
-                  .write_newline().build())
+        from .handlers.versions import client_version
+        from reborn_protocol.props import NPC_PROPS, encode_value
+        # NPC.cpp:485-565: pixel sign/magnitude coordinates since version 2.3.
+        classic = (PacketBuilder().write_gchar(PLO.MOVE).write_gint3(npc_id)
+                   .write_gchar(int(npc.x * 2)).write_gchar(int(npc.y * 2))
+                   .write_gchar(dx * 2 + 100).write_gchar(dy * 2 + 100)
+                   .write_gshort(ticks).write_gchar(options)
+                   .write_newline().build())
+        modern = PacketBuilder().write_gchar(PLO.MOVE2).write_gint3(npc_id)
+        for value in (npc.x, npc.y, dx, dy):
+            modern.write_bytes(encode_value(NPC_PROPS[NPCPROP.X2], value))
+        modern.write_gshort(ticks).write_gchar(options).write_newline()
         if npc.level is not None:
-            await server.broadcast_to_level(npc.level.name, packet)
+            for recipient in server.audience.players_in_world(npc.level.name):
+                await recipient.send_raw(
+                    modern.build() if client_version(recipient) >= 2.3 else classic)
         npc.x = _tile_position(npc.x + dx)
         npc.y = _tile_position(npc.y + dy)
     return True

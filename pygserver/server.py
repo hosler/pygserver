@@ -22,7 +22,8 @@ from .level import Level
 from .world import World
 from .npc import NPCManager
 from .server_flags import ServerFlags
-from .protocol.constants import PLTYPE, PLPERM, PLPROP, PLSTATUS
+from .protocol.constants import PLTYPE, PLPROP, PLSTATUS
+from .admin_access import is_admin_ip, peer_ip
 from .protocol.packets import (
     build_flag_del,
     build_flag_set,
@@ -31,8 +32,6 @@ from .protocol.packets import (
 )
 
 logger = logging.getLogger(__name__)
-
-_ALL_ADMIN_RIGHTS = sum(permission.value for permission in PLPERM)
 
 
 class GameServer:
@@ -567,7 +566,7 @@ class GameServer:
         return len([p for p in self.players.values() if p.logged_in])
 
     def is_staff(self, account_name: str) -> bool:
-        """Check if account is staff."""
+        """Server.cpp:1773: case-insensitive `staff` membership. Grants no rights."""
         if hasattr(self.config, 'staff'):
             return account_name.lower() in [s.lower() for s in self.config.staff]
         return False
@@ -717,67 +716,49 @@ class GameServer:
                 return True
         return False
 
-    def register_rc_session(self, player: Player) -> bool:
-        """
-        Register a player as an RC (Remote Control) admin.
+    def control_login_allowed(self, player: Player) -> bool:
+        """Player.cpp:685-694: RC, RC2 and NC need staff AND an admin-IP match.
 
-        Args:
-            player: Player to register
-
-        Returns:
-            True if registered successfully
+        Rights are not consulted here; the IP is the real socket peer.
         """
-        if not self.rc_manager:
+        if not self.is_staff(player.account_name):
             return False
+        account = self._account_for(player)
+        ip_range = getattr(account, 'admin_ip', '') if account is not None else ''
+        return is_admin_ip(peer_ip(player.remote_ip), ip_range)
 
-        # Get rights from account
-        rights = 0
-        if self.account_manager:
-            account = self.account_manager.get_account(player.account_name)
-            if account:
-                rights = account.admin_rights
+    def _account_for(self, player: Player):
+        if not self.account_manager:
+            return None
+        return self.account_manager.get_account(player.account_name)
 
-        # Also check staff config
-        if self.is_staff(player.account_name):
-            rights |= _ALL_ADMIN_RIGHTS
+    def _stored_rights(self, player: Player) -> int:
+        # Staff membership grants no rights; only the account's stored bits count.
+        rights = getattr(self._account_for(player), 'admin_rights', 0)
+        return rights if isinstance(rights, int) else 0
 
-        if rights > 0:
-            self.rc_manager.register_session(player, rights)
-            logger.info(f"RC session registered for {player.account_name} with rights {rights}")
-            return True
-
-        return False
+    def register_rc_session(self, player: Player) -> bool:
+        """Register an RC session if control_login_allowed admits the player."""
+        if not self.rc_manager or not self.control_login_allowed(player):
+            return False
+        rights = self._stored_rights(player)
+        self.rc_manager.register_session(player, rights)
+        logger.info(f"RC session registered for {player.account_name} with rights {rights}")
+        return True
 
     def register_nc_session(self, player: Player) -> bool:
-        """
-        Register a player as an NC (NPC Control) user.
+        """Register an NC session if control_login_allowed admits the player.
 
-        Args:
-            player: Player to register
-
-        Returns:
-            True if registered successfully
+        The NPC-control right is not checked: the reference gates only the
+        NC address push on it (NPCServer.cpp:120-131), never the NC login or
+        the NC packets (PlayerNCPackets.cpp checks isNC() only).
         """
-        if not self.nc_manager:
+        if not self.nc_manager or not self.control_login_allowed(player):
             return False
-
-        # Check for NC rights
-        rights = 0
-        if self.account_manager:
-            account = self.account_manager.get_account(player.account_name)
-            if account:
-                rights = account.admin_rights
-
-        if self.is_staff(player.account_name):
-            rights |= _ALL_ADMIN_RIGHTS
-
-        if rights > 0:
-            self.nc_manager.register_session(player)
-            player.connection_type = PLTYPE.NC
-            logger.info(f"NC session registered for {player.account_name}")
-            return True
-
-        return False
+        self.nc_manager.register_session(player)
+        player.connection_type = PLTYPE.NC
+        logger.info(f"NC session registered for {player.account_name}")
+        return True
 
 
 async def run_server(config_path: Optional[str] = None):

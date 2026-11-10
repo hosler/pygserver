@@ -34,6 +34,8 @@ class Character:
         # Wire position in tiles: NPC-relative when attached, level-local otherwise.
         self.x = 0.0
         self.y = 0.0
+        # PLPROP_Z/Z2 in tiles (Character.h localPixelZ / 16).
+        self.z = 0.0
         self.direction = 2  # Down
         self.carrysprite = -1
         # Retained until a carried-NPC throw consumes it.  Clients normally

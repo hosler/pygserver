@@ -76,7 +76,7 @@ def build_gani_script(gani_name: str, bytecode: bytes) -> bytes:
     """Build PLO_GANISCRIPT: [gchar name_len][gani name][bytecode]
     (GameAni.cpp getBytecodePacket; the name carries no .gani suffix).
 
-    The payload is compiled GS2, not gani text, and like PLO_NPCWEAPONSCRIPT
+    The payload is compiled GS2, not gani text, and like PLO_WEAPONBYTECODE2
     it must be announced with build_raw_data_announcement().
     """
     builder = PacketBuilder().write_gchar(PLO.GANISCRIPT)

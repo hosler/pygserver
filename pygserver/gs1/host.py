@@ -178,6 +178,12 @@ def _charprop_target(code, table):
 
 
 class _GS1ObjectRef:
+    """A script object handle (getplayer()/getnpc()/players[i]/bombs[i]/...).
+
+    `kind` is player, npc, baddy, bomb, arrow, item, explosion, horse or sign
+    (see objects.py). Used as `with (...)` target and for `array[i].field`
+    access; `owner` is the NPC running the script.
+    """
     gs1_with_members = True
 
     def __init__(self, host, kind, target, owner, ctx):
@@ -187,25 +193,35 @@ class _GS1ObjectRef:
         self.owner = owner
         self.ctx = ctx
 
-    def get(self, name):
-        table = NPC_ATTR if self.kind == "npc" else PLAYER_WITH_ATTR
-        attr = table.get(name)
+    def get(self, name, indices=()):
+        # The reference property table first (objects.py), then the legacy
+        # unprefixed spellings (`playerhearts`, `nick`, `message`, ...).
+        value = objects.read_field(self, name, tuple(indices or ()))
+        if value is not UNSET:
+            return value
+        table = {"npc": NPC_ATTR, "player": PLAYER_WITH_ATTR}.get(self.kind)
+        attr = table.get(name) if table else None
         if attr is None:
             return UNSET
         if self.kind == "player" and attr in ('x', 'y'):
             return host_value(absolute_position(self.target)[attr == 'y'])
         return host_value(getattr(self.target, attr, 0))
 
-    def set(self, name, value):
-        table = NPC_ATTR if self.kind == "npc" else PLAYER_WITH_ATTR
-        attr = table.get(name)
+    def set(self, name, value, indices=()):
+        if objects.write_field(self, name, value, tuple(indices or ())):
+            return True
+        table = {"npc": NPC_ATTR, "player": PLAYER_WITH_ATTR}.get(self.kind)
+        attr = table.get(name) if table else None
         if attr is None:
             return False
         if self.kind == "player":
             self.host._set_player_attr(self.target, attr, value, self.ctx)
         else:
-            setattr(self.target, attr, self.host._num_or_str(value))
-            self.host._dirty(self.target)
+            clean = objects.sanitize(self.host, self.target, attr,
+                                     self.host._num_or_str(value))
+            if clean is not objects.DROP:
+                setattr(self.target, attr, clean)
+                self.host._dirty(self.target)
         return True
 
 
@@ -218,6 +234,26 @@ PLAYER_WITH_ATTR.update({
     for name, attr in PLAYER_ATTR.items()
     if name.startswith("player") and len(name) > len("player")
 })
+
+
+def _source_player(ctx):
+    """The player a bare `#a` refers to: a with-target player handle, else
+    the acting player."""
+    this = ctx.this_obj
+    if isinstance(this, _GS1ObjectRef) and this.kind == "player":
+        return this.target
+    return ctx.player
+
+
+def _source_character(ctx):
+    """(character, nickname attr, chat attr) for bare `#n`/`#c`."""
+    this = ctx.this_obj
+    if isinstance(this, _GS1ObjectRef):
+        if this.kind == "player":
+            return this.target, "nickname", "chat"
+        if this.kind == "npc":
+            return this.target, "nickname", "message"
+    return ctx.player, "nickname", "chat"
 
 
 class GS1Host(Host):
@@ -235,12 +271,15 @@ class GS1Host(Host):
         reader returns when its gate (a player / an NPC) is missing.
         """
         if isinstance(ctx.this_obj, _GS1ObjectRef):
-            value = ctx.this_obj.get(name)
+            value = ctx.this_obj.get(name, indices)
             if value is not UNSET:
                 return value
         player = ctx.player
         npc = (ctx.this_obj.owner
                if isinstance(ctx.this_obj, _GS1ObjectRef) else ctx.this_obj)
+        value = objects.get(self, name, indices, ctx)
+        if value is not UNSET:
+            return value
         if name == "params":
             params = getattr(ctx, "action_params", [])
             if not indices:
@@ -262,11 +301,13 @@ class GS1Host(Host):
 
     def set_builtin(self, name, value, indices, ctx) -> bool:
         if isinstance(ctx.this_obj, _GS1ObjectRef):
-            if ctx.this_obj.set(name, value):
+            if ctx.this_obj.set(name, value, indices):
                 return True
         player = ctx.player
         npc = (ctx.this_obj.owner
                if isinstance(ctx.this_obj, _GS1ObjectRef) else ctx.this_obj)
+        if objects.put(self, name, value, indices, ctx):
+            return True
         if name == "save" and indices and npc is not None:
             slots = ctx.vars.scopes["this"].setdefault("save", [0.0] * 10)
             index = int(to_num(indices[0]))
@@ -284,8 +325,11 @@ class GS1Host(Host):
             self._set_player_attr(player, PLAYER_ATTR[name], value, ctx)
             return True
         if name in NPC_ATTR and npc is not None:
-            setattr(npc, NPC_ATTR[name], self._num_or_str(value))
-            self._dirty(npc)
+            clean = objects.sanitize(self, npc, NPC_ATTR[name],
+                                     self._num_or_str(value))
+            if clean is not objects.DROP:
+                setattr(npc, NPC_ATTR[name], clean)
+                self._dirty(npc)
             return True
         if name == "sprite" and npc is not None and hasattr(npc, "flags"):
             npc.flags["sprite"] = to_num(value)
@@ -380,9 +424,15 @@ class GS1Host(Host):
         if handler is not None:
             return handler(self, name, args, ctx)
         lowered = name.lower()
-        if lowered in ("getplayer", "findplayer"):
+        if lowered == "getplayer":
+            return self._get_player(args, ctx)
+        if lowered == "getnpc":
+            return self._get_npc(args, ctx)
+        # findplayer/findnpc are not in the GServer-v2 function table
+        # (GS1Functions.cpp); kept as the older level-scoped lookup.
+        if lowered == "findplayer":
             return self._object_ref(args, ctx, "player")
-        if lowered in ("getnpc", "findnpc"):
+        if lowered == "findnpc":
             return self._object_ref(args, ctx, "npc")
         if name == "makevar":
             dynamic = to_str(args[0]).strip('"') if args else ""
@@ -396,6 +446,56 @@ class GS1Host(Host):
             return (to_num(args[0]) if args else 0.0) * math.pi / 180.0
         return UNSET
 
+    def _get_player(self, args, ctx):
+        """getplayer(account): any online client on the server, matched on
+        the account name case-insensitively (GS1Functions.cpp fn_getplayer ->
+        NPCServer::getPlayer(account, PLTYPE_ANYCLIENT), NPCServer.h:185);
+        0 when nobody matches."""
+        wanted = to_str(args[0]).lower() if args else ""
+        if not wanted:
+            return 0.0
+        players = getattr(self.server, "players", None)
+        if isinstance(players, dict):
+            candidates = [players[pid] for pid in sorted(players)]
+            from ..protocol.constants import PLTYPE
+            candidates = [
+                p for p in candidates
+                if getattr(p, "connection_type", PLTYPE.CLIENT) & PLTYPE.ANYCLIENT
+                and getattr(p, "logged_in", True)]
+        else:
+            candidates = self._players_on_level(ctx)
+            if ctx.player is not None and ctx.player not in candidates:
+                candidates.insert(0, ctx.player)
+            candidates = [p for p in candidates if getattr(p, "logged_in", True)]
+        for player in candidates:
+            if to_str(getattr(player, "account_name", "")).lower() == wanted:
+                return _GS1ObjectRef(self, "player", player,
+                                     self._object_owner(ctx), ctx)
+        return 0.0
+
+    def _get_npc(self, args, ctx):
+        """getnpc(name): any NPC on the server whose name equals `name`
+        exactly (fn_getnpc compares `npc->name == npcName`), first by id."""
+        wanted = to_str(args[0]) if args else ""
+        if not wanted:
+            return 0.0
+        manager = getattr(self.server, "npc_manager", None)
+        pool = getattr(manager, "_npcs", None)
+        if isinstance(pool, dict):
+            candidates = [pool[nid] for nid in sorted(pool)]
+        else:
+            candidates = objects._level_npcs(self._level_of(ctx))
+        for npc in candidates:
+            if getattr(npc, "name", None) == wanted:
+                return _GS1ObjectRef(self, "npc", npc,
+                                     self._object_owner(ctx), ctx)
+        return 0.0
+
+    @staticmethod
+    def _object_owner(ctx):
+        this = ctx.this_obj
+        return this.owner if isinstance(this, _GS1ObjectRef) else this
+
     def _object_ref(self, args, ctx, kind):
         wanted = to_str(args[0]).lower() if args else ""
         if not wanted:
@@ -404,6 +504,7 @@ class GS1Host(Host):
             objects = self._players_on_level(ctx)
             if ctx.player is not None and ctx.player not in objects:
                 objects.insert(0, ctx.player)
+            objects = [p for p in objects if getattr(p, "logged_in", True)]
             fields = ("account_name", "nickname", "id")
         else:
             level = self._level_of(ctx)
@@ -507,6 +608,9 @@ class GS1Host(Host):
             npc.mark_dirty()
 
     def _set_player_attr(self, player, attr, value, ctx=None):
+        value = objects.sanitize(self, player, attr, value)
+        if value is objects.DROP:
+            return  # non-finite: never let it reach state or a packet
         if attr in ('x', 'y') and getattr(player, 'attach_npc', (0, 0))[1]:
             # Script coordinates are absolute; retain offsets in wire state.
             base = absolute_position(player)[attr == 'y'] - getattr(player, attr)
@@ -518,16 +622,16 @@ class GS1Host(Host):
             setattr(player, attr, to_str(value))
         else:
             setattr(player, attr, to_num(value))
-        # queue the change for propagation to the client (flushed after the
-        # event in run_npc_event); chat/account are not client props
-        wire = PLAYER_PROP_WIRE.get(attr)
-        if wire is not None:
-            prop_id, enc = wire
+        # queue the change for propagation (flushed after the event in
+        # run_npc_event to the player and to the other clients); chat/account
+        # are not client props
+        props = objects.player_wire_props(player, attr, PLAYER_PROP_WIRE)
+        if props:
             dirty = getattr(player, "_gs1_dirty_props", None)
             if dirty is None:
                 dirty = {}
                 player._gs1_dirty_props = dirty
-            dirty[prop_id] = enc(getattr(player, attr))
+            dirty.update(props)
             if ctx is not None:
                 written = getattr(ctx, "written_players", None)
                 if written is None:
@@ -536,6 +640,9 @@ class GS1Host(Host):
                 written[id(player)] = player
 
     def _set_timer(self, npc, seconds):
+        if not math.isfinite(seconds):
+            return
+        seconds = min(seconds, 86400.0)
         if hasattr(npc, "set_timer"):
             npc.set_timer(seconds)
         else:
@@ -576,7 +683,17 @@ class GS1Host(Host):
 
     # -- world queries -----------------------------------------------------
     def _level_of(self, ctx):
-        return getattr(ctx.this_obj, "level", None) or getattr(ctx.player, "level", None)
+        # Inside `with (players[i])` this_obj is the object handle; the script
+        # still belongs to the NPC that owns it.
+        this = ctx.this_obj
+        if isinstance(this, _GS1ObjectRef):
+            this = this.owner
+        return getattr(this, "level", None) or getattr(ctx.player, "level", None)
+
+    def _object_ref_for(self, kind, target, ctx):
+        this = ctx.this_obj
+        owner = this.owner if isinstance(this, _GS1ObjectRef) else this
+        return _GS1ObjectRef(self, kind, target, owner, ctx)
 
     def _players_on_level(self, ctx):
         """All logged-in Player objects on the script's level (nearest-* helpers)."""
@@ -603,6 +720,7 @@ class GS1Host(Host):
             direct = getattr(level, "players", None)
             if direct is not None:
                 objects = list(direct.values()) if isinstance(direct, dict) else list(direct)
+                objects = [p for p in objects if getattr(p, "logged_in", True)]
         if not players:
             if level is not None:
                 if hasattr(level, "get_npcs"):
@@ -771,17 +889,20 @@ class GS1Host(Host):
                 getattr(ctx, "action_params", ()))
             else ""
         ),
+        # Inside `with (players[i])` / `with (npcs[i])` the message codes read
+        # the with-target (GS1MessageCodes.cpp mc_a: nearest PLAYER source;
+        # mc_CharacterProperty: current source); elsewhere the acting player.
         "#a": lambda args, ctx: (
-            to_str(getattr(ctx.player, "account_name", ""))
-            if ctx.player is not None else ""
+            to_str(getattr(_source_player(ctx), "account_name", ""))
+            if _source_player(ctx) is not None else ""
         ),
         "#n": lambda args, ctx: (
-            to_str(getattr(ctx.player, "nickname", ""))
-            if ctx.player is not None else ""
+            to_str(getattr(_source_character(ctx)[0], _source_character(ctx)[1], ""))
+            if _source_character(ctx)[0] is not None else ""
         ),
         "#c": lambda args, ctx: (
-            to_str(getattr(ctx.player, "chat", ""))
-            if ctx.player is not None else ""
+            to_str(getattr(_source_character(ctx)[0], _source_character(ctx)[2], ""))
+            if _source_character(ctx)[0] is not None else ""
         ),
         "#N": lambda args, ctx: (
             to_str(getattr(ctx.this_obj, "name", ""))
@@ -794,6 +915,7 @@ class GS1Host(Host):
     }
 
 
+from . import objects
 from .builtins import _BUILTINS
 # Classic colour names, index = ClassicColors enum value (GServer-v2
 # Character.h / ScriptEngineGS1.h colorNames). The #C0-#C7 message codes read

@@ -176,7 +176,13 @@ async def test_login_decay_precedes_props_and_runs_once(
         assert player.elo_deviation == expected_dev
         assert player.last_spar_time == expected_time
         reader = PacketReader(packet)
-        assert reader.read_gchar() == PLO.PLAYERPROPS
+        # The login-response frame leads with the reset (and, with the list
+        # server up, SERVERLISTCONNECTED) ahead of the props.
+        packet_id = reader.read_gchar()
+        while packet_id in (PLO.SERVERLISTCONNECTED, PLO.RESETCLIENT):
+            assert reader.read_byte() == ord('\n')
+            packet_id = reader.read_gchar()
+        assert packet_id == PLO.PLAYERPROPS
         props, clean, _pos = parse_prop_stream(
             reader.remaining()[:-1], 0,
             StreamPolicy(table=PLAYER_PROPS, max_prop_id=100,

@@ -9,13 +9,14 @@ import importlib.util
 import logging
 import math
 import time
-from typing import TYPE_CHECKING, Optional, Dict, Any, List, Callable
+from typing import TYPE_CHECKING, Optional, Dict, Any, List, Callable, Tuple
 from pathlib import Path
 
 from .attachments import absolute_position
 
 from .protocol.packets import PacketBuilder, build_npc_props
 from .protocol.constants import PLO, NPCPROP
+from .text_safety import strip_control_chars
 
 if TYPE_CHECKING:
     from .server import GameServer
@@ -27,6 +28,35 @@ logger = logging.getLogger(__name__)
 # reborn_protocol.props.encode_value(NPC_PROPS[1]) uses two G-encoded
 # length lanes, each at most 223: (223 << 7) + 223, not a 16-bit integer.
 _MAX_CLIENT_SCRIPT_BYTES = 0x705F
+
+# Marks a decoded client prop value that cannot be applied.
+_REJECT = object()
+
+# PropertyHurtDxDy<> (PropertySerializers.h:600-657): MidPoint = 32. The push is
+# kept as signed half pixels in [-32, 32]; serialize() writes
+# (char)(v + MidPoint) through operator>>(char) = writeGChar (CString.h:317,
+# CString.cpp:1519-1524), which adds 32 again, so each wire byte is v + 64
+# (32..96, always printable); deserialize() reads GChar then subtracts MidPoint.
+HURT_MIDPOINT = 32
+_HURT_WIRE_BIAS = 2 * HURT_MIDPOINT
+
+
+def clamp_hurt_half_pixels(value) -> int:
+    """Clamp one push axis to the reference's [-MidPoint, MidPoint]."""
+    return max(-HURT_MIDPOINT, min(HURT_MIDPOINT, int(value)))
+
+
+def hurt_dxdy_wire(push) -> bytes:
+    """The two NPCPROP_HURTDXDY wire bytes for a signed (dx, dy) push."""
+    return bytes(clamp_hurt_half_pixels(v) + _HURT_WIRE_BIAS for v in push)
+
+
+def hurt_dxdy_from_wire(raw) -> Optional[Tuple[int, int]]:
+    """Decode two wire bytes back to a clamped signed push (None if short)."""
+    if not isinstance(raw, (bytes, bytearray)) or len(raw) < 2:
+        return None
+    return (clamp_hurt_half_pixels(raw[0] - _HURT_WIRE_BIAS),
+            clamp_hurt_half_pixels(raw[1] - _HURT_WIRE_BIAS))
 
 
 def split_gs1_script(code: str, npcserver: bool) -> tuple[str, str]:
@@ -94,6 +124,11 @@ class NPC:
         self.visible = True
         self.block_flags = 0
         self.vis_flags = 0
+
+        # NPCPROP_HURTDXDY: signed push (dx, dy) in half pixels, each clamped to
+        # [-32, 32] (hurtPushDeltaInHalfPixels, NPC.h:622); None until something
+        # sets it (hitnpc, NPC.cpp:1277). The wire form is hurt_dxdy_wire().
+        self.hurt_dxdy: Optional[Tuple[int, int]] = None
 
         # Flags (custom state)
         self.flags: Dict[str, str] = {}
@@ -191,6 +226,138 @@ class NPC:
             self._api = NPCApi(self, manager)
         return self._api
 
+    @staticmethod
+    def _client_prop_value(descriptor, value):
+        """Normalise a decoded client value, or return _REJECT when unusable.
+
+        The decoder yields None for an empty string and for any truncated
+        payload, and shapes the handlers below never see in well-formed
+        traffic. Everything is checked here, before apply_client_prop changes
+        any state, so a malformed prop is dropped whole instead of raising
+        halfway through an update.
+        """
+        from reborn_protocol.props import Wire
+        wire = descriptor.wire
+        if wire in (Wire.STRING, Wire.LONGSTRING):
+            return strip_control_chars(value) if isinstance(value, str) else ''
+        if wire is Wire.HEADGIF:
+            if isinstance(value, int) and not isinstance(value, bool):
+                return value
+            return strip_control_chars(value) if isinstance(value, str) else _REJECT
+        if wire is Wire.GBYTE:
+            return value if isinstance(value, int) else _REJECT
+        if wire in (Wire.TILE, Wire.HALFTILE, Wire.TILEZ, Wire.PIXEL):
+            return (value if isinstance(value, (int, float))
+                    and not isinstance(value, bool) else _REJECT)
+        if wire is Wire.SWORDPOWER:
+            if (not isinstance(value, tuple) or len(value) != 2
+                    or not isinstance(value[0], int)):
+                return _REJECT
+            image = value[1]
+            return (value[0],
+                    strip_control_chars(image) if isinstance(image, str) else None)
+        if wire is Wire.COLORS:
+            return (list(value) if isinstance(value, list) and value
+                    and all(isinstance(item, int) for item in value) else _REJECT)
+        if wire is Wire.IMAGEPART:
+            return (value if isinstance(value, tuple) and len(value) == 4
+                    and all(isinstance(item, int) for item in value) else _REJECT)
+        if wire is Wire.RAW:
+            return value if isinstance(value, (bytes, bytearray)) else _REJECT
+        return _REJECT
+
+    def apply_client_prop(self, prop_id, value):
+        """Apply classic-mode updates before relaying their normalized values."""
+        # NPC.cpp:982-1608: scripts are server-only; position has paired props.
+        from reborn_protocol.props import NPC_PROPS
+        if prop_id == NPCPROP.SCRIPT:
+            return {}
+        descriptor = NPC_PROPS.get(prop_id)
+        if descriptor is None:
+            return {}
+        value = self._client_prop_value(descriptor, value)
+        if value is _REJECT:
+            return {}
+        coordinates = {2: ('x', 75), 3: ('y', 76), 43: ('z', 77),
+                       75: ('x', 2), 76: ('y', 3), 77: ('z', 43)}
+        if prop_id == NPCPROP.HURTDXDY:
+            push = hurt_dxdy_from_wire(value)
+            if push is None or push == self.hurt_dxdy:
+                return {}
+            self.hurt_dxdy = push
+            return {prop_id: hurt_dxdy_wire(push)}
+        if prop_id in coordinates:
+            if getattr(self, '_block_position_updates', False):
+                return {}
+            attr, paired = coordinates[prop_id]
+            if attr == 'z' and not -50 <= value <= 170:
+                value = -51
+            if value == getattr(self, attr, 0):
+                return {}
+            setattr(self, attr, value)
+            return {prop_id: value, paired: value}
+        if 23 <= prop_id <= 32:
+            saves = getattr(self, 'saves', [0] * 10)
+            saves[prop_id - 23] = value
+            self.saves = saves
+            return {prop_id: value}
+        if descriptor.name.startswith('GATTRIB'):
+            if self.gattribs.get(prop_id, '') == value:
+                return {}
+            self.gattribs[prop_id] = value
+            return {prop_id: value}
+        attrs = {0: 'image', 4: 'hearts', 5: 'rupees', 6: 'arrows', 7: 'bombs',
+                 8: 'glove_power', 9: 'bomb_power', 12: 'gani', 13: 'vis_flags',
+                 14: 'block_flags', 15: 'message', 18: 'sprite',
+                 19: 'colors', 20: 'nickname', 21: 'horse_image', 22: 'head_image',
+                 33: 'ap', 34: 'imagepart', 35: 'body_image', 41: 'map_x',
+                 42: 'map_y', 49: 'scripter', 50: 'name', 51: 'script_type',
+                 74: 'joined_classes'}
+        if prop_id in (10, 11):
+            prefix = 'sword' if prop_id == 10 else 'shield'
+            power, image = value
+            power = min(power, 20 if prop_id == 10 else 3)
+            setattr(self, prefix + '_power', power)
+            if image is None:
+                image = prefix + str(power) + '.png'
+            setattr(self, prefix + '_image', image[:223])
+            return {prop_id: value}
+        attr = attrs.get(prop_id)
+        if attr is None:
+            return {}
+        current = getattr(self, attr, None)
+        stored = value / 2 if prop_id == 4 else value
+        if prop_id in (6, 7, 8, 9):
+            stored = min(value, {6: 99, 7: 99, 8: 2, 9: 3}[prop_id])
+        if prop_id == 22:
+            stored = f'head{value}.png' if isinstance(value, int) else value[:123]
+        if stored == current and prop_id != 12:
+            return {}
+        setattr(self, attr, stored)
+        updates = {prop_id: value}
+        if prop_id == 18:
+            self.direction = value & 3
+        if prop_id == 13:
+            self.visible = bool(value & 1)
+        if prop_id == 0:
+            old = self.vis_flags
+            self.vis_flags = ((old | 1) if value and value != '-' else old & ~1)
+            self.visible = bool(self.vis_flags & 1)
+            if old != self.vis_flags:
+                updates[13] = self.vis_flags
+            if value == '#c#' and current != '#c':
+                self.vis_flags |= 8
+                self.gani = 'idle'
+                updates[12] = self.gani
+        if prop_id == 12:
+            if self.image not in ('#c#', '#c'):
+                self.image = '#c#'
+                updates[0] = self.image
+            if not value.startswith('def[') and getattr(self, 'sprite', 0):
+                self.sprite = 0
+                updates[18] = 0
+        return updates
+
     def build_props_packet(self, *, include_script: bool = True) -> bytes:
         """Build NPC properties, including the client script for full sends."""
         props = {
@@ -238,6 +405,11 @@ class NPC:
             props[NPCPROP.HORSEIMAGE] = self.horse_image
         if self.block_flags:
             props[NPCPROP.BLOCKFLAGS] = self.block_flags
+        # The reference sends every prop whose modTime is set (NPC.cpp:1758); the
+        # push direction is set by hitnpc (GS1Commands.cpp:1470) and the hurtdx
+        # / hurtdy builtins (NPC.cpp:1984,1998).
+        if self.hurt_dxdy is not None:
+            props[NPCPROP.HURTDXDY] = hurt_dxdy_wire(self.hurt_dxdy)
         if getattr(self, 'imagepart', None):
             props[NPCPROP.IMAGEPART] = self.imagepart
         if any(self.colors):
@@ -546,10 +718,18 @@ class NPCManager:
         # smooth (per-tick) NPC movement. None until the first tick.
         self._last_move_tick: Optional[float] = None
 
+    def _allocate_id(self) -> int:
+        """Next NPC id that no NPC or weapon runtime already holds."""
+        while (self._next_id in self._npcs
+               or self._next_id in self._weapon_runtimes):
+            self._next_id += 1
+        npc_id = self._next_id
+        self._next_id += 1
+        return npc_id
+
     def register_weapon_runtime(self, npc: NPC) -> NPC:
         """Give a server-side weapon runtime a collision-free ticking ID."""
-        npc.id = self._next_id
-        self._next_id += 1
+        npc.id = self._allocate_id()
         self._weapon_runtimes[npc.id] = npc
         return npc
 
@@ -590,7 +770,8 @@ class NPCManager:
 
     def create_npc(self, name: str = "", script_name: str = "",
                    level: Optional['Level'] = None,
-                   x: float = 0, y: float = 0) -> NPC:
+                   x: float = 0, y: float = 0,
+                   npc_id: Optional[int] = None) -> NPC:
         """
         Create a new NPC.
 
@@ -599,12 +780,17 @@ class NPCManager:
             script_name: Name of script class to use
             level: Initial level
             x, y: Initial position
+            npc_id: Explicit ID (NC_NPCADD); None takes the next free one
 
         Returns:
             Created NPC instance
         """
-        npc_id = self._next_id
-        self._next_id += 1
+        if npc_id is None:
+            npc_id = self._allocate_id()
+        else:
+            # An id chosen by NC_NPCADD is reserved: the auto counter must
+            # never hand the same id to a later create_npc().
+            self._next_id = max(self._next_id, npc_id + 1)
 
         npc = NPC(npc_id, name)
         npc.x = x
@@ -701,6 +887,13 @@ class NPCManager:
         """Get NPC by ID."""
         return self._npcs.get(npc_id)
 
+    def get_npc_by_name(self, name: str) -> Optional[NPC]:
+        """Get an NPC by exact name (NPCServer::getNPCByName)."""
+        for npc in self._npcs.values():
+            if npc.name == name:
+                return npc
+        return None
+
     def get_npcs_on_level(self, level: 'Level') -> List[NPC]:
         """Get all NPCs on a level.
 
@@ -716,7 +909,7 @@ class NPCManager:
             return get_npcs()
         return [npc for npc in self._npcs.values() if npc.level == level]
 
-    async def destroy_npc(self, npc: NPC):
+    async def destroy_npc(self, npc: NPC, *, notify: bool = True):
         """Destroy an NPC."""
         if npc.id in self._npcs:
             del self._npcs[npc.id]
@@ -738,7 +931,8 @@ class NPCManager:
             # Notify players on level
             from .protocol.packets import build_npc_del
             packet = build_npc_del(npc.id)
-            await self.server.broadcast_to_level(level_name, packet)
+            if notify:
+                await self.server.broadcast_to_level(level_name, packet)
 
     async def warp_npc(self, npc: NPC, level_name: str, x: float, y: float):
         """Warp an NPC to a new location."""

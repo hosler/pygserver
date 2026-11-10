@@ -156,7 +156,7 @@ def test_rc_flags_are_visible_to_scripts_and_persisted(tmp_path):
         server = make_server(tmp_path)
         player = SimpleNamespace(id=2, account_name="admin", send_raw=AsyncMock())
         manager = RCManager(server)
-        session = RCSession(player, rights=PLPERM.SETATTRIBUTES | PLPERM.VIEWATTRIBUTES)
+        session = RCSession(player, rights=PLPERM.SETSERVERFLAGS)
         payload = (PacketBuilder().write_gshort(2).write_gstring("server.fromrc=hello")
                    .write_gstring("serverr.enabled").build())
         await manager._handle_server_flags_set(session, payload)

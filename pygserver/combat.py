@@ -17,7 +17,6 @@ from .attachments import absolute_position
 
 from .audience import (
     BOMB_BLAST_NPCS,
-    FIRESPY_HIT_PLAYERS,
 )
 from .ap_system import kill_penalty
 from .spar_rating import glicko_update
@@ -26,12 +25,13 @@ from .protocol.constants import PLO, PLPROP
 from reborn_protocol import PLSTATUS
 from .protocol.packets import (
     PacketBuilder,
+    PacketReader,
     build_bomb_add,
     build_bomb_del,
     build_arrow_add,
     build_explosion,
-    build_hurt_player,
     build_fire_spy,
+    build_hurt_player,
     build_push_away,
     build_throw_carried,
     build_hit_objects,
@@ -949,30 +949,21 @@ class CombatManager:
         self.set_invincible(player.id, 3.0)
         logger.info(f"Player {player.id} respawned")
 
-    async def handle_fire_spy(self, player: 'Player', x: float, y: float):
-        """
-        Handle fire spy placement (from fire wand).
+    async def handle_fire_spy(self, player: 'Player', length_power: int):
+        """Relay the packed wand effect from the player's current position.
 
-        Args:
-            player: Player placing fire
-            x: X position
-            y: Y position
+        PlayerClientPackets.cpp:314-327. The reference builds its relay from
+        `pPacket.text() + 1`: text() is the buffer start, whose first byte is
+        the packet id, so the +1 skips that id and the relay carries the packed
+        length/power byte (and anything after it) unchanged. The wand has no
+        coordinates on the wire, so no server-side player damage is derived
+        from it.
         """
         if not player.level:
             return
-
-        # Broadcast fire effect
-        packet = build_fire_spy(x, y)
-        await self.server.broadcast_to_level(player.level.name, packet)
-
-        # Damage players at position (1.5-tile box, sender excluded)
-        for other in self.server.audience.players_near(
-                player.level.name, x, y, 1.5, FIRESPY_HIT_PLAYERS,
-                exclude={player.id}):
-            await self.apply_damage(
-                other, 2, 0, 0,
-                DamageType.FIRE, player.id
-            )
+        await self.server.broadcast_to_level(
+            player.level.name, build_fire_spy(player.id, length_power),
+            exclude={player.id})
 
     async def handle_throw_carried(self, player: 'Player', direction: int,
                                     carrysprite: int):
@@ -1158,49 +1149,61 @@ class CombatManager:
             await npc_mgr.on_npc_wasthrown(npc, player)
 
     async def handle_shoot(self, player: 'Player', shoot_data: bytes):
-        """
-        Handle PLI_SHOOT packet (projectile weapons).
-
-        Args:
-            player: Player shooting
-            shoot_data: Raw shoot packet data
-        """
-        # Parse shoot data - format varies by weapon
-        # For now, broadcast to level
-        if not player.level:
-            return
-
-        # Build and broadcast
-        builder = PacketBuilder()
-        builder.write_gchar(PLO.SHOOT)
-        builder.write_gshort(player.id)
-        builder.write_bytes(shoot_data)
-        builder.write_byte(ord('\n'))
-
-        await self.server.broadcast_to_level(
-            player.level.name, builder.build(), exclude={player.id}
-        )
+        """Normalize the classic projectile before choosing recipient layouts."""
+        await self._relay_shoot(player, shoot_data, modern=False)
 
     async def handle_shoot2(self, player: 'Player', shoot_data: bytes):
-        """
-        Handle PLI_SHOOT2 packet (extended projectile data).
+        """Normalize the pixel projectile before choosing recipient layouts."""
+        await self._relay_shoot(player, shoot_data, modern=True)
 
-        Args:
-            player: Player shooting
-            shoot_data: Raw shoot packet data
-        """
+    async def _relay_shoot(self, player, data, *, modern):
+        # PlayerClientPackets.cpp:1329-1405; Player.cpp:239-274 serializes both.
+        from .handlers.versions import client_version
         if not player.level:
             return
-
-        builder = PacketBuilder()
-        builder.write_gchar(PLO.SHOOT)
-        builder.write_gshort(player.id)
-        builder.write_bytes(shoot_data)
-        builder.write_byte(ord('\n'))
-
-        await self.server.broadcast_to_level(
-            player.level.name, builder.build(), exclude={player.id}
-        )
+        reader = PacketReader(data)
+        if modern:
+            x, y, z = (reader.read_gshort() for _ in range(3))
+            x, y, z = ((value + 32768) % 65536 - 32768 for value in (x, y, z))
+            ox, oy = reader.read_gchar_signed(), reader.read_gchar_signed()
+        else:
+            reader.read_gint3()  # The incoming source is discarded.
+            x, y = reader.read_gchar_signed() * 8, reader.read_gchar_signed() * 8
+            z = (reader.read_gchar_signed() - 50) * 16
+            info = self.server.world.get_gmap_for_level(player.level.name)
+            if info:
+                x += info[1] * 1024
+                y += info[2] * 1024
+            ox = oy = 0
+        angle, zangle, power = (reader.read_gchar() for _ in range(3))
+        gravity = reader.read_gchar() if modern else 2
+        gani_length = reader.read_gshort() if modern else reader.read_gchar()
+        gani = reader.read_bytes(gani_length)
+        reader.read_gchar()  # The reference consumes all trailing params.
+        params = reader.remaining()
+        packets = {}
+        for use_modern in (False, True):
+            builder = (PacketBuilder().write_gchar(PLO.SHOOT2 if use_modern else PLO.SHOOT)
+                       .write_gshort(player.id))
+            if use_modern:
+                builder.write_gshort(x).write_gshort(y).write_gshort(z)
+                builder.write_byte(ox + 32).write_byte(oy + 32)
+            else:
+                builder.write_gint3(0)
+                for value in (x, y):
+                    remainder = value - int(value / 1024) * 1024
+                    builder.write_gchar(int(remainder / 8))
+                builder.write_gchar(int(z / 16) + 50)
+            builder.write_gchar(angle).write_gchar(zangle).write_gchar(power)
+            if use_modern:
+                builder.write_gchar(gravity).write_gshort(len(gani))
+            else:
+                builder.write_gchar(len(gani))
+            builder.write_bytes(gani).write_gchar(len(params)).write_bytes(params)
+            packets[use_modern] = builder.write_newline().build()
+        for other in self.server.audience.players_in_world(
+                player.level.name, exclude={player.id}):
+            await other.send_raw(packets[client_version(other) >= 5.07])
 
     async def handle_hit_objects(self, player: 'Player', x: float, y: float,
                                   power: float, npc_id: Optional[int] = None):

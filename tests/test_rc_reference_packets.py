@@ -95,10 +95,12 @@ def test_file_browser_directory_packet_matches_block_reference_layout():
     assert build_rc_file_browser_dir("levels", [info]) == expected
 
 
-def test_file_browser_start_sends_folder_csv_and_welcome_only():
+def test_file_browser_start_sends_folders_welcome_and_initial_listing(tmp_path):
     server = MagicMock()
     server.account_manager.get_account.return_value = SimpleNamespace(
         folders=["rw levels/*", "r images/*"])
+    server.filesystem.base_path = tmp_path
+    server.filesystem.list_directory.return_value = []
     manager = RCManager(server)
     player = SimpleNamespace(account_name="admin", send_raw=AsyncMock())
     session = RCSession(player=player, rights=PLPERM.VIEWATTRIBUTES)
@@ -110,14 +112,18 @@ def test_file_browser_start_sends_folder_csv_and_welcome_only():
         + b'"rw levels/*","r images/*"\n',
         _gchar(PLO.RC_FILEBROWSER_MESSAGE)
         + b"Welcome to the File Browser.\n",
+        _gchar(PLO.RC_FILEBROWSER_DIR) + _gstring("images") + b"\n",
     ]
 
 
-def test_file_browser_cd_sends_entered_folder_listing():
+def test_file_browser_cd_sends_entered_folder_listing(tmp_path):
     server = MagicMock()
     server.filesystem.list_directory.return_value = [
         FileInfo("map.nw", 42, False, 1000)
     ]
+    server.filesystem.base_path = tmp_path
+    server.account_manager.get_account.return_value = SimpleNamespace(
+        folders=["rw levels/*"])
     manager = RCManager(server)
     player = SimpleNamespace(account_name="admin", send_raw=AsyncMock())
     session = RCSession(

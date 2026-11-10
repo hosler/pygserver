@@ -6,14 +6,23 @@ Based on GServer-v2 TPlayerRC.cpp implementation.
 """
 
 import asyncio
+import csv
+import dataclasses
+import io
+import locale
+import math
+import os
+import tempfile
+from pathlib import Path, PureWindowsPath
 import logging
 import time
 from typing import TYPE_CHECKING, Optional, Dict, Any, List, Set, Callable
 from dataclasses import dataclass, field
 
+from .account import RCRight, mask_rc_rights
 from .attachments import absolute_position
 
-from .protocol.constants import PLI, PLO, PLPROP, PLPERM
+from .protocol.constants import PLI, PLO, PLPROP, PLTYPE
 from .protocol.packets import (
     PacketBuilder,
     PacketReader,
@@ -32,6 +41,7 @@ from .protocol.packets import (
     build_rc_file_browser_message,
     build_player_props,
 )
+from .config import ServerConfig
 from .level import ITEM_NAME_TO_ID
 
 if TYPE_CHECKING:
@@ -39,6 +49,132 @@ if TYPE_CHECKING:
     from .player import Player
 
 logger = logging.getLogger(__name__)
+
+
+# PlayerRC.h:27-70
+ADMIN_SERVER_OPTIONS = frozenset("""
+name description url serverip serverport serverinterface localip upnp listip
+listport maxplayers onlystaff nofoldersconfig serverside sharefolder language
+protectdbnpcs triggerhack_weapons triggerhack_guilds triggerhack_groups
+triggerhack_files triggerhack_rc triggerhack_execscript triggerhack_props
+triggerhack_levels flaghack_movement flaghack_ip generation servermode
+runallscriptevents clientsidesigns clientsidelinks localhost
+""".split())
+# ServerConfig attributes that the option aliases below can reach by their Python
+# name; the reference has no equivalent key, so they count as admin-only too.
+INTERNAL_CONFIG_NAMES = frozenset("""
+port host max_players server_name staff verify_login enable_listserver
+hq_password hq_level base_dir levels_dir weapons_dir npcs_dir accounts_dir gmaps
+""".split())
+# Loader keys that the reference's AdminServerOptions list has no entry for but
+# that grant admin-level control here (login verification bypass).
+ADMIN_ONLY_LOADER_KEYS = frozenset({"noverifylogin"})
+MAX_EXTRA_OPTIONS = 256
+MAX_EXTRA_OPTION_KEY = 64
+MAX_EXTRA_OPTION_VALUE = 1024
+_CONFIG_FIELDS = frozenset(f.name for f in dataclasses.fields(ServerConfig))
+
+
+class _LoggedList(list):
+    """List that records which indices the config loader assigns."""
+
+    def __init__(self, items, log):
+        super().__init__(items)
+        self._log = log
+
+    def __setitem__(self, index, value):
+        self._log[index] = value
+        super().__setitem__(index, value)
+
+
+class _OptionProbe(ServerConfig):
+    """Scratch ServerConfig that records what ServerConfig.from_file assigns.
+
+    Running a candidate option line through the real loader gives the RC path
+    the loader's own key table, parsers and typing without a second copy.
+    """
+
+    def __init__(self):
+        super().__init__()
+        self.__dict__['_assigned'] = {}
+        self.__dict__['_aptime_assigned'] = {}
+        self.__dict__['aptime'] = _LoggedList(self.aptime, self._aptime_assigned)
+
+    def __setattr__(self, name, value):
+        assigned = self.__dict__.get('_assigned')
+        if assigned is not None:
+            assigned[name] = value
+        super().__setattr__(name, value)
+
+
+def _probe_option(key: str, value: str):
+    """Parse one option line with the config loader.
+
+    Returns (fields, aptime) for a recognised key, ({}, {}) for an unknown key,
+    and raises ValueError when the value does not convert.
+    """
+    encoding = locale.getpreferredencoding(False)
+    with tempfile.TemporaryDirectory() as scratch:
+        path = os.path.join(scratch, "serveroptions.txt")
+        try:
+            with open(path, 'w', encoding=encoding) as handle:
+                handle.write(f"{key} = {value}\n")
+        except UnicodeEncodeError as exc:
+            raise ValueError("unencodable option") from exc
+        probe = _OptionProbe.from_file(path)
+    fields = {name: val for name, val in probe._assigned.items()
+              if name in _CONFIG_FIELDS and name != 'aptime'}
+    for val in list(fields.values()) + list(probe._aptime_assigned.values()):
+        if isinstance(val, float) and not math.isfinite(val):
+            raise ValueError("non-finite number")
+    return fields, dict(probe._aptime_assigned)
+
+
+PROTECTED_DOWNLOADS = frozenset((
+    "accounts/(defaultaccount).txt", "config/adminconfig.txt",
+    "config/allowedversions.txt", "config/rchelp.txt",
+))
+IMPORTANT_FILES = {
+    "accounts/(defaultaccount).txt": RCRight.MODIFYSTAFFACCOUNT,
+    "config/adminconfig.txt": RCRight.MODIFYSTAFFACCOUNT,
+    "config/allowedversions.txt": RCRight.MODIFYSTAFFACCOUNT,
+    "config/foldersconfig.txt": RCRight.SETFOLDEROPTIONS,
+    "config/ipbans.txt": RCRight.MODIFYSTAFFACCOUNT,
+    "config/rchelp.txt": RCRight.MODIFYSTAFFACCOUNT,
+    "config/rcmessage.txt": RCRight.MODIFYSTAFFACCOUNT,
+    "config/rules.txt": RCRight.MODIFYSTAFFACCOUNT,
+    "config/servermessage.html": RCRight.SETSERVEROPTIONS,
+    "config/serveroptions.txt": RCRight.SETSERVEROPTIONS,
+}
+
+
+def _wildcard_match(pattern: str, text: str) -> bool:
+    """Case-sensitive wildcard match of one path segment: `*` any run, `?` one char.
+
+    The reference compiles each segment into a regex with only `*` rewritten
+    (FilePermissions.cpp:60,80-90), so `.` and `?` act as regex syntax there. We
+    match literally instead; no pattern is ever compiled, so none can backtrack.
+    Segments are split on `/` first, so `*` never crosses a separator.
+    """
+    p = t = 0
+    star = -1
+    mark = 0
+    while t < len(text):
+        if p < len(pattern) and pattern[p] == '*':
+            star, mark = p, t
+            p += 1
+        elif p < len(pattern) and pattern[p] in ('?', text[t]):
+            p += 1
+            t += 1
+        elif star >= 0:
+            mark += 1
+            t = mark
+            p = star + 1
+        else:
+            return False
+    while p < len(pattern) and pattern[p] == '*':
+        p += 1
+    return p == len(pattern)
 
 
 @dataclass
@@ -53,7 +189,7 @@ class RCSession:
     # RC_LARGEFILESTART and flushed on RC_LARGEFILEEND).
     large_file_uploads: Dict[str, bytearray] = field(default_factory=dict)
 
-    def has_right(self, right: PLPERM) -> bool:
+    def has_right(self, right: RCRight) -> bool:
         """Check if session has a specific right."""
         return bool(self.rights & right)
 
@@ -79,6 +215,8 @@ class RCManager:
         self._sessions: Dict[int, RCSession] = {}  # player_id -> RCSession
         self._eval_npcs: Dict[str, Any] = {}
         self._eval_times: Dict[str, float] = {}
+        # Unrecognised option lines, string-valued and never read by typed code.
+        self.extra_server_options: Dict[str, str] = {}
 
         # RC packet handlers
         self._handlers: Dict[int, Callable] = {
@@ -263,8 +401,7 @@ class RCManager:
 
     async def _handle_server_options_get(self, session: RCSession, data: bytes):
         """Handle RC_SERVEROPTIONSGET - Get server options."""
-        if not session.has_right(PLPERM.VIEWATTRIBUTES):
-            return
+        # PlayerRCPackets.cpp:44: control connection only.
 
         # Build options string
         options = self._build_server_options_string()
@@ -273,14 +410,26 @@ class RCManager:
 
     async def _handle_server_options_set(self, session: RCSession, data: bytes):
         """Handle RC_SERVEROPTIONSSET - Set server options."""
-        if not session.has_right(PLPERM.SETATTRIBUTES):
+        # PlayerRCPackets.cpp:63
+        if not await self._require_right(
+                session, RCRight.SETSERVEROPTIONS,
+                f"Server: {session.player.account_name} is not authorized to change the server options."):
             return
 
         reader = PacketReader(data)
         options_str = reader.remaining().decode('latin-1', errors='replace')
 
         # Parse and apply options
-        self._apply_server_options(options_str)
+        options = self._decode_lines(options_str)
+        # PlayerRCPackets.cpp:84; PlayerRC.h:27
+        if not session.has_right(RCRight.MODIFYSTAFFACCOUNT):
+            options = [line for line in options
+                       if line.partition('=')[0].strip().lower()
+                       not in ADMIN_SERVER_OPTIONS | INTERNAL_CONFIG_NAMES]
+        for message in self._apply_server_options(
+                '\n'.join(options),
+                allow_admin=session.has_right(RCRight.MODIFYSTAFFACCOUNT)):
+            await self._reply(session, message)
 
         # Notify other RCs
         msg = f"{session.player.account_name} updated server options"
@@ -305,17 +454,53 @@ class RCManager:
 
         return '\n'.join(lines)
 
-    def _apply_server_options(self, options_str: str):
-        """Apply server options from string."""
+    def _apply_server_options(self, options_str: str,
+                              allow_admin: bool = True) -> List[str]:
+        """Apply option lines; returns reference-style rejection messages.
+
+        Only keys the config loader understands reach the typed config, each
+        converted by that loader. Any other key is kept as a string in
+        `extra_server_options`, which no typed code path reads (the reference
+        stores unrecognised lines verbatim in serveroptions.txt,
+        PlayerRCPackets.cpp:63-130). A line that fails to convert changes nothing.
+        """
+        rejected: List[str] = []
         for line in options_str.split('\n'):
             line = line.strip()
-            if '=' in line:
-                key, value = line.split('=', 1)
-                key = key.strip().lower()
-                value = value.strip()
-                # Apply to config
-                if hasattr(self.server.config, key):
-                    setattr(self.server.config, key, value)
+            if not line or line.startswith('#') or '=' not in line:
+                continue
+            key, value = line.split('=', 1)
+            key = key.strip().lower()
+            value = value.strip()
+            shown = key[:MAX_EXTRA_OPTION_KEY]
+            if (not key or any(c.isspace() or not c.isprintable() for c in key)
+                    or '\r' in value or '\0' in value):
+                rejected.append(f"Server: Invalid server option {shown!r}.")
+                continue
+            try:
+                fields, aptime = _probe_option(key, value)
+            except ValueError:
+                rejected.append(f"Server: Invalid value for server option {shown}.")
+                continue
+            if not fields and not aptime:
+                if (len(key) > MAX_EXTRA_OPTION_KEY
+                        or len(value) > MAX_EXTRA_OPTION_VALUE
+                        or (key not in self.extra_server_options
+                            and len(self.extra_server_options) >= MAX_EXTRA_OPTIONS)):
+                    rejected.append(f"Server: Server option {shown} is too large.")
+                else:
+                    self.extra_server_options[key] = value
+                continue
+            if not allow_admin and (
+                    key in ADMIN_SERVER_OPTIONS | ADMIN_ONLY_LOADER_KEYS
+                    or INTERNAL_CONFIG_NAMES & fields.keys()):
+                continue
+            config = self.server.config
+            for name, converted in fields.items():
+                setattr(config, name, converted)
+            for index, converted in aptime.items():
+                config.aptime[index] = converted
+        return rejected
 
     # =========================================================================
     # Folder Config Handlers
@@ -323,15 +508,17 @@ class RCManager:
 
     async def _handle_folder_config_get(self, session: RCSession, data: bytes):
         """Handle RC_FOLDERCONFIGGET - Get folder configuration."""
-        if not session.has_right(PLPERM.VIEWATTRIBUTES):
-            return
+        # PlayerRCPackets.cpp:136: control connection only.
 
         config = build_rc_folder_config(self._get_folder_config())
         await session.player.send_raw(config)
 
     async def _handle_folder_config_set(self, session: RCSession, data: bytes):
         """Handle RC_FOLDERCONFIGSET - Set folder configuration."""
-        if not session.has_right(PLPERM.SETATTRIBUTES):
+        # PlayerRCPackets.cpp:153
+        if not await self._require_right(
+                session, RCRight.SETFOLDEROPTIONS,
+                f"Server: {session.player.account_name} is not authorized to change the folder config."):
             return
 
         reader = PacketReader(data)
@@ -348,91 +535,35 @@ class RCManager:
     # =========================================================================
 
     async def _handle_respawn_set(self, session: RCSession, data: bytes):
-        """Handle RC_RESPAWNSET - Set respawn time."""
-        if not session.has_right(PLPERM.SETATTRIBUTES):
-            return
-
-        reader = PacketReader(data)
-        respawn_time = reader.read_gchar()
-
-        if hasattr(self.server, 'combat_manager'):
-            self.server.combat_manager.respawn_time = respawn_time
-
-        await self._broadcast_rc_message(
-            f"{session.player.account_name} set respawn time to {respawn_time}"
-        )
+        """Ignore the deprecated packet (PlayerRCPackets.cpp:176)."""
+        return
 
     async def _handle_horse_life_set(self, session: RCSession, data: bytes):
-        """Handle RC_HORSELIFESET - Set horse lifetime."""
-        if not session.has_right(PLPERM.SETATTRIBUTES):
-            return
-
-        reader = PacketReader(data)
-        horse_life = reader.read_gchar()
-
-        if hasattr(self.server, 'horse_manager'):
-            self.server.horse_manager.default_respawn_time = horse_life
-
-        await self._broadcast_rc_message(
-            f"{session.player.account_name} set horse life to {horse_life}"
-        )
+        """Ignore the deprecated packet (PlayerRCPackets.cpp:182)."""
+        return
 
     async def _handle_ap_increment_set(self, session: RCSession, data: bytes):
-        """Handle RC_APINCREMENTSET - Set AP (alignment) increment.
-
-        GServer-v2 (PlayerRCPackets.cpp msgPLI_RC_APINCREMENTSET) marks this
-        "Deprecated" and returns without even reading pPacket - same as its
-        RESPAWNSET/HORSELIFESET/BADDYRESPAWNSET siblings, which pygserver
-        otherwise reimplements as real local settings (combat_manager /
-        horse_manager / baddy_manager respawn times). Unlike those, there's
-        no local alignment-increment-per-kill system anywhere in pygserver
-        for this to configure (account.ap is a static persisted stat, never
-        auto-adjusted), so there's nothing sensible to wire it into. Parse
-        and log for observability, but this stays a genuine no-op.
-        """
-        if not session.has_right(PLPERM.SETATTRIBUTES):
-            return
-
-        reader = PacketReader(data)
-        ap_increment = reader.read_gchar()
-        logger.debug(f"AP increment set to {ap_increment} (no local effect - see docstring)")
+        """Ignore the deprecated packet (PlayerRCPackets.cpp:188)."""
+        return
 
     async def _handle_baddy_respawn_set(self, session: RCSession, data: bytes):
-        """Handle RC_BADDYRESPAWNSET - Set baddy respawn time."""
-        if not session.has_right(PLPERM.SETATTRIBUTES):
-            return
-
-        reader = PacketReader(data)
-        respawn_time = reader.read_gchar()
-
-        if hasattr(self.server, 'baddy_manager'):
-            self.server.baddy_manager.default_respawn_time = respawn_time
-
-        await self._broadcast_rc_message(
-            f"{session.player.account_name} set baddy respawn to {respawn_time}"
-        )
+        """Ignore the deprecated packet (PlayerRCPackets.cpp:194)."""
+        return
 
     # =========================================================================
     # Player Management Handlers
     # =========================================================================
 
     async def _handle_player_props_get(self, session: RCSession, data: bytes):
-        """Handle RC_PLAYERPROPSGET - Get player properties."""
-        if not session.has_right(PLPERM.VIEWATTRIBUTES):
-            return
-
-        reader = PacketReader(data)
-        player_name = reader.remaining().decode('latin-1', errors='replace')
-
-        player = self.server.get_player_by_name(player_name)
-        if player:
-            props = self._build_player_props(player)
-            packet = self._build_rc_player_props_packet(player, props)
-            await session.player.send_raw(packet)
+        """Ignore the deprecated packet (PlayerRCPackets.cpp:200)."""
+        return
 
     async def _handle_player_props_get2(self, session: RCSession, data: bytes):
         """Handle RC_PLAYERPROPSGET2 - Get player props by ID."""
-        if not session.has_right(PLPERM.VIEWATTRIBUTES):
+        # PlayerRCPackets.cpp:517
+        if not await self._require_right(
+                session, RCRight.VIEWATTRIBUTES,
+                f"Server: You are not authorized to view player props."):
             return
 
         reader = PacketReader(data)
@@ -452,11 +583,16 @@ class RCManager:
         to that handler, which read the leading length byte as part of the
         name (a leading garbage character on every lookup).
         """
-        if not session.has_right(PLPERM.VIEWATTRIBUTES):
+        # PlayerRCPackets.cpp:545
+        if not await self._require_right(
+                session, RCRight.VIEWATTRIBUTES,
+                f"Server: You are not authorized to view player props."):
             return
 
         reader = PacketReader(data)
         player_name = reader.read_gstring()
+        if not self._valid_account_path(player_name):
+            return
 
         player = self.server.get_player_by_name(player_name)
         if player:
@@ -481,16 +617,18 @@ class RCManager:
         setPropsFromRCPacket (commit 36f409da) so the client's level state
         stays in sync.
         """
-        if not session.has_right(PLPERM.SETATTRIBUTES):
-            return
-
         reader = PacketReader(data)
         player_id = reader.read_gshort()
         # Remainder is the prop stream (world/props/flags/chests/weapons) -
         # not applied; see docstring.
 
         player = self.server.get_player(player_id)
-        target_name = player.account_name if player else str(player_id)
+        if player is None:
+            return
+        target_name = player.account_name
+        # PlayerRCPackets.cpp:213
+        if not await self._can_set_attributes(session, target_name):
+            return
 
         await self._broadcast_rc_message(
             f"{session.player.account_name} modified props for {target_name}"
@@ -506,11 +644,18 @@ class RCManager:
         Same stub caveat as _handle_player_props_set applies to the prop
         stream.
         """
-        if not session.has_right(PLPERM.SETATTRIBUTES):
-            return
-
         reader = PacketReader(data)
         player_name = reader.read_gstring()
+        if not self._valid_account_path(player_name):
+            return
+        # PlayerRCPackets.cpp:632,642
+        if not await self._can_set_attributes(session, player_name):
+            return
+        if (player_name == "(defaultaccount)"
+                and not session.has_right(RCRight.MODIFYSTAFFACCOUNT)):
+            await self._reply(
+                session, "Server: You are not authorized to modify the default account.")
+            return
         # Remainder is the prop stream (world/props/flags/chests/weapons) -
         # not applied; see _handle_player_props_set docstring.
 
@@ -520,11 +665,16 @@ class RCManager:
 
     async def _handle_player_props_reset(self, session: RCSession, data: bytes):
         """Handle RC_PLAYERPROPSRESET - Reset player properties."""
-        if not session.has_right(PLPERM.SETATTRIBUTES):
+        # PlayerRCPackets.cpp:562
+        if not await self._require_right(
+                session, RCRight.RESETATTRIBUTES,
+                f"Server: You are not authorized to reset accounts."):
             return
 
         reader = PacketReader(data)
         player_name = reader.remaining().decode('latin-1', errors='replace')
+        if not self._valid_account_path(player_name):
+            return
 
         player = self.server.get_player_by_name(player_name)
         if player:
@@ -567,7 +717,10 @@ class RCManager:
 
     async def _handle_disconnect_player(self, session: RCSession, data: bytes):
         """Handle RC_DISCONNECTPLAYER - Disconnect a player."""
-        if not session.has_right(PLPERM.DISCONNECT):
+        # PlayerRCPackets.cpp:238
+        if not await self._require_right(
+                session, RCRight.DISCONNECT,
+                f"Server: {session.player.account_name} is not authorized to disconnect players."):
             return
 
         reader = PacketReader(data)
@@ -583,7 +736,10 @@ class RCManager:
 
     async def _handle_warp_player(self, session: RCSession, data: bytes):
         """Handle RC_WARPPLAYER - Warp a player."""
-        if not session.has_right(PLPERM.WARPTOPLAYER):
+        # PlayerRCPackets.cpp:783
+        if not await self._require_right(
+                session, RCRight.WARPTOPLAYER,
+                f"Server: You are not authorized to warp players.\n"):
             return
 
         reader = PacketReader(data)
@@ -607,41 +763,70 @@ class RCManager:
 
     async def _handle_player_rights_get(self, session: RCSession, data: bytes):
         """Handle RC_PLAYERRIGHTSGET - Get player rights."""
-        if not session.has_right(PLPERM.VIEWATTRIBUTES):
-            return
-
         reader = PacketReader(data)
         player_name = reader.remaining().decode('latin-1', errors='replace')
+        if not self._valid_account_path(player_name):
+            return
+        # PlayerRCPackets.cpp:807
+        if (player_name != session.player.account_name
+                and not await self._require_right(
+                    session, RCRight.SETRIGHTS,
+                    "Server: You are not authorized to view that player's rights.")):
+            return
 
         # Get rights from account
         rights = 0
+        admin_ip = ""
+        folders = ""
         if hasattr(self.server, 'account_manager'):
             account = self.server.account_manager.get_account(player_name)
             if account:
                 rights = account.admin_rights
+                admin_ip = account.admin_ip
+                folders = self._encode_lines(account.folders)
 
-        packet = build_rc_player_rights(player_name, rights)
+        packet = build_rc_player_rights(player_name, rights, admin_ip, folders)
         await session.player.send_raw(packet)
 
     async def _handle_player_rights_set(self, session: RCSession, data: bytes):
         """Handle RC_PLAYERRIGHTSSET - Set player rights."""
-        if not session.has_right(PLPERM.SETRIGHTS):
+        # PlayerRCPackets.cpp:842
+        if not await self._require_right(
+                session, RCRight.SETRIGHTS,
+                f"Server: You are not authorized to set player rights."):
             return
 
         reader = PacketReader(data)
         player_name = reader.read_gstring()
+        if not self._valid_account_path(player_name):
+            return
         rights = reader.read_gint5()
-        # admin_ip/folders are parsed to consume the packet correctly but
-        # not applied yet - only adminRights is wired up below, matching
-        # this handler's prior scope.
         admin_ip = reader.read_gstring()
         folders = reader.read_gstring_short()
 
         if hasattr(self.server, 'account_manager'):
             account = self.server.account_manager.get_account(player_name)
             if account:
-                account.admin_rights = rights
+                account.admin_rights = mask_rc_rights(
+                    session.rights, rights,
+                    player_name.lower() == session.player.account_name.lower())
+                # PlayerRCPackets.cpp:885-900: IPs are unrestricted; folders are filtered.
+                account.admin_ip = admin_ip
+                account.folders = [
+                    entry for entry in self._decode_lines(folders)
+                    if ':' not in entry and '..' not in entry and ' /*' not in entry
+                ]
                 self.server.account_manager.save_account(account)
+                for active in list(self._sessions.values()):
+                    if active.player.account_name.lower() == player_name.lower():
+                        active.rights = account.admin_rights
+                        active.large_file_uploads.clear()
+                        if active.file_browser_active:
+                            active.file_browser_active = False
+                            await self._handle_file_browser_start(active, b"")
+                # PlayerRCPackets.cpp:913-918: losing NPC control drops the NC session.
+                if not account.admin_rights & RCRight.NPCCONTROL:
+                    await self._drop_nc_sessions(player_name)
 
         await self._broadcast_rc_message(
             f"{session.player.account_name} set rights for {player_name}"
@@ -653,11 +838,12 @@ class RCManager:
 
     async def _handle_player_comments_get(self, session: RCSession, data: bytes):
         """Handle RC_PLAYERCOMMENTSGET - Get player comments."""
-        if not session.has_right(PLPERM.VIEWATTRIBUTES):
-            return
+        # PlayerRCPackets.cpp:943: control connection only.
 
         reader = PacketReader(data)
         player_name = reader.remaining().decode('latin-1', errors='replace')
+        if not self._valid_account_path(player_name):
+            return
 
         comments = ""
         if hasattr(self.server, 'account_manager'):
@@ -670,11 +856,16 @@ class RCManager:
 
     async def _handle_player_comments_set(self, session: RCSession, data: bytes):
         """Handle RC_PLAYERCOMMENTSSET - Set player comments."""
-        if not session.has_right(PLPERM.SETATTRIBUTES):
+        # PlayerRCPackets.cpp:972
+        if not await self._require_right(
+                session, RCRight.SETCOMMENTS,
+                f"Server: You are not authorized to set player comments."):
             return
 
         reader = PacketReader(data)
         player_name = reader.read_gstring()
+        if not self._valid_account_path(player_name):
+            return
         comments = reader.remaining().decode('latin-1', errors='replace')
 
         if hasattr(self.server, 'account_manager'):
@@ -685,11 +876,12 @@ class RCManager:
 
     async def _handle_player_ban_get(self, session: RCSession, data: bytes):
         """Handle RC_PLAYERBANGET - Get player ban info."""
-        if not session.has_right(PLPERM.BAN):
-            return
+        # PlayerRCPackets.cpp:1011: control connection only.
 
         reader = PacketReader(data)
         player_name = reader.remaining().decode('latin-1', errors='replace')
+        if not self._valid_account_path(player_name):
+            return
 
         is_banned = False
         ban_reason = ""
@@ -704,11 +896,16 @@ class RCManager:
 
     async def _handle_player_ban_set(self, session: RCSession, data: bytes):
         """Handle RC_PLAYERBANSET - Set player ban."""
-        if not session.has_right(PLPERM.BAN):
+        # PlayerRCPackets.cpp:1040
+        if not await self._require_right(
+                session, RCRight.BAN,
+                f"Server: You are not authorized to set player bans."):
             return
 
         reader = PacketReader(data)
         player_name = reader.read_gstring()
+        if not self._valid_account_path(player_name):
+            return
         is_banned = reader.read_gchar() != 0
         ban_reason = reader.remaining().decode('latin-1', errors='replace')
 
@@ -725,10 +922,8 @@ class RCManager:
         )
 
     async def _handle_apply_reason(self, session: RCSession, data: bytes):
-        """Handle RC_APPLYREASON - Apply ban/mute reason."""
-        reader = PacketReader(data)
-        reason = reader.remaining().decode('latin-1', errors='replace')
-        logger.info(f"RC apply reason from {session.player.account_name}: {reason}")
+        """Ignore the deprecated packet (PlayerRCPackets.cpp:324)."""
+        return
 
     # =========================================================================
     # Server Flags Handlers
@@ -736,8 +931,7 @@ class RCManager:
 
     async def _handle_server_flags_get(self, session: RCSession, data: bytes):
         """Handle RC_SERVERFLAGSGET - Get server flags."""
-        if not session.has_right(PLPERM.VIEWATTRIBUTES):
-            return
+        # PlayerRCPackets.cpp:332: control connection only.
 
         flags = {}
         if hasattr(self.server, 'server_flags'):
@@ -748,7 +942,10 @@ class RCManager:
 
     async def _handle_server_flags_set(self, session: RCSession, data: bytes):
         """Handle RC_SERVERFLAGSSET - Set server flags."""
-        if not session.has_right(PLPERM.SETATTRIBUTES):
+        # PlayerRCPackets.cpp:356
+        if not await self._require_right(
+                session, RCRight.SETSERVERFLAGS,
+                f"Server: You are not authorized to set the server flags."):
             return
 
         # Wire format (msgPLI_RC_SERVERFLAGSSET): [GUSHORT count] then
@@ -774,7 +971,10 @@ class RCManager:
 
     async def _handle_account_add(self, session: RCSession, data: bytes):
         """Handle RC_ACCOUNTADD - Add account."""
-        if not session.has_right(PLPERM.SETATTRIBUTES):
+        # PlayerRCPackets.cpp:405
+        if not await self._require_right(
+                session, RCRight.MODIFYSTAFFACCOUNT,
+                f"Server: You are not authorized to create new accounts."):
             return
 
         # Wire format (msgPLI_RC_ACCOUNTADD): [GUCHAR-len account][GUCHAR-len
@@ -782,14 +982,20 @@ class RCManager:
         # [GUCHAR adminlevel, deprecated].
         reader = PacketReader(data)
         account_name = reader.read_gstring()
+        if not self._valid_account_path(account_name):
+            return
         password = reader.read_gstring()
         email = reader.read_gstring()
         banned = reader.read_gchar() != 0
         only_load = reader.read_gchar() != 0
         reader.read_gchar()  # admin level, deprecated
 
+        world = reader.read_gstring()
+        ban_reason = reader.read_gstring()
         if hasattr(self.server, 'account_manager'):
-            self.server.account_manager.create_account(account_name, password)
+            account = self.server.account_manager.create_account(account_name, password)
+            self._set_account_metadata(session, account, email, only_load,
+                                       banned, ban_reason)
 
         await self._broadcast_rc_message(
             f"{session.player.account_name} created account {account_name}"
@@ -797,12 +1003,22 @@ class RCManager:
 
     async def _handle_account_del(self, session: RCSession, data: bytes):
         """Handle RC_ACCOUNTDEL - Delete account."""
-        if not session.has_right(PLPERM.SETATTRIBUTES):
+        # PlayerRCPackets.cpp:439
+        if not await self._require_right(
+                session, RCRight.MODIFYSTAFFACCOUNT,
+                f"Server: You are not authorized to delete accounts."):
             return
 
         reader = PacketReader(data)
         account_name = reader.remaining().decode('latin-1', errors='replace')
+        if not self._valid_account_path(account_name):
+            return
 
+        # PlayerRCPackets.cpp:450
+        if account_name == "(defaultaccount)":
+            await self._reply(
+                session, "Server: You are not allowed to delete the default account.")
+            return
         if hasattr(self.server, 'account_manager'):
             self.server.account_manager.delete_account(account_name)
 
@@ -812,8 +1028,7 @@ class RCManager:
 
     async def _handle_account_list_get(self, session: RCSession, data: bytes):
         """Handle RC_ACCOUNTLISTGET - Get account list."""
-        if not session.has_right(PLPERM.VIEWATTRIBUTES):
-            return
+        # PlayerRCPackets.cpp:477: control connection only.
 
         accounts = []
         if hasattr(self.server, 'account_manager'):
@@ -824,11 +1039,12 @@ class RCManager:
 
     async def _handle_account_get(self, session: RCSession, data: bytes):
         """Handle RC_ACCOUNTGET - Get account details."""
-        if not session.has_right(PLPERM.VIEWATTRIBUTES):
-            return
+        # PlayerRCPackets.cpp:662: control connection only.
 
         reader = PacketReader(data)
         account_name = reader.remaining().decode('latin-1', errors='replace')
+        if not self._valid_account_path(account_name):
+            return
 
         email = ""
         is_banned = False
@@ -850,16 +1066,20 @@ class RCManager:
 
     async def _handle_account_set(self, session: RCSession, data: bytes):
         """Handle RC_ACCOUNTSET - Set account details."""
-        if not session.has_right(PLPERM.SETATTRIBUTES):
+        # PlayerRCPackets.cpp:702
+        if not await self._require_right(
+                session, RCRight.MODIFYSTAFFACCOUNT,
+                f"Server: You are not authorized to edit accounts."):
             return
 
         # Wire format (msgPLI_RC_ACCOUNTSET): [GUCHAR-len account][GUCHAR-len
         # password][GUCHAR-len email][GUCHAR banned][GUCHAR loadOnly]
         # [GUCHAR adminlevel, deprecated][GUCHAR-len world][GUCHAR-len
-        # banreason]. Applying these fields is not implemented (stub); only
-        # parsed here so the packet doesn't desync/crash.
+        # banreason].
         reader = PacketReader(data)
         account_name = reader.read_gstring()
+        if not self._valid_account_path(account_name):
+            return
         password = reader.read_gstring()
         email = reader.read_gstring()
         banned = reader.read_gchar() != 0
@@ -868,6 +1088,11 @@ class RCManager:
         world = reader.read_gstring()
         ban_reason = reader.read_gstring()
 
+        if hasattr(self.server, 'account_manager'):
+            account = self.server.account_manager.get_account(account_name)
+            if account:
+                self._set_account_metadata(session, account, email, load_only,
+                                           banned, ban_reason)
         logger.info(f"Account {account_name} modified by {session.player.account_name}")
 
     # =========================================================================
@@ -876,6 +1101,9 @@ class RCManager:
 
     async def _handle_rc_chat(self, session: RCSession, data: bytes):
         """Handle RC_CHAT - RC chat message."""
+        # PlayerRCPackets.cpp:767
+        if getattr(session.player, 'connection_type', None) == PLTYPE.NC:
+            return
         reader = PacketReader(data)
         message = reader.remaining().decode('latin-1', errors='replace')
 
@@ -919,7 +1147,7 @@ class RCManager:
             if command.lower() in ('/savelevel', '/reloadlevel', '/updatelevel'):
                 if session is None:
                     return
-                if not session.has_right(PLPERM.UPDATELEVEL):
+                if not session.has_right(RCRight.UPDATELEVEL):
                     await session.player.send_raw(build_rc_chat(
                         f"{command}: permission denied (UPDATELEVEL required)"
                     ))
@@ -972,7 +1200,7 @@ class RCManager:
     async def _process_level_object(self, command: str, arguments: List[str],
                                     session: RCSession):
         """Apply one live level-object editor command and resend the level."""
-        if not session.has_right(PLPERM.UPDATELEVEL):
+        if not session.has_right(RCRight.UPDATELEVEL):
             await self._reply(
                 session, f"{command}: permission denied (UPDATELEVEL required)")
             return
@@ -1059,7 +1287,7 @@ class RCManager:
 
     async def _process_eval(self, arguments: List[str], session: RCSession):
         """Compile and immediately run bounded GS1 source on a scratch NPC."""
-        if not session.has_right(PLPERM.UPDATELEVEL):
+        if not session.has_right(RCRight.UPDATELEVEL):
             await self._reply(
                 session, "/eval: permission denied (UPDATELEVEL required)")
             return
@@ -1113,7 +1341,10 @@ class RCManager:
 
     async def _handle_admin_message(self, session: RCSession, data: bytes):
         """Handle RC_ADMINMESSAGE - Admin message to all players."""
-        if not session.has_right(PLPERM.ADMINMSG):
+        # PlayerRCPackets.cpp:285
+        if not await self._require_right(
+                session, RCRight.ADMINMSG,
+                f"Server: You are not authorized to send an admin message."):
             return
 
         reader = PacketReader(data)
@@ -1130,7 +1361,10 @@ class RCManager:
 
     async def _handle_priv_admin_message(self, session: RCSession, data: bytes):
         """Handle RC_PRIVADMINMESSAGE - Private admin message."""
-        if not session.has_right(PLPERM.ADMINMSG):
+        # PlayerRCPackets.cpp:298
+        if not await self._require_right(
+                session, RCRight.ADMINMSG,
+                f"Server: You are not authorized to send an admin message."):
             return
 
         reader = PacketReader(data)
@@ -1144,30 +1378,12 @@ class RCManager:
             await player.send_raw(packet)
 
     async def _handle_list_rcs(self, session: RCSession, data: bytes):
-        """Handle RC_LISTRCS - List RC users."""
-        rc_list = []
-        for rc_session in self._sessions.values():
-            rc_list.append(rc_session.player.account_name)
-
-        # Send list
-        packet = build_rc_chat("RC Users: " + ", ".join(rc_list))
-        await session.player.send_raw(packet)
+        """Ignore the deprecated packet (PlayerRCPackets.cpp:312)."""
+        return
 
     async def _handle_disconnect_rc(self, session: RCSession, data: bytes):
-        """Handle RC_DISCONNECTRC - Disconnect an RC user."""
-        if not session.has_right(PLPERM.DISCONNECT):
-            return
-
-        reader = PacketReader(data)
-        rc_name = reader.remaining().decode('latin-1', errors='replace')
-
-        for rc_session in self._sessions.values():
-            if rc_session.player.account_name == rc_name:
-                await rc_session.player.disconnect()
-                await self._broadcast_rc_message(
-                    f"{session.player.account_name} disconnected RC {rc_name}"
-                )
-                break
+        """Ignore the deprecated packet (PlayerRCPackets.cpp:318)."""
+        return
 
     # =========================================================================
     # Level Management Handlers
@@ -1175,7 +1391,10 @@ class RCManager:
 
     async def _handle_update_levels(self, session: RCSession, data: bytes):
         """Handle RC_UPDATELEVELS - Reload levels."""
-        if not session.has_right(PLPERM.UPDATELEVEL):
+        # PlayerRCPackets.cpp:266
+        if not await self._require_right(
+                session, RCRight.UPDATELEVEL,
+                f"Server: {session.player.account_name} is not authorized to update levels."):
             return
 
         # Reload levels
@@ -1191,39 +1410,36 @@ class RCManager:
 
     async def _handle_file_browser_start(self, session: RCSession, data: bytes):
         """Handle RC_FILEBROWSER_START - Start file browser."""
-        if not session.has_right(PLPERM.VIEWATTRIBUTES):
-            return
-
-        session.file_browser_active = True
-        session.file_browser_path = ""
-
+        # PlayerRCPackets.cpp:1091,1103-1125
         folders = self._get_file_browser_folders(session)
+        folder_map = self._folder_map(session)
+        if not folders or not folder_map:
+            session.file_browser_active = False
+            session.file_browser_path = ""
+            session.large_file_uploads.clear()
+            return
+        current = session.file_browser_path.rstrip('/')
+        session.file_browser_path = (current if current in folder_map
+                                     else sorted(folder_map)[0])
+        session.file_browser_active = True
         await session.player.send_raw(build_rc_file_browser_dir_list(folders))
         await session.player.send_raw(
             build_rc_file_browser_message("Welcome to the File Browser."))
+        await self._send_directory_listing(session)
 
     async def _handle_file_browser_cd(self, session: RCSession, data: bytes):
-        """Handle RC_FILEBROWSER_CD - Change directory."""
-        if not session.file_browser_active:
+        """Handle RC_FILEBROWSER_CD - Select an authorized folder."""
+        directory = data.decode('latin-1', errors='replace')
+        if not self._valid_browser_path(directory):
             return
-
-        reader = PacketReader(data)
-        directory = reader.remaining().decode('latin-1', errors='replace')
-
-        # Update path
-        if directory == "..":
-            # Go up
-            if '/' in session.file_browser_path:
-                session.file_browser_path = session.file_browser_path.rsplit('/', 1)[0]
-            else:
-                session.file_browser_path = ""
-        else:
-            # Go into directory
-            if session.file_browser_path:
-                session.file_browser_path += "/" + directory
-            else:
-                session.file_browser_path = directory
-
+        # PlayerRCPackets.cpp:1197
+        directory = directory.rstrip('/')
+        if directory not in self._folder_map(session):
+            return
+        session.file_browser_path = directory
+        session.file_browser_active = True
+        await self._send_file_browser_message(
+            session, f"Folder changed to {directory}/")
         await self._send_directory_listing(session)
 
     async def _handle_file_browser_end(self, session: RCSession, data: bytes):
@@ -1251,15 +1467,30 @@ class RCManager:
             return
 
         path = self._browser_path(session, filename)
-        await self.server.filesystem.send_file(session.player, path)
+        error = self._file_access_error(session, path, 'r')
+        if error:
+            await self._send_file_browser_message(session, error)
+            return
+        # PlayerRCPackets.cpp:1267
+        if (self._protected_path(path) in PROTECTED_DOWNLOADS
+                and not session.has_right(RCRight.MODIFYSTAFFACCOUNT)):
+            await self._send_file_browser_message(
+                session, f"Insufficient rights to download/view {path}")
+            return
+        resolved = self._resolve_browser_path(path)
+        filesystem = self.server.filesystem
+        # Send this exact resolved file; the general lookup searches other folders.
+        if resolved.is_file():
+            if resolved.stat().st_size > filesystem.large_file_threshold:
+                await filesystem._send_large_file(session.player, filename, resolved)
+            else:
+                await filesystem._send_file(session.player, filename, resolved)
+        else:
+            from .protocol.packets import build_file_send_failed
+            await session.player.send_raw(build_file_send_failed(filename))
 
     async def _handle_file_browser_up(self, session: RCSession, data: bytes):
         """Handle RC_FILEBROWSER_UP - Upload file."""
-        if not session.has_right(PLPERM.SETATTRIBUTES):
-            await self._send_file_browser_message(
-                session, "Insufficient rights to upload files.")
-            return
-
         reader = PacketReader(data)
         filename = reader.read_gstring()
         file_data = reader.remaining()
@@ -1296,11 +1527,6 @@ class RCManager:
 
     async def _handle_file_browser_move(self, session: RCSession, data: bytes):
         """Handle RC_FILEBROWSER_MOVE - Move file."""
-        if not session.has_right(PLPERM.SETATTRIBUTES):
-            await self._send_file_browser_message(
-                session, "Insufficient rights to move files.")
-            return
-
         # Wire format (msgPLI_RC_FILEBROWSER_MOVE): [GUCHAR-len destination
         # dir][filename to end] - the filename is moved from the RC's
         # current folder into the given destination dir.
@@ -1318,7 +1544,17 @@ class RCManager:
                 session, "File browser storage is unavailable.")
             return
         src = self._browser_path(session, filename)
-        dst = dest_dir + "/" + filename if dest_dir else filename
+        dst = dest_dir.rstrip('/') + "/" + filename if dest_dir else filename
+        # PlayerRCPackets.cpp:1367: source veto, even for staff administrators.
+        # The reference only vetoes the source; an important file as the
+        # destination would be overwritten by the rename, so it is vetoed too.
+        if (self._protected_path(src) in IMPORTANT_FILES
+                or self._protected_path(dst) in IMPORTANT_FILES):
+            await self._send_file_browser_message(
+                session, f"Not allowed to move file {src}")
+            return
+        if not await self._check_file_paths(session, src, dst):
+            return
         if self.server.filesystem.move_file(src, dst):
             message = f"Moved file {src} to {dst}."
         else:
@@ -1328,11 +1564,6 @@ class RCManager:
 
     async def _handle_file_browser_delete(self, session: RCSession, data: bytes):
         """Handle RC_FILEBROWSER_DELETE - Delete file."""
-        if not session.has_right(PLPERM.SETATTRIBUTES):
-            await self._send_file_browser_message(
-                session, "Insufficient rights to delete files.")
-            return
-
         reader = PacketReader(data)
         filename = reader.remaining().decode('latin-1', errors='replace')
 
@@ -1345,6 +1576,13 @@ class RCManager:
                 session, "File browser storage is unavailable.")
             return
         path = self._browser_path(session, filename)
+        # PlayerRCPackets.cpp:1404
+        if self._protected_path(path) in IMPORTANT_FILES:
+            await self._send_file_browser_message(
+                session, f"Not allowed to delete file {path}")
+            return
+        if not await self._check_file_paths(session, path):
+            return
         deleted = self.server.filesystem.delete_file(path)
         message = (f"Deleted file {filename}." if deleted
                    else f"Could not delete file {filename}.")
@@ -1353,11 +1591,6 @@ class RCManager:
 
     async def _handle_file_browser_rename(self, session: RCSession, data: bytes):
         """Handle RC_FILEBROWSER_RENAME - Rename file."""
-        if not session.has_right(PLPERM.SETATTRIBUTES):
-            await self._send_file_browser_message(
-                session, "Insufficient rights to rename files.")
-            return
-
         # Wire format (msgPLI_RC_FILEBROWSER_RENAME): [GUCHAR-len old
         # name][GUCHAR-len new name] - new_name is also length-prefixed,
         # not the rest of the packet.
@@ -1376,6 +1609,14 @@ class RCManager:
             return
         old_path = self._browser_path(session, old_name)
         new_path = self._browser_path(session, new_name)
+        # PlayerRCPackets.cpp:1472
+        if (self._protected_path(old_path) in IMPORTANT_FILES
+                or self._protected_path(new_path) in IMPORTANT_FILES):
+            await self._send_file_browser_message(
+                session, f"Not allowed to rename/overwrite file {old_path} or {new_path}")
+            return
+        if not await self._check_file_paths(session, old_path, new_path):
+            return
         renamed = self.server.filesystem.move_file(old_path, new_path)
         message = (f"Renamed file {old_name} to {new_name}." if renamed
                    else f"Could not rename file {old_name} to {new_name}.")
@@ -1384,15 +1625,10 @@ class RCManager:
 
     async def _handle_folder_delete(self, session: RCSession, data: bytes):
         """Handle RC_FOLDERDELETE - Delete folder."""
-        if not session.has_right(PLPERM.SETATTRIBUTES):
-            await self._send_file_browser_message(
-                session, "Insufficient rights to delete folders.")
-            return
-
         reader = PacketReader(data)
         folder = reader.remaining().decode('latin-1', errors='replace')
 
-        if not self._valid_browser_name(folder):
+        if not self._valid_browser_path(folder) or not folder:
             await self._send_file_browser_message(
                 session, f"Invalid folder name: {folder}")
             return
@@ -1400,8 +1636,18 @@ class RCManager:
             await self._send_file_browser_message(
                 session, "File browser storage is unavailable.")
             return
-        path = self._browser_path(session, folder)
-        deleted = self.server.filesystem.delete_folder(path)
+        path = folder.rstrip('/')
+        if not await self._check_file_paths(session, path + '/'):
+            return
+        # PlayerRCPackets.cpp:1577: only an empty directory can be removed.
+        resolved = self._resolve_browser_path(path)
+        deleted = False
+        if resolved != self._resolve_browser_path(""):
+            try:
+                resolved.rmdir()
+                deleted = True
+            except OSError:
+                pass
         message = (f"Folder {folder} has been removed." if deleted
                    else f"Could not remove folder {folder}.")
         await self._send_file_browser_message(session, message)
@@ -1423,13 +1669,15 @@ class RCManager:
         """Return whether a browser-relative path cannot traverse upward."""
         normalized = path.replace('\\', '/')
         return (not normalized.startswith('/') and '\x00' not in normalized
+                and not PureWindowsPath(normalized).drive
+                and ':' not in normalized
                 and '..' not in normalized.split('/'))
 
     @staticmethod
     def _browser_path(session: RCSession, name: str) -> str:
         """Join a direct child name to the browser's current folder."""
         if session.file_browser_path:
-            return session.file_browser_path.strip('/') + "/" + name
+            return session.file_browser_path.rstrip('/') + "/" + name
         return name
 
     def _upload_error(
@@ -1437,10 +1685,18 @@ class RCManager:
         """Return a user-visible upload rejection, or None when allowed."""
         if not session.file_browser_active:
             return "Upload refused: file browser is not active."
-        if 'w' not in self._get_file_browser_rights(session).lower():
-            return "Upload refused: current folder is read-only."
         if not self._valid_browser_name(filename):
             return f"Upload refused: invalid filename {filename}."
+        path = self._browser_path(session, filename)
+        error = self._file_access_error(session, path, 'w')
+        if error:
+            return error
+        # PlayerRCPackets.cpp:1317-1328
+        required = IMPORTANT_FILES.get(self._protected_path(path))
+        if (required is not None
+                and not session.has_right(RCRight.MODIFYSTAFFACCOUNT)
+                and not session.has_right(required)):
+            return f"Insufficent rights to upload {path}"
         if size > self.max_upload_size:
             return (f"Upload refused: {filename} exceeds the maximum upload "
                     f"size of {self.max_upload_size} bytes.")
@@ -1449,39 +1705,116 @@ class RCManager:
         return None
 
     async def _send_directory_listing(self, session: RCSession):
-        """Send directory listing to RC session."""
+        """Send only matching files inside the selected authorized folder."""
+        path = session.file_browser_path
+        if (path.rstrip('/') not in self._folder_map(session)
+                or self._resolve_browser_path(path) is None):
+            return
         files = []
-
-        if hasattr(self.server, 'filesystem'):
-            files = self.server.filesystem.list_directory(session.file_browser_path)
-
-        rights = self._get_file_browser_rights(session)
-        packet = build_rc_file_browser_dir(
-            session.file_browser_path, files, rights=rights)
+        rights = {}
+        # PlayerRCPackets.cpp:1136-1154: match each filename's wildcard.
+        for info in self.server.filesystem.list_directory(path):
+            candidate = self._browser_path(session, info.name)
+            entry_rights = self._file_rights(session, candidate)
+            if (not info.is_directory and entry_rights
+                    and self._resolve_browser_path(candidate) is not None):
+                files.append(info)
+                rights[info.name] = entry_rights
+        packet = build_rc_file_browser_dir(path, files, rights=rights)
         await session.player.send_raw(packet)
 
     def _get_file_browser_folders(self, session: RCSession) -> List[str]:
-        """Return the folder-rights entries available to an RC account."""
+        """Return stored folder rights; an empty list grants no access."""
         account = None
         if hasattr(self.server, 'account_manager'):
             account = self.server.account_manager.get_account(
                 session.player.account_name)
-        folders = (getattr(account, 'folders', None)
-                   or getattr(account, 'folder_list', None))
-        resolved = list(folders) if folders else []
-        return resolved or ["rw *"]
+        folders = getattr(account, 'folders', None)
+        if folders is None:
+            folders = getattr(account, 'folder_list', None)
+        return list(folders) if isinstance(folders, (list, tuple)) else []
 
-    def _get_file_browser_rights(self, session: RCSession) -> str:
-        """Find the rights attached to the current folder's wildcard entry."""
-        path = session.file_browser_path.strip('/')
-        for folder_entry in self._get_file_browser_folders(session):
-            rights, separator, pattern = folder_entry.partition(' ')
+    def _folder_map(self, session: RCSession) -> Dict[str, list]:
+        result = {}
+        for entry in self._get_file_browser_folders(session):
+            rights, separator, pattern = entry.partition(' ')
+            pattern = pattern.strip().replace('\\', '/')
+            if not separator or not pattern or rights.startswith('-'):
+                continue
+            if pattern.endswith('/'):
+                folder, wildcard = pattern.rstrip('/'), '*'
+            else:
+                folder, _, wildcard = pattern.rpartition('/')
+            if folder == '.':
+                folder = ''
+            if self._resolve_browser_path(folder) is not None:
+                result.setdefault(folder, []).append((rights.lower(), wildcard))
+        return result
+
+    def _file_rights(self, session: RCSession, path: str) -> str:
+        # FilePermissions.cpp:19-33,80-94: deny first, match equal segment counts.
+        allowed = set()
+        denied = set()
+        for entry in self._get_file_browser_folders(session):
+            flags, separator, pattern = entry.partition(' ')
+            pattern = pattern.strip().replace('\\', '/')
             if not separator:
                 continue
-            base = pattern.rstrip('*').rstrip('/')
-            if not base or path == base or path.startswith(base + '/'):
-                return rights
-        return "r"
+            if pattern.startswith('./'):
+                pattern = pattern[2:]
+            if pattern.endswith('/'):
+                pattern += '*'
+            segments = path.split('/')
+            patterns = pattern.split('/')
+            if len(segments) != len(patterns):
+                continue
+            if all(_wildcard_match(p, segment)
+                   for p, segment in zip(patterns, segments)):
+                (denied if flags.startswith('-') else allowed).update(flags.lower())
+        return ''.join(flag for flag in 'rw' if flag in allowed and flag not in denied)
+
+    def _resolve_browser_path(self, path: str) -> Optional[Path]:
+        if not self._valid_browser_path(path):
+            return None
+        base = getattr(getattr(self.server, 'filesystem', None), 'base_path', None)
+        if not isinstance(base, (str, os.PathLike)):
+            return None
+        try:
+            base = Path(base).resolve()
+            resolved = (base / path.replace('\\', '/')).resolve()
+            resolved.relative_to(base)
+            return resolved
+        except (ValueError, OSError, RuntimeError):
+            return None
+
+    def _protected_path(self, path: str) -> str:
+        resolved = self._resolve_browser_path(path)
+        base = self._resolve_browser_path('')
+        if resolved is None or base is None:
+            return path
+        relative = resolved.relative_to(base).as_posix()
+        if relative == 'accounts/(defaultaccount).json':
+            return 'accounts/(defaultaccount).txt'
+        return relative
+
+    def _file_access_error(self, session: RCSession, path: str,
+                           flag: str) -> Optional[str]:
+        if self._resolve_browser_path(path) is None:
+            return "Invalid file path."
+        if not session.file_browser_active:
+            return "File browser is not active."
+        if flag not in self._file_rights(session, path):
+            return ("Upload refused: current folder is read-only." if flag == 'w'
+                    else "Insufficient folder rights to read file.")
+        return None
+
+    async def _check_file_paths(self, session: RCSession, *paths: str) -> bool:
+        for path in paths:
+            error = self._file_access_error(session, path, 'w')
+            if error:
+                await self._send_file_browser_message(session, error)
+                return False
+        return True
 
     # =========================================================================
     # Large File Transfer Handlers
@@ -1495,11 +1828,6 @@ class RCManager:
         an empty CString buffer by filename; bytes stream in afterward via
         RC_FILEBROWSER_UP chunks and get flushed on RC_LARGEFILEEND).
         """
-        if not session.has_right(PLPERM.SETATTRIBUTES):
-            await self._send_file_browser_message(
-                session, "Insufficient rights to upload files.")
-            return
-
         reader = PacketReader(data)
         filename = reader.remaining().decode('latin-1', errors='replace')
 
@@ -1519,11 +1847,6 @@ class RCManager:
         RC_LARGEFILESTART. Previously this never read it, so the buffered
         upload could never be matched up and finalized.
         """
-        if not session.has_right(PLPERM.SETATTRIBUTES):
-            await self._send_file_browser_message(
-                session, "Insufficient rights to upload files.")
-            return
-
         reader = PacketReader(data)
         filename = reader.remaining().decode('latin-1', errors='replace')
 
@@ -1553,6 +1876,73 @@ class RCManager:
     # =========================================================================
     # Utility Methods
     # =========================================================================
+
+    async def _require_right(self, session: RCSession, right: RCRight,
+                             message: str) -> bool:
+        if session.has_right(right):
+            return True
+        if right == RCRight.SETSERVEROPTIONS:
+            logger.info("%s attempted to set the server options.", session.player.account_name)
+        elif right == RCRight.SETFOLDEROPTIONS:
+            logger.info("%s attempted to set the folder config.", session.player.account_name)
+        await self._reply(session, message)
+        return False
+
+    async def _can_set_attributes(self, session: RCSession, name: str) -> bool:
+        right = (RCRight.SETSELFATTRIBUTES if name == session.player.account_name
+                 else RCRight.SETATTRIBUTES)
+        if not session.has_right(right):
+            logger.info("%s attempted to set a player's properties.",
+                        session.player.account_name)
+        return await self._require_right(
+            session, right,
+            f"Server: {session.player.account_name} is not authorized to set the properties of {name}")
+
+    def _set_account_metadata(self, session: RCSession, account: Any,
+                              email: str, load_only: bool, banned: bool,
+                              reason: str):
+        account.profile_email = email
+        account.load_only = load_only
+        # PlayerRCPackets.cpp:425,732
+        if session.has_right(RCRight.BAN):
+            account.is_banned = banned
+            account.ban_reason = reason
+        self.server.account_manager.save_account(account)
+
+    async def _drop_nc_sessions(self, account_name: str):
+        nc_manager = getattr(self.server, 'nc_manager', None)
+        if nc_manager is None:
+            return
+        for nc_session in nc_manager.get_all_sessions():
+            player = nc_session.player
+            if player.account_name.lower() == account_name.lower():
+                nc_manager.unregister_session(player.id)
+                await player.disconnect()
+
+    def _valid_account_path(self, name: str) -> bool:
+        if not self._valid_browser_name(name) or ':' in name:
+            return False
+        directory = getattr(getattr(self.server, 'account_manager', None),
+                            'accounts_dir', None)
+        if isinstance(directory, (str, os.PathLike)):
+            base = Path(directory).resolve()
+            try:
+                (base / (name + '.json')).resolve().relative_to(base)
+            except (ValueError, OSError, RuntimeError):
+                return False
+        return True
+
+    @staticmethod
+    def _decode_lines(value: str) -> List[str]:
+        if '\n' in value:
+            return value.splitlines()
+        return next(csv.reader([value]), [])
+
+    @staticmethod
+    def _encode_lines(lines: List[str]) -> str:
+        output = io.StringIO()
+        csv.writer(output, lineterminator='').writerow(lines)
+        return output.getvalue()
 
     async def _broadcast_rc_message(self, message: str):
         """Broadcast a message to all RC sessions."""

@@ -17,13 +17,32 @@ from typing import TYPE_CHECKING, Optional, List, Dict, Any
 
 from .attachments import absolute_position
 
-from .protocol.constants import PLTYPE
+from .protocol.constants import PLPERM, PLTYPE
 
 if TYPE_CHECKING:
     from .server import GameServer
     from .player import Player
 
 logger = logging.getLogger(__name__)
+
+
+# RC permission bits (GServer-v2/server/include/Account.h:29-50); the shared enum
+# carries the reference names and values.
+RCRight = PLPERM
+
+
+def mask_rc_rights(caller_rights: int, granted_rights: int,
+                   own_account: bool) -> int:
+    """Apply the grant mask and own-account preservation for RC rights edits."""
+    # PlayerRCPackets.cpp:864-879. Diverges on purpose: the reference leaves bits 20+
+    # unmasked and ORs both bits into own-account edits (:874-879), which escalates.
+    granted_rights &= 0xffffffff
+    if not caller_rights & RCRight.MODIFYSTAFFACCOUNT:
+        granted_rights &= caller_rights
+    if own_account:
+        granted_rights |= caller_rights & (
+            RCRight.MODIFYSTAFFACCOUNT | RCRight.SETRIGHTS)
+    return granted_rights
 
 
 @dataclass
@@ -40,6 +59,10 @@ class Account:
     ban_reason: str = ""
     is_staff: bool = False
     admin_rights: int = 0
+    # (defaultaccount).txt:47 ships IPRANGE 0.0.0.0: no control access by default.
+    admin_ip: str = "0.0.0.0"
+    folders: List[str] = field(default_factory=list)
+    load_only: bool = False
 
     # Stats
     kills: int = 0
@@ -85,6 +108,9 @@ class Account:
     level_name: str = ""
     x: float = 30.0
     y: float = 30.0
+    # FlatFileAccountLoader.cpp:153-160,195-200,612,622: NICK and Z persist.
+    nickname: str = ""
+    z: float = 0.0
 
     # Flags (persistent player flags)
     flags: Dict[str, str] = field(default_factory=dict)
@@ -143,6 +169,9 @@ class Account:
             'ban_reason': self.ban_reason,
             'is_staff': self.is_staff,
             'admin_rights': self.admin_rights,
+            'admin_ip': self.admin_ip,
+            'folders': self.folders,
+            'load_only': self.load_only,
             'kills': self.kills,
             'deaths': self.deaths,
             'elo_rating': self.elo_rating,
@@ -168,6 +197,8 @@ class Account:
             'level_name': self.level_name,
             'x': self.x,
             'y': self.y,
+            'nickname': self.nickname,
+            'z': self.z,
             'flags': self.flags,
             'gattribs': self.gattribs,
             'weapons': self.weapons,
@@ -195,6 +226,9 @@ class Account:
         account.ban_reason = data.get('ban_reason', '')
         account.is_staff = data.get('is_staff', False)
         account.admin_rights = data.get('admin_rights', 0)
+        account.admin_ip = data.get('admin_ip', '')
+        account.folders = data.get('folders', [])
+        account.load_only = data.get('load_only', False)
         account.kills = data.get('kills', 0)
         account.deaths = data.get('deaths', 0)
         account.elo_rating = data.get('elo_rating', 1500.0)
@@ -222,6 +256,8 @@ class Account:
         account.level_name = data.get('level_name', '')
         account.x = data.get('x', 30.0)
         account.y = data.get('y', 30.0)
+        account.nickname = data.get('nickname', '')
+        account.z = data.get('z', 0.0)
         account.flags = data.get('flags', {})
         account.gattribs = data.get('gattribs', [''] * 30)
         account.weapons = data.get('weapons', [])
@@ -387,6 +423,13 @@ class AccountManager:
         # Remove from cache
         self._accounts.pop(name_lower, None)
 
+        # A save still queued on the writer thread would recreate the file
+        # right after the unlink below; let the queue drain first.
+        try:
+            self._save_executor.submit(lambda: None).result()
+        except RuntimeError:
+            pass
+
         # Delete file
         account_file = self.accounts_dir / f"{account_name}.json"
         try:
@@ -518,6 +561,9 @@ class AccountManager:
         player.elo_rating = account.elo_rating
         player.elo_deviation = account.elo_deviation
         player.last_spar_time = account.last_spar_time
+        if account.nickname:
+            player.nickname = account.nickname
+        player.z = account.z
         player.flags = account.flags.copy()
         player.gattribs = {i: v for i, v in enumerate(account.gattribs) if v}
         # Weapons must be on the player before complete_login runs, which is
@@ -561,6 +607,8 @@ class AccountManager:
         account.elo_rating = player.elo_rating
         account.elo_deviation = player.elo_deviation
         account.last_spar_time = player.last_spar_time
+        account.nickname = player.nickname
+        account.z = player.z
         account.flags = player.flags.copy()
         account.weapons = player.weapons.copy()
 

@@ -96,7 +96,7 @@ def _write_player_prop(builder: 'PacketBuilder', prop_id: int, value) -> None:
     try:
         payload = (bytes([(int(value) + 32) & 0xff]) if prop_id == PLPROP.CARRYSPRITE
                    else encode_value(desc, value, _OUTBOUND_COLORS))
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         logger.warning("build_player_props: prop %s (%s) value %r not encodable: %s",
                        prop_id, desc.name, value, exc)
         return
@@ -163,7 +163,7 @@ def _write_npc_prop(builder: 'PacketBuilder', prop_id: int, value) -> None:
         return
     try:
         payload = encode_value(desc, value, _OUTBOUND_COLORS)
-    except (TypeError, ValueError) as exc:
+    except (TypeError, ValueError, OverflowError) as exc:
         logger.warning("build_npc_props: prop %s (%s) value %r not encodable: %s",
                        prop_id, desc.name, value, exc)
         return
@@ -343,10 +343,15 @@ def build_status_list(statuses: List[str]) -> bytes:
 
 
 def build_clear_weapons() -> bytes:
-    """Build PLO_CLEARWEAPONS packet."""
-    builder = PacketBuilder().write_gchar(PLO.CLEARWEAPONS)
+    """Build PLO_RESETCLIENT packet."""
+    builder = PacketBuilder().write_gchar(PLO.RESETCLIENT)
     builder.write_newline()
     return builder.build()
+
+
+def build_serverlist_connected() -> bytes:
+    """Build PLO_SERVERLISTCONNECTED (no payload)."""
+    return PacketBuilder().write_gchar(PLO.SERVERLISTCONNECTED).write_newline().build()
 
 
 def build_list_processes(processes: List[str]) -> bytes:

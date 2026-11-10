@@ -2,11 +2,12 @@ from . import character
 from . import world
 from . import combat
 from . import visual
+from . import objects
 import logging
 
 
 _COMMANDS = {}
-for _module in (character, world, combat, visual):
+for _module in (character, world, combat, visual, objects):
     _COMMANDS.update(_module._COMMANDS)
 
 _c_noop = character._c_noop
@@ -39,14 +40,14 @@ _NOOP_COMMANDS = (
     "setbackpal", "setletters", "setmap", "setminimap",
     "showtext", "showtext2", "showstats", "replaceani",
     "setfocus", "centermap", "putcomp", "putnewcomp", "removecompus",
-    "setpause", "dontshowtime", "timershow", "showbomb", "showbow", "showsword", "showani",
+    "setpause", "dontshowtime", "showbomb", "showbow", "showsword", "showani",
     "resetfocus",
     # not implemented in the GServer-v2 C++ oracle either (commented out there),
     # so faithfully no-ops:
     "noplayerkilling", "enabledefmovement", "disabledefmovement",
     "toinventory", "hideplayer", "showplayer",
     # combat projectiles with no pygserver representation (client-side in Reborn)
-    "shootball", "shootfireball", "shootfireblast", "shoot",
+    "shootball", "shoot",
 )
 for _name in _NOOP_COMMANDS:
     _COMMANDS.setdefault(_name, _c_noop)

@@ -83,9 +83,11 @@ def test_handler_table_is_bound_methods_named_after_the_packet():
     assert handlers[PLI.BADDYHURT] == player._handle_baddy_hurt
 
 
-def test_unsupported_npc_edit_packets_are_not_registered():
-    for packet_id in (PLI.NPCPROPS, PLI.NPCDEL):
-        assert packet_id not in _HANDLER_NAMES
+def test_classic_npc_edit_packets_are_registered():
+    # Both are classic-mode requests (PlayerClientPackets.cpp:189,783); the
+    # handlers refuse them while an NPC server is present.
+    assert _HANDLER_NAMES[PLI.NPCPROPS] == '_handle_npc_props'
+    assert _HANDLER_NAMES[PLI.NPCDEL] == '_handle_npc_del'
 
 
 def test_client_entity_creation_packets_are_registered():
@@ -95,7 +97,8 @@ def test_client_entity_creation_packets_are_registered():
 
 def test_unhandled_packet_ids_are_recorded():
     player = make_player()
-    unregistered = PLI.NPCDEL  # not a handler, not in the RC/NC ranges
+    unregistered = PLI.TOWEAPON  # not a handler, not in the RC/NC ranges
+    assert unregistered not in _HANDLER_NAMES
 
     asyncio.run(player._handle_packets(bytes((unregistered + 32,)) + b"\n"))
 

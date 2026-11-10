@@ -11,6 +11,14 @@ def players_on_level_for(server, level):
     """
     if server is None or level is None or not hasattr(level, "get_player_ids"):
         return []
+    # A connection that has not finished logging in is not a player yet:
+    # scripts must not enumerate, index or write it (fakes without the
+    # attribute count as logged in).
+    return [p for p in _level_players(server, level)
+            if getattr(p, "logged_in", True)]
+
+
+def _level_players(server, level):
     name = getattr(level, "name", None)
     audience = getattr(server, "audience", None)
     world = getattr(server, "world", None)

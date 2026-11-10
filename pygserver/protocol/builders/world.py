@@ -190,8 +190,10 @@ def build_npc_weapon_add_scripted(weapon_name: str, image: str,
     builder.write_gstring(weapon_name)
     builder.write_gchar(NPCPROP.IMAGE)
     builder.write_gstring(image)
-    builder.write_gchar(NPCPROP.CLASS)
-    builder.write_gstring_short(joined_classes)
+    # server/src/object/Weapon.cpp:188-189 omits an empty class list.
+    if joined_classes:
+        builder.write_gchar(NPCPROP.CLASS)
+        builder.write_gstring_short(joined_classes)
     builder.write_newline()
     return builder.build()
 
@@ -208,13 +210,13 @@ def build_npc_weapon_del(weapon_name: str) -> bytes:
 
 
 def build_npc_weapon_script(header: str, bytecode: bytes) -> bytes:
-    """Build PLO_NPCWEAPONSCRIPT: [gshort header_len][header CSV][bytecode].
+    """Build PLO_WEAPONBYTECODE2: [gshort header_len][header CSV][bytecode].
 
     Bytecode is binary and routinely contains 0x0a, so this packet must be
     announced with build_raw_data_announcement() - unframed it is truncated at
     the first newline.
     """
-    builder = PacketBuilder().write_gchar(PLO.NPCWEAPONSCRIPT)
+    builder = PacketBuilder().write_gchar(PLO.WEAPONBYTECODE2)
     builder.write_gstring_short(header)
     builder.write_bytes(bytecode)
     builder.write_newline()
@@ -234,7 +236,7 @@ def build_load_script_bytecode(header: str, bytecode: bytes) -> bytes:
     """Build the class-bytecode form of PLO_LOADSCRIPT:
     [gchar header_len][header CSV][bytecode] (ScriptClass.cpp getClassPacket).
 
-    Like PLO_NPCWEAPONSCRIPT this must be sent inside PLO_RAWDATA framing.
+    Like PLO_WEAPONBYTECODE2 this must be sent inside PLO_RAWDATA framing.
     """
     builder = PacketBuilder().write_gchar(PLO.LOADSCRIPT)
     builder.write_gstring(header)
@@ -450,6 +452,11 @@ def build_board_layer(layer: int, tiles: bytes) -> bytes:
     builder.write_bytes(tiles)
     builder.write_newline()
     return builder.build()
+
+
+def build_board_layer_raw(layer: int, tiles: bytes) -> bytes:
+    """Build the complete raw board layer (Level.cpp:427-437)."""
+    return bytes([PLO.BOARDLAYER + 32, layer, 0, 0, 64, 64]) + tiles + b'\n'
 
 
 def build_set_active_level(level_name: str) -> bytes:

@@ -24,6 +24,7 @@ class TestWarpPlayerWireFormat:
         mock_server = MagicMock()
         rc = RCManager(mock_server)
         player = MagicMock()
+        player.send_raw = AsyncMock()
         player.id = 1
         player.account_name = "admin"
         player.disconnect = AsyncMock()
@@ -55,6 +56,7 @@ class TestWarpPlayerWireFormat:
         mock_server = MagicMock()
         rc = RCManager(mock_server)
         player = MagicMock()
+        player.send_raw = AsyncMock()
         player.id = 1
         player.account_name = "admin"
         player.warp = AsyncMock()
@@ -81,6 +83,7 @@ class TestWarpPlayerWireFormat:
         mock_server = MagicMock()
         rc = RCManager(mock_server)
         player = MagicMock()
+        player.send_raw = AsyncMock()
         player.warp = AsyncMock()
         
         session = RCSession(player=player, rights=0)  # No rights
@@ -105,6 +108,7 @@ class TestDisconnectPlayerWireFormat:
         mock_server = MagicMock()
         rc = RCManager(mock_server)
         admin_player = MagicMock()
+        admin_player.send_raw = AsyncMock()
         admin_player.id = 1
         admin_player.account_name = "admin"
         target_player = MagicMock()
@@ -130,6 +134,7 @@ class TestDisconnectPlayerWireFormat:
         mock_server = MagicMock()
         rc = RCManager(mock_server)
         admin_player = MagicMock()
+        admin_player.send_raw = AsyncMock()
         admin_player.disconnect = AsyncMock()
         
         session = RCSession(player=admin_player, rights=0)
@@ -155,10 +160,11 @@ class TestServerFlagsSetWireFormat:
         mock_server.server_flags = {}
         rc = RCManager(mock_server)
         player = MagicMock()
+        player.send_raw = AsyncMock()
         player.id = 1
         player.account_name = "admin"
         
-        session = RCSession(player=player, rights=PLPERM.SETATTRIBUTES)
+        session = RCSession(player=player, rights=PLPERM.SETSERVERFLAGS)
 
         # Build packet: count=2, then "flag1=value1", "flag2=value2"
         payload = PacketBuilder().write_gshort(2).write_gstring("flag1=value1").write_gstring("flag2=value2").build()
@@ -178,6 +184,7 @@ class TestServerFlagsSetWireFormat:
         mock_server.server_flags = {}
         rc = RCManager(mock_server)
         player = MagicMock()
+        player.send_raw = AsyncMock()
         
         session = RCSession(player=player, rights=0)
 
@@ -208,6 +215,7 @@ class TestPlayerBanSetWireFormat:
         
         rc = RCManager(mock_server)
         admin_player = MagicMock()
+        admin_player.send_raw = AsyncMock()
         admin_player.id = 1
         admin_player.account_name = "admin"
         
@@ -237,6 +245,7 @@ class TestPlayerBanSetWireFormat:
         
         rc = RCManager(mock_server)
         admin_player = MagicMock()
+        admin_player.send_raw = AsyncMock()
         admin_player.id = 1
         admin_player.account_name = "admin"
         
@@ -260,6 +269,7 @@ class TestPlayerBanSetWireFormat:
         
         rc = RCManager(mock_server)
         player = MagicMock()
+        player.send_raw = AsyncMock()
         
         session = RCSession(player=player, rights=0)
 
@@ -275,11 +285,16 @@ class TestPlayerBanSetWireFormat:
 class TestLargeFileTransferWireFormat:
     """PLI_RC_LARGEFILESTART/END: [filename=rest]"""
 
-    def test_large_file_start_creates_buffer(self):
+    def test_large_file_start_creates_buffer(self, tmp_path):
         from pygserver.rc import RCManager, RCSession
         from pygserver.protocol.constants import PLPERM
 
         mock_server = MagicMock()
+        mock_server.filesystem.base_path = tmp_path
+        mock_server.filesystem.list_directory.return_value = []
+        from types import SimpleNamespace
+        mock_server.account_manager.get_account.return_value = SimpleNamespace(
+            folders=["rw *", "rw uploads/*"])
         rc = RCManager(mock_server)
         player = MagicMock()
         player.send_raw = AsyncMock()
@@ -323,7 +338,7 @@ class TestLargeFileTransferWireFormat:
         # Should not raise, just log warning
         assert "nonexistent.txt" not in session.large_file_uploads
 
-    def test_large_file_roundtrip_start_end(self):
+    def test_large_file_roundtrip_start_end(self, tmp_path):
         """Test that LARGEFILESTART+LARGEFILEEND properly key the buffered upload."""
         from pygserver.rc import RCManager, RCSession
         from pygserver.protocol.constants import PLPERM
@@ -332,6 +347,11 @@ class TestLargeFileTransferWireFormat:
         mock_server.filesystem = MagicMock()
         mock_server.filesystem.write_file = MagicMock()
         
+        mock_server.filesystem.base_path = tmp_path
+        mock_server.filesystem.list_directory.return_value = []
+        from types import SimpleNamespace
+        mock_server.account_manager.get_account.return_value = SimpleNamespace(
+            folders=["rw *", "rw uploads/*"])
         rc = RCManager(mock_server)
         player = MagicMock()
         player.send_raw = AsyncMock()
@@ -359,7 +379,7 @@ class TestLargeFileTransferWireFormat:
         # Verify the file was written with the correct content
         mock_server.filesystem.write_file.assert_called_once_with("test.dat", b"Hello World!")
 
-    def test_large_file_filename_with_path(self):
+    def test_large_file_filename_with_path(self, tmp_path):
         """Test LARGEFILEEND with file_browser_path prepended."""
         from pygserver.rc import RCManager, RCSession
         from pygserver.protocol.constants import PLPERM
@@ -368,6 +388,11 @@ class TestLargeFileTransferWireFormat:
         mock_server.filesystem = MagicMock()
         mock_server.filesystem.write_file = MagicMock()
         
+        mock_server.filesystem.base_path = tmp_path
+        mock_server.filesystem.list_directory.return_value = []
+        from types import SimpleNamespace
+        mock_server.account_manager.get_account.return_value = SimpleNamespace(
+            folders=["rw *", "rw uploads/*"])
         rc = RCManager(mock_server)
         player = MagicMock()
         player.send_raw = AsyncMock()

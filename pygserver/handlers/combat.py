@@ -67,11 +67,11 @@ class CombatHandlers:
         if not self.level:
             return
         reader = PacketReader(data)
-        x = reader.read_gchar() / 2.0
-        y = reader.read_gchar() / 2.0
+        # PlayerClientPackets.cpp:314: low three bits are power, rest length.
+        length_power = reader.read_gchar()
 
         if hasattr(self.server, 'combat_manager'):
-            await self.server.combat_manager.handle_fire_spy(self, x, y)
+            await self.server.combat_manager.handle_fire_spy(self, length_power)
 
     @handles(PLI.THROWCARRIED)
     async def _handle_throw_carried(self, data: bytes):

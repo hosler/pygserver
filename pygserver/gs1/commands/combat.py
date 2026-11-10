@@ -7,6 +7,7 @@ from reborn_protocol.gs1.values import to_num
 
 from ...attachments import absolute_position
 from ..execution import _schedule
+from .. import objects as gs1_objects
 from ..host import NPC_CHARPROP, PLAYER_CHARPROP, PLAYER_PROP_WIRE, PLPROP, _NPC_GATTRIB_PROPS, _PLAYER_GATTRIB_PROPS, _charprop_target  # noqa: F401  - kept: original import block (star-import consumers rely on it)
 import asyncio  # noqa: F401  - kept: original import block (star-import consumers rely on it)
 import time  # noqa: F401  - kept: original import block (star-import consumers rely on it)
@@ -157,8 +158,8 @@ def _c_hitnpc(self, a, npc, player, ctx):
     target = npcs[idx]
     halfhearts = math.floor(to_num(a[1]))
     dx, dy = _normalized_push(target, a[2], a[3])
-    target.hurt_dx = int(max(-1.0, min(1.0, dx)) * 32)
-    target.hurt_dy = int(max(-1.0, min(1.0, dy)) * 32)
+    # stored as the NPC's signed half-pixel HURTDXDY push
+    gs1_objects.set_npc_hurt(target, dx, dy)
     target.hearts = max(0.0, to_num(getattr(target, "hearts", 0)) - halfhearts / 2.0)
     self._dirty(target)
     nm = getattr(self.server, "npc_manager", None)

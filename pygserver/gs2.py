@@ -7,9 +7,8 @@ a weapon or script-class source, hand it to the real GServer-v2 GS2 compiler
 (`gs2test`, the same binary reborn-protocol's compiler-conformance test pins),
 and hold the resulting bytecode ready for PLI_UPDATESCRIPT / PLI_UPDATECLASS.
 
-The compiler is a native binary and is not a dependency of this server: with no
-binary and no precompiled `.gs2bc` beside the source, a script simply has no
-bytecode and the server keeps serving it as classic GS1 text exactly as before.
+The compiler is optional. Without bytecode, classic GS1 weapons retain their
+source text; failed GS2 scripts have no clientside payload.
 
 Animation scripts go the same way: a .gani's SCRIPT block is compiled whole and
 served as PLO_GANISCRIPT bytecode (server/src/animation/GameAni.cpp).
@@ -22,13 +21,16 @@ setScript(), server/src/scripting/ScriptClass.cpp setScript()).
 import logging
 import os
 import tempfile
+import time
 import zlib
 from dataclasses import dataclass
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
 
 from reborn_protocol.gs2.compiler import Gs2Compiler as GS2Compiler, find_compiler
+from reborn_protocol.gs2.detect import looks_like_gs2
 
+from .text_safety import strip_control_chars
 from .protocol.packets import (
     build_default_weapon,
     build_gani_script,
@@ -52,7 +54,7 @@ CLIENTSIDE_MARKER = "//#CLIENTSIDE"
 #: Empty-bytecode header the client gets for a class it asked for and we don't
 #: have; without it a weapon's join() of a missing class never settles
 #: (PlayerClientPackets.cpp msgPLI_UPDATECLASS, which answers with
-#: PLO_NPCWEAPONSCRIPT rather than PLO_LOADSCRIPT on purpose).
+#: PLO_WEAPONBYTECODE2 rather than PLO_LOADSCRIPT on purpose).
 _ZERO_KEY = "\x20" * 10
 _ZERO_CRC = "\x20" * 5
 
@@ -201,13 +203,16 @@ class GS2Script:
     server_program: Optional[Any] = None
     server_runtime: Optional[Any] = None
     source_path: Optional[Path] = None
+    #: Last time the weapon's definition changed (Weapon::modTime): the file's
+    #: mtime when loaded, the wall clock when created or edited. A level NPC's
+    #: toweapons only replaces the weapon when this is older than the level.
+    mod_time: float = 0.0
 
     def build_headers(self, source: str):
-        """Derive the DES key, CRC32 and CSV headers from the full source.
+        """Derive the DES key from source and build the CRC32 headers.
 
-        The two kinds encode their checksum differently in the reference
-        implementation: Weapon::setScript appends it as a decimal string
-        (CString's long long ctor), ScriptClass::setScript as a GINT5.
+        Weapons hash bytecode (server/src/object/Weapon.cpp:351-370);
+        Classes retain source CRC (server/src/scripting/ScriptClass.cpp:40-42).
         """
         raw = source.encode('latin-1', errors='replace')
         digest = zlib.crc32(raw) & 0xFFFFFFFF
@@ -215,7 +220,8 @@ class GS2Script:
         # don't need to: the client only stores the key. Any stable 8 bytes will
         # do, as long as it's the same 10-char two-GINT5 shape.
         self.des_key = _gint5(digest) + _gint5(zlib.adler32(raw) & 0xFFFFFFFF)
-        self.checksum = digest
+        self.checksum = (digest if self.kind == 'class'
+                         else zlib.crc32(self.bytecode) & 0xFFFFFFFF)
         parts = [self.kind, self.name, '1', self.des_key]
         if self.kind == 'class':
             self.header = to_csv(parts + [_gint5(self.checksum)])
@@ -223,6 +229,17 @@ class GS2Script:
         else:
             self.header = to_csv(parts)
             self.header_with_crc = to_csv(parts + [str(self.checksum)])
+
+
+def _header_value(value: str) -> str:
+    """A weapon-file header value (REALNAME/IMAGE) on one line.
+
+    The file is line-oriented, so a line break (or any control character) in a
+    name or image would start a new directive, e.g. a SCRIPT block that loads
+    on the next restart. Those characters are dropped rather than escaped:
+    the format has no escape.
+    """
+    return strip_control_chars(value)
 
 
 def parse_weapon_file(text: str) -> Optional[Tuple[str, str, str]]:
@@ -358,7 +375,7 @@ class GS2ScriptManager:
         serverside, clientside = split_clientside(script_source)
         script = GS2Script(kind=kind, name=name, image=image,
                            source=script_source, clientside=clientside,
-                           source_path=path)
+                           source_path=path, mod_time=path.stat().st_mtime)
         if kind == 'weapon' and serverside:
             from .gs1_host import compile_gs1
             from .npc import NPC
@@ -370,8 +387,12 @@ class GS2ScriptManager:
                 manager = getattr(self.server, "npc_manager", None)
                 if manager is not None:
                     manager.register_weapon_runtime(script.server_runtime)
+        # Script.cpp:480-513 requires an NPC server (Server.cpp:973-986).
+        if getattr(self.server.config, 'serverside', False):
+            script.bytecode = self._bytecode_for(path, clientside, name) or b''
+            if not script.bytecode and looks_like_gs2(clientside):
+                script.clientside = ''
         script.build_headers(script_source)
-        script.bytecode = self._bytecode_for(path, clientside, name) or b''
 
         target = self.weapons if kind == 'weapon' else self.classes
         target[name.lower()] = script
@@ -426,6 +447,7 @@ class GS2ScriptManager:
 
     def upsert_weapon(self, name: str, image: str, source: str) -> GS2Script:
         """Persist and load an NC-created or replaced weapon."""
+        name, image = _header_value(name), _header_value(image)
         current = self.get_weapon(name)
         directory = Path(getattr(self.server.config, "weapons_dir", None)
                          or "weapons")
@@ -458,8 +480,10 @@ class GS2ScriptManager:
     def upsert_classic_weapon(self, name: str, image: str,
                               source: str) -> GS2Script:
         """Create/update a persistent classic weapon from an NPC script."""
+        name, image = _header_value(name), _header_value(image)
         weapon = self.get_weapon(name)
         if weapon is not None and weapon.source == source:
+            weapon.mod_time = time.time()
             return weapon
 
         serverside, clientside = split_clientside(source)
@@ -478,6 +502,7 @@ class GS2ScriptManager:
                 if manager is not None:
                     manager.register_weapon_runtime(weapon.server_runtime)
         weapon.build_headers(source)
+        weapon.mod_time = time.time()
         self.weapons[name.lower()] = weapon
         self._save_classic_weapon(weapon, source)
         return weapon
@@ -486,8 +511,8 @@ class GS2ScriptManager:
         directory = Path(getattr(self.server.config, "weapons_dir", None)
                          or "weapons")
         encoded = self._encoded_weapon_filename(weapon.name)
-        lines = ["GRAWP001", f"REALNAME {weapon.name}",
-                 f"IMAGE {weapon.image}"]
+        lines = ["GRAWP001", f"REALNAME {_header_value(weapon.name)}",
+                 f"IMAGE {_header_value(weapon.image)}"]
         if source:
             lines.extend(("SCRIPT", source, "SCRIPTEND"))
         try:
@@ -553,7 +578,7 @@ class GS2ScriptManager:
     # -- wire ----------------------------------------------------------------
 
     async def send_weapon_bytecode(self, player: 'Player', name: str) -> bool:
-        """Answer PLI_UPDATESCRIPT with PLO_NPCWEAPONSCRIPT.
+        """Answer PLI_UPDATESCRIPT with PLO_WEAPONBYTECODE2.
 
         Wrapped in PLO_RAWDATA: bytecode is binary and any 0x0a byte in it
         would otherwise end the packet early (Weapon::sendByteCodeToPlayer).
@@ -571,23 +596,20 @@ class GS2ScriptManager:
                                   checksum: int = 0):
         """Answer PLI_UPDATECLASS with PLO_LOADSCRIPT (in PLO_RAWDATA).
 
-        Always answers: a class we don't have gets the empty-bytecode stub, an
-        unchanged one gets nothing (the client's copy is current).
+        A missing class gets an empty-bytecode stub; unchanged classes and
+        classes without bytecode get no payload.
         """
         script = self.get_class(name)
         if script is None:
             stub = to_csv(['class', name, '1', _ZERO_KEY, _ZERO_CRC])
             await player.send_raw(build_npc_weapon_script(stub, b''))
             return
-        if checksum == script.checksum:
+        if checksum == script.checksum or not script.bytecode:
             return
-        payload = (script.bytecode if script.bytecode
-                   else script.clientside.encode('latin-1'))
-        packet = build_load_script_bytecode(script.header, payload)
+        packet = build_load_script_bytecode(script.header, script.bytecode)
         await player.send_raw(build_raw_data_announcement(len(packet)) + packet)
-        kind = "bytecode" if script.bytecode else "source"
-        logger.debug(f"GS2: sent class {script.name} {kind} "
-                     f"({len(payload)} bytes) to player {player.id}")
+        logger.debug(f"GS2: sent class {script.name} bytecode "
+                     f"({len(script.bytecode)} bytes) to player {player.id}")
 
     async def send_gani(self, player: 'Player', name: str, checksum: int = 0):
         """Answer PLI_UPDATEGANI: the compiled script as PLO_GANISCRIPT when

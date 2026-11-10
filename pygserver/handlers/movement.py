@@ -1,6 +1,7 @@
 """Warps, player property updates and adjacent-level preloading."""
 
 import logging
+import time
 
 from reborn_protocol import PLSTATUS
 
@@ -13,6 +14,7 @@ from ..protocol.packets import (
     build_raw_data_announcement,
     parse_player_props,
 )
+from ..text_safety import sanitize_value, strip_control_chars
 from .registry import handles
 
 logger = logging.getLogger(__name__)
@@ -32,6 +34,22 @@ _RELAYED_PROPS = {
     PLPROP.BODYIMAGE: 'body_image',
     PLPROP.COLORS: 'colors',
 }
+
+
+def resolve_nickname(account_name: str, requested: str) -> str:
+    """Player::setNick for a client request (Player.cpp:891-960).
+
+    A guild suffix needs the guild manager / list server to verify it, which
+    this server has neither of, so it falls through to the unverified outcome:
+    the suffix is dropped.
+    """
+    desired = strip_control_chars(requested).strip()
+    guild_start = desired.find('(')
+    nick = desired if guild_start < 0 else desired[:guild_start]
+    if nick.startswith('*'):
+        nick = nick[1:]
+    nick = nick.strip() or 'unknown'
+    return ('*' if nick == account_name else '') + nick
 
 
 class MovementHandlers:
@@ -65,7 +83,11 @@ class MovementHandlers:
     @handles(PLI.PLAYERPROPS)
     async def _handle_player_props(self, data: bytes):
         """Handle PLI_PLAYERPROPS packet."""
-        props = parse_player_props(data)
+        # Choke point for every client-settable string prop (nickname, chat,
+        # gani, head/body/sword/shield image, ...): control characters are
+        # stripped once here, before anything is stored, relayed or saved.
+        props = {key: sanitize_value(value)
+                 for key, value in parse_player_props(data).items()}
         pending_revive = getattr(self, 'pending_revive', None)
 
         # Capture the last absolute position before replacing any wire axes.
@@ -88,6 +110,34 @@ class MovementHandlers:
         elif PLPROP.Y in props:
             self.y = props[PLPROP.Y] / 2.0
         absolute_position(self)
+
+        # PlayerProps.cpp:495-511: Z (tiles) then Z2 (pixels), unless locked.
+        z_changed = False
+        z_reverted = False
+        if PLPROP.Z in props or PLPROP.Z2 in props:
+            if getattr(self.server.config, 'lockplayerz', False):
+                z_reverted = True
+            else:
+                if PLPROP.Z in props:
+                    self.z = float(props[PLPROP.Z])
+                if PLPROP.Z2 in props:
+                    self.z = props[PLPROP.Z2]
+                z_changed = True
+                # PlayerProps.cpp:507-510: a height update un-pauses the
+                # player and counts as movement.
+                self.client_status = (getattr(self, 'client_status', 0)
+                                      & ~PLSTATUS.PAUSED)
+                self.last_movement_time = time.time()
+
+        # PlayerProps.cpp:180-203: an unchanged nickname is ignored; a changed
+        # one is normalised, echoed back to the sender if altered, and sent on.
+        nickname_changed = False
+        nickname_adjusted = False
+        if PLPROP.NICKNAME in props and props[PLPROP.NICKNAME] != self.nickname:
+            requested = props[PLPROP.NICKNAME]
+            self.nickname = resolve_nickname(self.account_name, requested)
+            nickname_adjusted = self.nickname != requested
+            nickname_changed = True
 
         if PLPROP.DIRECTION in props:
             self.direction = props[PLPROP.DIRECTION]
@@ -192,6 +242,9 @@ class MovementHandlers:
                     broadcast_props[prop_id] = getattr(self, attr)
             if chat_changed:
                 broadcast_props[PLPROP.CURCHAT] = self.chat
+            if z_changed:
+                broadcast_props[PLPROP.Z] = int(self.z)
+                broadcast_props[PLPROP.Z2] = self.z
             # Gear goes out as the (power, image) pair so the image name is on
             # the wire; a bare power would only tell the other client which
             # preset sprite to guess at.
@@ -206,9 +259,43 @@ class MovementHandlers:
                     self.level.name, packet, exclude={self.id}
                 )
 
+        # A changed nickname goes to every player on the server, not just the
+        # level (SetResults::sendToAll, PlayerProps.cpp:203).
+        if nickname_changed:
+            await self.server.broadcast_to_all(
+                build_other_player_props(
+                    self.id, {PLPROP.NICKNAME: self.nickname}),
+                exclude={self.id})
+
+        if self.level:
             # Fire GS1 playertouchsme for NPCs the player has walked onto
             if getattr(self.server, 'npc_manager', None):
                 await self.server.npc_manager.check_touches(self)
+
+        # Corrections go back to the sender only (SETPROP_SENDBACK /
+        # SETPROP_RETURN_REVERT, PlayerProps.cpp:149-171).
+        corrections = {}
+        if nickname_adjusted:
+            corrections[PLPROP.NICKNAME] = self.nickname
+        if z_reverted:
+            corrections[PLPROP.Z] = int(self.z)
+            corrections[PLPROP.Z2] = self.z
+        if corrections:
+            await self.send_props(corrections)
+
+    def _adjacent_level(self, level_name: str):
+        """Levels PLI_ADJACENTLEVEL may name: a sublevel of the player's own
+        gmap, else a level the server already holds in memory. Never one that
+        merely exists on disk (PlayerClientPackets.cpp:994-1014)."""
+        world = self.server.world
+        if self.level is not None:
+            gmap_info = world.get_gmap_for_level(self.level.name)
+            if gmap_info and gmap_info[0].find_level(level_name) is not None:
+                return world.get_level(level_name)
+        for cached in world.get_all_levels():
+            if cached.name == level_name:
+                return cached
+        return None
 
     @handles(PLI.ADJACENTLEVEL)
     async def _handle_adjacent_level(self, data: bytes):
@@ -216,12 +303,14 @@ class MovementHandlers:
         segment. Send that level's name + board so the client can stitch the
         world together; no warp and no player-add (the player stays put)."""
         reader = PacketReader(data)
-        level_name = reader.remaining().decode('latin-1', errors='replace').strip()
+        # PlayerClientPackets.cpp:994-1014: cache time precedes the name.
+        reader.read_gint5()
+        level_name = reader.remaining().decode('latin-1', errors='replace')
         if not level_name:
             return
-        level = self.server.world.get_level(level_name)
+        level = self._adjacent_level(level_name)
         if not level:
-            logger.debug(f"Adjacent level not found: {level_name}")
+            logger.debug(f"Adjacent level not served: {level_name}")
             return
 
         # Only the board — adjacent segments are for rendering. Their signs/links
@@ -231,4 +320,5 @@ class MovementHandlers:
         tile_data = level.get_board_packet()
         board_packet = bytes([PLO.BOARDPACKET + 32]) + tile_data + b'\n'
         announcement = build_raw_data_announcement(len(board_packet))
-        await self.send_raw(level_name_pkt + announcement + board_packet)
+        await self.send_raw(level_name_pkt + announcement + board_packet
+                            + self._board_layer_packets(level))

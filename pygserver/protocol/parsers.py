@@ -117,6 +117,12 @@ def _store_chat(props, value):
     props[PLPROP.CURCHAT] = value or ''
 
 
+def _store_nickname(props, value):
+    # Like CURCHAT, an empty nickname decodes as None but is a real request
+    # (Player::setNick turns it into "unknown", Player.cpp:921-930).
+    props[PLPROP.NICKNAME] = value or ''
+
+
 def _store_head_image(props, value):
     # Only a custom image name is surfaced; a preset id would change the type
     # callers (Player.head_image) expect. Routing it through the descriptor is
@@ -131,7 +137,7 @@ def _store_head_image(props, value):
 # GS1 host consume is surfaced; everything else is still stepped over at its
 # real width from the descriptor table.
 _INBOUND_PROP_HANDLERS = {
-    PLPROP.NICKNAME: _store(PLPROP.NICKNAME),
+    PLPROP.NICKNAME: _store_nickname,
     PLPROP.MAXPOWER: _store(PLPROP.MAXPOWER),
     PLPROP.CURPOWER: _store(PLPROP.CURPOWER),
     PLPROP.RUPEESCOUNT: _store(PLPROP.RUPEESCOUNT),
@@ -166,6 +172,7 @@ _INBOUND_PROP_HANDLERS = {
     PLPROP.TEXTCODEPAGE: _store(PLPROP.TEXTCODEPAGE),
     PLPROP.X2: _store(PLPROP.X2),
     PLPROP.Y2: _store(PLPROP.Y2),
+    PLPROP.Z: _store(PLPROP.Z),
     PLPROP.Z2: _store(PLPROP.Z2),
     **{pid: _store(pid) for pid in _GATTRIB_IDS},
 }
@@ -176,7 +183,7 @@ _INBOUND_PROP_HANDLERS = {
 _CARRY_PLAYER_PROPS = dict(PLAYER_PROPS)
 _CARRY_PLAYER_PROPS[PLPROP.CARRYSPRITE] = replace(PLAYER_PROPS[PLPROP.CARRYSPRITE], wire=Wire.RAW)
 _INBOUND_STREAM = StreamPolicy(table=_CARRY_PLAYER_PROPS, max_prop_id=100,
-                               handle_empty=frozenset({PLPROP.CURCHAT}))
+                               handle_empty=frozenset({PLPROP.CURCHAT, PLPROP.NICKNAME}))
 
 
 def parse_player_props(data: bytes, start_pos: int = 0,

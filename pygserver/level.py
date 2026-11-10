@@ -61,6 +61,7 @@ class Level:
 
         # Tile data (64x64 = 4096 tiles, 2 bytes each)
         self._tiles = bytearray(self.BOARD_SIZE)
+        self.board_layers: Dict[int, bytearray] = {}
 
         # Players on this level, insertion-ordered (dict[id, None] as an
         # ordered set) so the first key is always the current level leader -
@@ -177,6 +178,25 @@ class Level:
         for y in range(self.HEIGHT):
             lines.append(f"BOARD 0 {y} 64 0 {self._encode_board_row(y)}")
 
+        for layer, board in sorted(self.board_layers.items()):
+            for y in range(self.HEIGHT):
+                x = 0
+                while x < self.WIDTH:
+                    start = x
+                    encoded = []
+                    while x < self.WIDTH:
+                        index = level_index(x, y) * 2
+                        tile = int.from_bytes(board[index:index + 2], 'little')
+                        if tile == 65535:
+                            break
+                        if not 0 <= tile < 4096:
+                            raise ValueError(f"layer {layer} tile {tile} is not representable")
+                        encoded.append(self.BASE64_CHARS[tile // 64] + self.BASE64_CHARS[tile % 64])
+                        x += 1
+                    if encoded:
+                        lines.append(f"BOARD {start} {y} {x - start} {layer} {''.join(encoded)}")
+                    x += 1
+
         for link in self._links:
             required = ('dest_level', 'x', 'y', 'width', 'height',
                         'dest_x', 'dest_y')
@@ -281,32 +301,28 @@ class Level:
 
         # Parse BOARD lines - each is: "BOARD x y width height tile_data"
         # y is row number (0-63), tile_data is base64-encoded
-        board_rows: Dict[int, List[int]] = {}
-
+        # LevelLoader.cpp:779-808: BOARD records include x, width and layer.
+        self._tiles = bytearray(self.BOARD_SIZE)
+        self.board_layers.clear()
         for line in lines:
-            line = line.strip()
-            if line.startswith('BOARD '):
-                parts = line.split(None, 5)  # Split max 6 parts
-                if len(parts) >= 6:
-                    try:
-                        y = int(parts[2])  # Row number
-                        tile_str = parts[5]  # Tile data string
-                        if 0 <= y < 64:
-                            row_tiles = self._decode_board_string(tile_str)
-                            board_rows[y] = row_tiles
-                    except (ValueError, IndexError):
-                        pass
-
-        # Convert parsed rows to binary tile data
-        if board_rows:
-            self._tiles = bytearray(self.BOARD_SIZE)
-            for y in range(64):
-                if y in board_rows:
-                    row_tiles = board_rows[y]
-                    for x, tile_id in enumerate(row_tiles[:LEVEL_SIZE]):
-                        idx = level_index(x, y) * 2
-                        self._tiles[idx] = tile_id & 0xFF
-                        self._tiles[idx + 1] = (tile_id >> 8) & 0xFF
+            parts = line.split(None, 5)
+            if len(parts) != 6 or parts[0] != 'BOARD':
+                continue
+            try:
+                x, y, width, layer = map(int, parts[1:5])
+            except ValueError:
+                continue
+            if not (0 <= x < 64 and 0 <= y < 64 and 0 < width <= 64 - x
+                    and 0 <= layer <= 255 and len(parts[5].strip()) >= width * 2):
+                continue
+            if layer == 0:
+                board = self._tiles
+            else:
+                board = self.board_layers.setdefault(
+                    layer, bytearray(b'\xff\xff' * self.TILE_COUNT))
+            for offset, tile_id in enumerate(self._decode_board_string(parts[5])[:width]):
+                index = level_index(x + offset, y) * 2
+                board[index:index + 2] = tile_id.to_bytes(2, 'little')
 
         # Parse line-based features (GLEVNW01 text format): LINK, SIGN/SIGNEND,
         # CHEST, BADDY/BADDYEND. Mirrors GServer-v2 LevelLoader.

@@ -167,6 +167,56 @@ starty = 30.5
 maxplayers = 100
 ```
 
+### Gameplay options
+
+Each is read from `serveroptions.txt` with the reference server's name and
+default, and written back by `ServerConfig.to_file`:
+
+| Option | Default | Effect |
+|---|---|---|
+| `baddyitems` | `false` | A dying baddy drops an item (`LevelBaddy.cpp:284`) |
+| `lockplayerz` | `false` | Client Z changes are rejected (`PlayerProps.cpp:495-500`) |
+| `defaultweapons` | `true` | Pickups may add the built-in weapons (`Server.h:165`); off, they are a no-op |
+| `putnpcenabled` | `false` | Allows the client `PLI_PUTNPC` packet |
+
+### RC and NC Access
+
+An RC, RC2 or NC login is admitted only when both hold (as on the reference
+server, GServer-v2 `Player.cpp:685-694`):
+
+1. the account is listed in the `staff` option (case-insensitive), and
+2. the connecting socket address matches one entry of the account's
+   admin-IP range: comma-separated, `*` matches any run and `?` one
+   character, no spaces. An empty range, and the `0.0.0.0` every new account
+   starts with, admit nobody. IPv4-mapped IPv6 peers match as plain IPv4.
+
+Staff membership grants no rights. Every RC action checks only the rights
+stored on the account (`PLPERM` bits). A staff member with no rights can log
+in but cannot do anything. The NC login does not check the NPC-control right.
+If an RC user removes that right from an account, the server drops the live
+NC session of that account.
+
+To grant access by hand, stop the server and edit `accounts/<name>.json`:
+
+```json
+"admin_rights": 1048575,
+"admin_ip": "127.0.0.1,192.168.1.*"
+```
+
+`1048575` (`0xFFFFF`) is every right. Once one account can log in with the
+set-rights right, use RC's player-rights editor for the rest.
+
+### Files clients can download
+
+`PLI_WANTFILE` and `PLI_UPDATEFILE` look a file up by name alone,
+case-insensitively, under the public folders and search them recursively:
+`world/` (the reference's file system root, GServer-v2 `Server.cpp:491-530`),
+`levels/ gani/ ganis/ images/ sounds/ bodies/ heads/ swords/ shields/ hats/
+global/`, and the first folder of every `config/foldersconfig.txt` pattern.
+`accounts/`, `config/`, `logs/`, `weapons/`, `npcs/`, `scripts/`, `guilds/`,
+`serverflags.txt` and anything outside the server folder are never served, and
+a symlink that leaves its folder is refused.
+
 ### List Server Setup
 
 To enable list server registration:

@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 
+from reborn_protocol.gs1 import ast as gs1_ast
 from reborn_protocol.gs1.runtime import Context, VarStore
 from reborn_protocol.gs1.lexer import tokenize
 from reborn_protocol.gs1.parser import Parser, parse
@@ -66,7 +67,8 @@ class _PendingGS1Sleep:
     started with, even if the level leader changed mid-sleep).
     """
     __slots__ = ("resumable", "ctx", "vars", "player", "this_obj", "level",
-                 "hit_source", "charprop_source", "tokenize_tokens")
+                 "hit_source", "charprop_source", "tokenize_tokens",
+                 "functions")
 
     def __init__(self, resumable, ctx):
         self.resumable = resumable
@@ -78,9 +80,13 @@ class _PendingGS1Sleep:
         self.hit_source = ctx.hit_source
         self.charprop_source = ctx.charprop_source
         self.tokenize_tokens = ctx.tokenize_tokens
+        # A joined class runs against its own function table (see
+        # _run_joined_classes), so a resume must put that table back.
+        self.functions = ctx.functions
 
     def apply(self):
         ctx = self.ctx
+        ctx.functions = self.functions
         ctx.vars = self.vars
         ctx.player = self.player
         ctx.this_obj = self.this_obj
@@ -191,10 +197,24 @@ def run_npc_event(npc, event: str, server=None, player=None, source=None,
     shared Context per NPC).
 
     Returns the Context (or None if the NPC has no GS1 program).
+
+    Classes the script `join`ed run the same event after the NPC's own script
+    (NPC.cpp:678-693 NPC::executeEvents), see _run_joined_classes.
     """
     prog = getattr(npc, "gs1_program", None)
     if prog is None:
         return None
+    ctx = _run_npc_program(npc, prog, event, server, player, source,
+                           carryobject_type, params)
+    if getattr(npc, "_gs1_joined", None):
+        _run_joined_classes(npc, ctx, event, server, player, source,
+                            carryobject_type, params)
+    return ctx
+
+
+def _run_npc_program(npc, prog, event, server, player, source,
+                     carryobject_type, params):
+    """The NPC's own script for one event (the body of run_npc_event)."""
 
     from .host import GS1Host
     host = getattr(server, "gs1_host", None) or GS1Host(server)
@@ -225,6 +245,8 @@ def run_npc_event(npc, event: str, server=None, player=None, source=None,
     ctx = _ensure_gs1_ctx(npc, host)
     _bind_fresh_gs1_call(ctx, npc, server, player, event, source,
                          carryobject_type, params)
+    ctx.functions = _main_functions(ctx)
+    merge_joined_functions(npc, server, ctx.functions)
     try:
         resumable = ServerInterpreter(ctx).run_event_resumable(prog, event)
     except Exception as e:
@@ -243,18 +265,159 @@ def run_npc_event(npc, event: str, server=None, player=None, source=None,
     return ctx
 
 
+# -- joined script classes ---------------------------------------------------
+# `join <class>` (GS1Commands.cpp:1597 fn_join -> NPC::joinClass,
+# NPC.cpp:854) attaches a server script class to the NPC. The reference then
+# (a) runs every event through each joined class's script after the NPC's own
+# script (NPC::executeEvents, NPC.cpp:678-693) and (b) resolves a user
+# function the NPC's script does not define in its joined classes
+# (GS1Visitor::visitStatementUserFunctionCall, GS1Visitor.cpp:1033-1044).
+
+def class_program(server, name):
+    """Compiled serverside GS1 half of the script class `name`, or None.
+
+    The program is cached on the class's script object (a reloaded class is a
+    new object, so edits take effect). False marks "not GS1 / empty"."""
+    manager = getattr(server, "gs2_manager", None)
+    getter = getattr(manager, "get_class", None)
+    script = getter(name) if getter is not None else None
+    if script is None:
+        return None
+    cached = getattr(script, "_gs1_class_program", None)
+    if cached is not None:
+        return cached or None
+    from reborn_protocol.gs2.detect import looks_like_gs2
+    from ..npc import split_gs1_script
+    server_half = split_gs1_script(getattr(script, "source", "") or "", True)[0]
+    program = None
+    if server_half.strip() and not looks_like_gs2(server_half):
+        program = compile_gs1(server_half)
+    script._gs1_class_program = program if program is not None else False
+    return program
+
+
+def _main_functions(ctx):
+    """The NPC script's own user-function table (stable per Context)."""
+    table = getattr(ctx, "_gs1_main_functions", None)
+    if table is None:
+        table = ctx.functions
+        ctx._gs1_main_functions = table
+    return table
+
+
+def merge_joined_functions(npc, server, table):
+    """Add the joined classes' functions to `table` without overriding a
+    function that is already defined there (own script wins)."""
+    for name in getattr(npc, "_gs1_joined", None) or ():
+        program = class_program(server, name)
+        if program is None:
+            continue
+        for stmt in program.body:
+            if isinstance(stmt, gs1_ast.FuncDef):
+                table.setdefault(stmt.name, stmt)
+
+
+def _run_joined_classes(npc, ctx, event, server, player, source,
+                        carryobject_type, params):
+    pending = npc.__dict__.setdefault("_gs1_class_pending", {})
+    main = _main_functions(ctx)
+    try:
+        for name in list(npc._gs1_joined):
+            program = class_program(server, name)
+            if program is None:
+                continue
+            held = pending.get(name)
+            if held is not None and held.resumable.done:
+                pending.pop(name, None)
+                held = None
+            try:
+                if event == "timeout" and held is not None:
+                    ctx.written_players = {}
+                    held.apply()
+                    held.resumable.resume()
+                    if held.resumable.done:
+                        pending.pop(name, None)
+                    elif hasattr(npc, "set_timer"):
+                        npc.set_timer(held.resumable.pending_sleep)
+                    _flush_event_players(ctx, held.player)
+                    continue
+                _bind_fresh_gs1_call(ctx, npc, server, player, event, source,
+                                     carryobject_type, params)
+                table = {}
+                merge_joined_functions(npc, server, table)
+                ctx.functions = table
+                resumable = ServerInterpreter(ctx).run_event_resumable(
+                    program, event)
+                if not resumable.done:
+                    pending[name] = _PendingGS1Sleep(resumable, ctx)
+                    if hasattr(npc, "set_timer"):
+                        npc.set_timer(resumable.pending_sleep)
+                _flush_event_players(ctx, player)
+            except Exception as e:
+                from .host import _report_gs1_error
+                _report_gs1_error(
+                    f"event {event} in class {name} on npc "
+                    f"{getattr(npc, 'id', '?')}", e)
+                pending.pop(name, None)
+    finally:
+        ctx.functions = main
+
+
 def _flush_event_players(ctx, acting_player):
     """Flush every player mutated during this execution slice."""
     players = dict(getattr(ctx, "written_players", {}) or {})
     if acting_player is not None:
         players[id(acting_player)] = acting_player
     ctx.written_players = {}
+    server = getattr(ctx.host, "server", None)
     for player in players.values():
-        _flush_player_props(player)
+        _flush_player_props(player, server)
 
 
-def _flush_player_props(player):
-    """Send any player stat changes a script made to that player's client."""
+# Inventory counters stay with the owner; everything else a script
+# changes is also relayed to the other clients, as the reference does for each
+# modified prop (PlayerProps.cpp:1217-1239 sendPropsFromResults: NICKNAME to
+# everyone, the rest to the nearby level).
+
+def _other_form(player, prop_id, value):
+    """The OTHERPLPROPS value for `prop_id` (gear carries its image)."""
+    from ..protocol.constants import PLPROP
+    if prop_id == PLPROP.SWORDPOWER:
+        return (getattr(player, "sword_power", 0), getattr(player, "sword_image", ""))
+    if prop_id == PLPROP.SHIELDPOWER:
+        return (getattr(player, "shield_power", 0), getattr(player, "shield_image", ""))
+    return value
+
+
+async def _send_player_props(player, server, dirty):
+    from ..protocol.constants import PLPROP
+    from ..protocol.packets import build_other_player_props
+    await player.send_props(dirty)
+    if server is None:
+        server = getattr(player, "server", None)
+    private = {PLPROP.RUPEESCOUNT, PLPROP.ARROWSCOUNT, PLPROP.BOMBSCOUNT}
+    others = {pid: _other_form(player, pid, value)
+              for pid, value in dirty.items() if pid not in private}
+    if not others or server is None:
+        return
+    me = getattr(player, "id", None)
+    exclude = {me} if me is not None else None
+    if PLPROP.NICKNAME in others and hasattr(server, "broadcast_to_all"):
+        await server.broadcast_to_all(build_other_player_props(
+            me, {PLPROP.NICKNAME: others.pop(PLPROP.NICKNAME)}), exclude=exclude)
+    level = getattr(player, "level", None)
+    if not others or level is None:
+        return
+    packet = build_other_player_props(me, others)
+    cast = (getattr(server, "broadcast_to_world", None)
+            or getattr(server, "broadcast_to_level", None))
+    if cast is not None:
+        await cast(level.name, packet, exclude=exclude)
+
+
+def _flush_player_props(player, server=None):
+    """Send any player stat changes a script made: to that player's client and
+    to the other clients that can see the player."""
     if player is None:
         return
     dirty = getattr(player, "_gs1_dirty_props", None)
@@ -264,8 +427,8 @@ def _flush_player_props(player):
     if not hasattr(player, "send_props"):
         return
     try:
-        import asyncio
-        asyncio.get_running_loop().create_task(player.send_props(dirty))
+        asyncio.get_running_loop().create_task(
+            _send_player_props(player, server, dirty))
     except RuntimeError:
         pass  # no running loop (e.g. unit test) — state is set, just not pushed
 

@@ -555,15 +555,27 @@ class BaddyManager:
 
         # Spawn drop
         level = self.server.world.get_level(baddy.level_name)
-        if level and hasattr(self.server, 'item_manager'):
-            # GServer-v2 LevelBaddy.cpp:93: uniform 0..11; 0..5 map
-            # directly to item IDs, 6..9 are green, 10..11 drop nothing.
-            roll = random.randint(0, 11)
+        if (level and hasattr(self.server, 'item_manager')
+                and getattr(getattr(self.server, 'config', None), 'baddyitems', False)):
+            # server/src/level/LevelBaddy.cpp:97-125,292-293.
+            from .protocol.constants import LevelItemType
+            roll = random.randint(0, 100)
+            item_type = None
             if roll < 10:
-                from .protocol.constants import LevelItemType
+                item_type = LevelItemType.GREENRUPEE
+            else:
+                roll -= 10
+                if roll < 5:
+                    item_type = LevelItemType.BLUERUPEE
+                else:
+                    roll -= 15
+                    if roll < 15:
+                        item_type = LevelItemType.HEART
+                    elif roll < 45 and int(baddy.baddy_type) in (3, 4, 9):
+                        item_type = LevelItemType.DARTS
+            if item_type is not None:
                 await self.server.item_manager.spawn_item(
-                    level, baddy.x, baddy.y,
-                    LevelItemType(roll if roll <= 5 else 0)
+                    level, baddy.x, baddy.y, item_type
                 )
 
         logger.info(f"Baddy {baddy.id} died, killed by player {killer.id if killer else 'unknown'}")

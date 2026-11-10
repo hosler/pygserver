@@ -88,11 +88,15 @@ def build_rc_player_props(player_id: int, account: str, props: bytes,
     return builder.build()
 
 
-def build_rc_player_rights(account: str, rights: int) -> bytes:
+def build_rc_player_rights(account: str, rights: int, admin_ip: str = "",
+                           folders: str = "") -> bytes:
     """Build PLO_RC_PLAYERRIGHTSGET packet."""
     builder = PacketBuilder().write_gchar(PLO.RC_PLAYERRIGHTSGET)
     builder.write_gstring(account)
-    builder.write_gint3(rights)
+    # PlayerRCPackets.cpp:831
+    builder.write_gint5(rights)
+    builder.write_gstring(admin_ip)
+    builder.write_gstring_short(folders)
     builder.write_newline()
     return builder.build()
 
@@ -154,7 +158,7 @@ def build_rc_file_browser_dir_list(folders: Sequence[str]) -> bytes:
 
 
 def build_rc_file_browser_dir(path: str, files: Sequence[Any],
-                              rights: str = "rw") -> bytes:
+                              rights: Any = "rw") -> bytes:
     """Build PLO_RC_FILEBROWSER_DIR with length-prefixed file blocks.
 
     Args:
@@ -177,7 +181,10 @@ def build_rc_file_browser_dir(path: str, files: Sequence[Any],
         # The reference wildcard listing omits directories.  Keep them usable
         # in this hierarchical browser by marking their names with a trailing
         # slash and encoding them as zero-sized, read-only file blocks.
-        entry_rights = "r" if is_directory else rights
+        entry_rights = (rights.get(filename, "")
+                        if isinstance(rights, Mapping) else rights)
+        if is_directory:
+            entry_rights = "r"
         if is_directory and not filename.endswith("/"):
             filename += "/"
         entry = PacketBuilder().write_gstring(filename)
@@ -228,11 +235,29 @@ def build_nc_level_list(levels: List[str]) -> bytes:
     return builder.build()
 
 
-def build_nc_npc_attributes(npc_id: int, attributes: str) -> bytes:
-    """Build PLO_NC_NPCATTRIBUTES packet."""
+def _csv(lines: List[str]) -> str:
+    from ...irc import gtokenize      # local: irc is above the protocol layer
+
+    return gtokenize(lines)
+
+
+def build_nc_npc_attributes(lines: List[str]) -> bytes:
+    """Build PLO_NC_NPCATTRIBUTES: the NPC variable dump as one toCSV row.
+
+    The reference sends `toCSV(npc->getVariableDump())` with no NPC id in front
+    (GServer-v2 PlayerNCPackets.cpp:57).
+    """
     builder = PacketBuilder().write_gchar(PLO.NC_NPCATTRIBUTES)
-    builder.write_gint3(npc_id)
-    builder.write_string(attributes)
+    builder.write_string(_csv(lines))
+    builder.write_newline()
+    return builder.build()
+
+
+def build_nc_level_dump(lines: List[str]) -> bytes:
+    """Build PLO_NC_LEVELDUMP: the level's NPC variable dumps, gtokenized
+    (PlayerNCPackets.cpp:553)."""
+    builder = PacketBuilder().write_gchar(PLO.NC_LEVELDUMP)
+    builder.write_string(_csv(lines))
     builder.write_newline()
     return builder.build()
 
@@ -260,19 +285,24 @@ def build_nc_npc_delete(npc_id: int) -> bytes:
 
 
 def build_nc_npc_script(npc_id: int, script: str) -> bytes:
-    """Build PLO_NC_NPCSCRIPT packet."""
+    """Build PLO_NC_NPCSCRIPT: `{INT id}` then the script as toCSV(lines).
+
+    PlayerNCPackets.cpp:109 sends `toCSV(source, "\\n")` raw after the id, with
+    no length prefix.
+    """
     builder = PacketBuilder().write_gchar(PLO.NC_NPCSCRIPT)
     builder.write_gint3(npc_id)
-    builder.write_gstring_short(script)
+    builder.write_string(_csv(script.split("\n")))
     builder.write_newline()
     return builder.build()
 
 
-def build_nc_npc_flags(npc_id: int, flags: str) -> bytes:
-    """Build PLO_NC_NPCFLAGS packet."""
+def build_nc_npc_flags(npc_id: int, flags: List[str]) -> bytes:
+    """Build PLO_NC_NPCFLAGS: `{INT id}` then toCSV(["flag", "flag=value"...])
+    (PlayerNCPackets.cpp:180)."""
     builder = PacketBuilder().write_gchar(PLO.NC_NPCFLAGS)
     builder.write_gint3(npc_id)
-    builder.write_string(flags)
+    builder.write_string(_csv(flags))
     builder.write_newline()
     return builder.build()
 

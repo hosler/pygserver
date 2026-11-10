@@ -18,6 +18,7 @@ def arena():
     level = Level('arena.nw')
     players = {}
     server = SimpleNamespace(
+        config=SimpleNamespace(baddyitems=True),
         world=SimpleNamespace(get_level=lambda name: level,
                               get_gmap_for_level=lambda name: None),
         get_player=players.get,
@@ -283,8 +284,11 @@ def test_baddy_die_delay_then_dead_then_respawn():
     asyncio.run(run())
 
 
-@pytest.mark.parametrize('baddy_type', [BaddyType.GRAYBALL, BaddyType.REDBALL])
-@pytest.mark.parametrize('roll,drop', list(enumerate([0, 1, 2, 3, 4, 5, 0, 0, 0, 0, None, None])))
+@pytest.mark.parametrize('baddy_type', list(BaddyType))
+@pytest.mark.parametrize('roll,drop', [
+    (0, 0), (9, 0), (10, 1), (14, 1), (15, 5), (24, 5),
+    (25, 5), (39, 5), (40, 4), (69, 4), (70, None), (100, None),
+])
 def test_baddy_uniform_drop_roll_mapping(baddy_type, roll, drop):
     async def run():
         server, level, combat, player = arena()
@@ -293,10 +297,28 @@ def test_baddy_uniform_drop_roll_mapping(baddy_type, roll, drop):
         with patch('pygserver.baddy.random.randint', return_value=roll) as random_roll:
             await manager.handle_baddy_death(baddy)
             await manager.handle_baddy_death(baddy)
-        random_roll.assert_called_once_with(0, 11)
-        if drop is None:
+        random_roll.assert_called_once_with(0, 100)
+        expected = None if drop == 4 and int(baddy_type) not in (3, 4, 9) else drop
+        if expected is None:
             server.item_manager.spawn_item.assert_not_awaited()
         else:
             server.item_manager.spawn_item.assert_awaited_once_with(
-                level, 10, 10, LevelItemType(drop))
+                level, 10, 10, LevelItemType(expected))
+    asyncio.run(run())
+
+
+@pytest.mark.parametrize('configured', [False, None])
+def test_baddy_items_disabled_or_missing_skips_drop_roll(configured):
+    async def run():
+        server, level, _, _ = arena()
+        if configured is None:
+            del server.config.baddyitems
+        else:
+            server.config.baddyitems = configured
+        baddy = Baddy(1, level.name, BaddyType.GRAYBALL, 10, 10)
+        with patch('pygserver.baddy.random.randint') as random_roll:
+            await BaddyManager(server).handle_baddy_death(baddy)
+        random_roll.assert_not_called()
+        server.item_manager.spawn_item.assert_not_awaited()
+        assert baddy.dead
     asyncio.run(run())

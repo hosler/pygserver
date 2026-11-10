@@ -6,9 +6,11 @@ importing pyReborn, since pygserver's CI only checks out reborn-protocol.
 """
 
 import asyncio
+import zlib
 from pathlib import Path
 
 import pytest
+from reborn_protocol.gs2.detect import looks_like_gs2
 
 from pygserver.gs2 import (
     GS2Compiler,
@@ -22,9 +24,11 @@ from pygserver.gs2 import (
 )
 from pygserver.protocol.constants import PLO
 from pygserver.protocol.packets import (
+    PacketBuilder,
     build_load_script_bytecode,
     build_load_script_header,
     build_npc_weapon_script,
+    build_npc_weapon_add_scripted,
     build_raw_data_announcement,
 )
 
@@ -32,7 +36,7 @@ WEAPON_FIXTURE = Path(__file__).parent.parent / "weapons" / "weaponqa%095gs2vm.t
 CLASS_FIXTURE = Path(__file__).parent.parent / "scripts" / "qa_gs2vmclass.txt"
 
 # Bytecode stand-in that contains 0x0a in several places: the exact shape that
-# truncates when PLO_NPCWEAPONSCRIPT is sent without PLO_RAWDATA framing.
+# truncates when PLO_WEAPONBYTECODE2 is sent without PLO_RAWDATA framing.
 BINARY_BYTECODE = bytes(range(256)) * 3
 
 #: A PLO_RAWDATA announcement is always [gchar id][gint3 size][\n].
@@ -123,16 +127,41 @@ def test_to_csv_quotes_and_doubles_only_complex_fields():
 
 
 def test_weapon_header_carries_a_decimal_crc_and_class_a_gint5_one():
-    weapon = GS2Script(kind="weapon", name="w")
+    weapon = GS2Script(kind="weapon", name="w", bytecode=BINARY_BYTECODE)
     weapon.build_headers("script body")
     klass = GS2Script(kind="class", name="c")
     klass.build_headers("script body")
 
     assert weapon.header_with_crc == weapon.header + "," + str(weapon.checksum)
     assert weapon.header_with_crc.rsplit(",", 1)[1].isdigit()
+    assert weapon.checksum == zlib.crc32(BINARY_BYTECODE) & 0xffffffff
+    assert weapon.checksum != zlib.crc32(b"script body") & 0xffffffff
+    assert klass.checksum == zlib.crc32(b"script body") & 0xffffffff
+    assert weapon.des_key == klass.des_key
     # ScriptClass puts its GINT5 checksum in the one header it ever sends.
     assert klass.header == klass.header_with_crc
     assert len(klass.header.rsplit(",", 1)[1].strip('"')) == 5
+
+
+def test_weapon_without_bytecode_has_zero_crc():
+    weapon = GS2Script(kind="weapon", name="empty")
+    weapon.build_headers("nonempty source")
+
+    assert weapon.checksum == 0
+    assert weapon.header_with_crc == weapon.header + ",0"
+
+
+@pytest.mark.parametrize('classes', ['', 'helpers,shared'])
+def test_compiled_weapon_class_property_is_present_only_when_nonempty(classes):
+    from pygserver.protocol.constants import NPCPROP
+    expected = (PacketBuilder().write_gchar(PLO.NPCWEAPONADD)
+                .write_gstring("wand").write_gchar(NPCPROP.IMAGE)
+                .write_gstring("wand.png"))
+    if classes:
+        expected.write_gchar(NPCPROP.CLASS).write_gstring_short(classes)
+
+    assert build_npc_weapon_add_scripted("wand", "wand.png", classes) == (
+        expected.write_newline().build())
 
 
 # =============================================================================
@@ -150,7 +179,7 @@ def test_weapon_script_packet_survives_newlines_in_the_bytecode():
             + (announcement[3] - 32))
     assert size == len(packet)
 
-    body = strip_frame(packet, PLO.NPCWEAPONSCRIPT)
+    body = strip_frame(packet, PLO.WEAPONBYTECODE2)
     header_len = read_gshort(body, 0)
     assert body[2:2 + header_len] == b"weapon,qa,1,key"
     assert body[2 + header_len:] == BINARY_BYTECODE
@@ -178,6 +207,7 @@ def test_load_script_header_packet_is_bare_csv():
 class FakeConfig:
     def __init__(self, weapons_dir):
         self.weapons_dir = str(weapons_dir)
+        self.serverside = True
 
 
 class FakeFileSystem:
@@ -288,8 +318,178 @@ def test_send_weapon_bytecode_announces_the_packet_length(tmp_path):
     announcement = build_raw_data_announcement(len(stream) - ANNOUNCEMENT_SIZE)
     assert stream.startswith(announcement)
     packet = stream[ANNOUNCEMENT_SIZE:]
-    assert packet[0] == PLO.NPCWEAPONSCRIPT + 32
+    assert packet[0] == PLO.WEAPONBYTECODE2 + 32
     assert packet.endswith(BINARY_BYTECODE + b"\n")
+
+
+def test_weapon_load_and_upsert_recompute_bytecode_crc(tmp_path):
+    write_fixtures(tmp_path)
+    manager = make_manager(tmp_path, compiler_available=False)
+    compiled = iter([b"first bytecode", b"replacement bytecode"])
+    manager.compiler.compile = lambda source, name: next(compiled)
+    path = tmp_path / "weapons" / WEAPON_FIXTURE.name
+    manager._load_file(path, 'weapon')
+    first = manager.get_weapon("qa_gs2vm")
+
+    assert first.checksum == zlib.crc32(b"first bytecode") & 0xffffffff
+    assert first.header_with_crc.endswith("," + str(first.checksum))
+
+    replacement = manager.upsert_weapon(
+        "qa_gs2vm", "new.png", "function onCreated() { this.x = 2; }")
+
+    assert replacement.checksum == zlib.crc32(b"replacement bytecode") & 0xffffffff
+    assert replacement.checksum != first.checksum
+    assert replacement.checksum != zlib.crc32(replacement.source.encode()) & 0xffffffff
+    assert replacement.header_with_crc.endswith("," + str(replacement.checksum))
+
+
+def test_toweapons_upsert_rebuilds_empty_bytecode_crc(tmp_path):
+    manager = make_manager(tmp_path, compiler_available=False)
+    first = manager.upsert_classic_weapon("wand", "", "if (weaponfired) { show; }")
+    second = manager.upsert_classic_weapon("wand", "", "if (weaponfired) { hide; }")
+
+    assert second is not first
+    assert first.checksum == second.checksum == 0
+    assert second.header_with_crc == second.header + ",0"
+    assert first.des_key != second.des_key
+
+
+def test_explicit_classic_weapon_keeps_function_source(tmp_path):
+    from pygserver.protocol.packets import build_npc_weapon_add
+    manager = make_manager(tmp_path, compiler_available=False)
+    source = 'function onCreated() { message hello; }'
+    weapon = manager.upsert_classic_weapon('classic', '', source)
+    player = FakePlayer()
+
+    assert run(manager.announce_weapon(player, weapon.name))
+
+    assert weapon.clientside == source
+    assert player.sent == [build_npc_weapon_add('classic', '', source)]
+
+
+@pytest.mark.parametrize('serverside', [False, True])
+@pytest.mark.parametrize('directory', [
+    'Preagonal/graal-bomber-gs1/weapons',
+    'Preagonal/graal-gta/weapons',
+], ids=['bomber', 'city'])
+def test_reference_classic_weapons_keep_clientside_source(
+        tmp_path, serverside, directory):
+    directory = Path(__file__).resolve().parents[2] / directory
+    if not directory.is_dir():
+        pytest.skip('reference weapon directory is absent')
+    manager = make_manager(tmp_path, compiler_available=False)
+    manager.server.config.serverside = serverside
+    manager.compiler.compile = lambda source, name: None
+    paths = sorted(directory.iterdir())
+    assert paths
+
+    for path in paths:
+        if not path.is_file():
+            continue
+        parsed = parse_weapon_file(path.read_text(encoding='latin-1'))
+        if parsed is None:
+            continue
+        name, _, source = parsed
+        _, clientside = split_clientside(source)
+        manager._load_file(path, 'weapon')
+        weapon = manager.get_weapon(name)
+        assert weapon is not None, path.name
+        if clientside and (not serverside or not looks_like_gs2(clientside)):
+            assert weapon.clientside == clientside, path.name
+
+
+@pytest.mark.parametrize('serverside', [False, True])
+def test_classic_function_weapon_survives_save_and_reload(tmp_path, serverside):
+    manager = make_manager(tmp_path, compiler_available=False)
+    manager.server.config.serverside = serverside
+    source = ('//#CLIENTSIDE\nif (weaponfired) { cast(); }\n'
+              'function cast() { message hello; }')
+    assert not looks_like_gs2(source)
+    original = manager.upsert_classic_weapon('wand', 'wand.png', source)
+    manager.load()
+    reloaded = manager.get_weapon('wand')
+
+    assert reloaded is not original
+    assert reloaded.clientside == original.clientside == split_clientside(source)[1]
+
+
+@pytest.mark.parametrize('cached', [False, True])
+def test_without_npc_server_keeps_gs2_source_and_skips_compilation(
+        tmp_path, cached):
+    from unittest.mock import Mock
+    write_fixtures(tmp_path)
+    if cached:
+        (tmp_path / 'weapons' / WEAPON_FIXTURE.name).with_suffix('.gs2bc').write_bytes(
+            BINARY_BYTECODE)
+    manager = make_manager(tmp_path, compiler_available=False)
+    manager.server.config.serverside = False
+    manager.compiler.compile = Mock(return_value=None)
+
+    manager.load()
+
+    for script in [manager.get_weapon('qa_gs2vm'), manager.get_class('qa_gs2vmclass')]:
+        assert looks_like_gs2(script.clientside)
+        assert script.clientside == split_clientside(script.source)[1]
+        assert script.bytecode == b''
+    manager.compiler.compile.assert_not_called()
+
+
+@pytest.mark.parametrize('compiler_available', [True, False])
+def test_failed_gs2_compile_sends_empty_weapon_and_no_class_source(
+        tmp_path, compiler_available):
+    from pygserver.protocol.packets import build_npc_weapon_add
+    write_fixtures(tmp_path)
+    manager = make_manager(tmp_path, compiler_available=compiler_available)
+    assert manager.server.config.serverside is True
+    manager.compiler.compile = lambda source, name: None
+
+    manager.load()
+    weapon = manager.get_weapon("qa_gs2vm")
+    klass = manager.get_class("qa_gs2vmclass")
+    player = FakePlayer()
+    assert run(manager.announce_weapon(player, weapon.name))
+    run(manager.send_class_bytecode(player, klass.name))
+
+    assert weapon.bytecode == klass.bytecode == b""
+    assert weapon.clientside == klass.clientside == ''
+    assert weapon.checksum == 0
+    assert player.sent == [build_npc_weapon_add(weapon.name, weapon.image, '')]
+    assert b'function' not in b''.join(player.sent)
+
+
+@pytest.mark.parametrize('source', [
+    'if (weaponfired) { setani cast; }',
+    'if (weaponfired) { message function onCreated(); }',
+])
+def test_gs1_weapon_retains_source_when_gs2_compiler_rejects_it(tmp_path, source):
+    from pygserver.protocol.packets import build_npc_weapon_add
+    manager = make_manager(tmp_path, compiler_available=False)
+    manager.compiler.compile = lambda source, name: None
+
+    weapon = manager.upsert_weapon('classic', 'wand.png', source)
+    player = FakePlayer()
+    assert run(manager.announce_weapon(player, weapon.name))
+
+    assert weapon.clientside == source
+    assert player.sent == [build_npc_weapon_add('classic', 'wand.png', source)]
+
+
+def test_failed_recompile_removes_old_weapon_bytecode_and_crc(tmp_path):
+    manager = make_manager(tmp_path, compiler_available=False)
+    manager.compiler.compile = lambda source, name: BINARY_BYTECODE
+    first = manager.upsert_weapon('wand', '', 'function onCreated() { show(); }')
+    manager.compiler.compile = lambda source, name: None
+
+    second = manager.upsert_weapon('wand', '', 'function onCreated() { hide(); }')
+    player = FakePlayer()
+    assert run(manager.announce_weapon(player, second.name))
+
+    assert first.bytecode == BINARY_BYTECODE
+    assert second.bytecode == b''
+    assert second.checksum == 0
+    assert second.header_with_crc.endswith(',0')
+    assert second.clientside == ''
+    assert b'function' not in b''.join(player.sent)
 
 
 def test_unknown_weapon_is_not_answered(tmp_path):
@@ -308,7 +508,7 @@ def test_unknown_class_gets_the_empty_bytecode_stub(tmp_path):
 
     run(manager.send_class_bytecode(player, "nosuchclass"))
 
-    body = strip_frame(player.sent[0], PLO.NPCWEAPONSCRIPT)
+    body = strip_frame(player.sent[0], PLO.WEAPONBYTECODE2)
     header_len = read_gshort(body, 0)
     assert body[2:2 + header_len].startswith(b"class,nosuchclass,1,")
     assert body[2 + header_len:] == b""
@@ -329,7 +529,7 @@ def test_matching_class_checksum_sends_nothing(tmp_path):
     assert len(player.sent) == 1
 
 
-def test_classic_class_is_sent_as_source_with_empty_cache(tmp_path):
+def test_class_without_bytecode_sends_no_source_with_empty_cache(tmp_path):
     (tmp_path / "weapons").mkdir()
     scripts = tmp_path / "scripts"
     scripts.mkdir()
@@ -346,10 +546,8 @@ def test_classic_class_is_sent_as_source_with_empty_cache(tmp_path):
 
     run(manager.send_class_bytecode(player, "classicclass", 0))
 
-    packet = player.sent[0][ANNOUNCEMENT_SIZE:]
-    body = strip_frame(packet, PLO.LOADSCRIPT)
-    header_len = body[0] - 32
-    assert body[1 + header_len:] == source.strip().encode("latin-1")
+    assert manager.get_class("classicclass").bytecode == b""
+    assert player.sent == []
 
 
 def test_announce_weapon_sends_the_add_then_the_header(tmp_path):

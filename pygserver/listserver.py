@@ -579,9 +579,6 @@ class ServerListClient:
 
         await self._send_packet(packet.build())
 
-        # Notify player that list server is connected
-        await player.send_packet(PLO.SERVERLISTCONNECTED)
-
     async def remove_player(self, player: 'Player'):
         """Remove a player from the list server."""
         if not self.connected:

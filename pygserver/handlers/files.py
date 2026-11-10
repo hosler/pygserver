@@ -45,7 +45,7 @@ class FileHandlers:
 
     # The three script requests below all answer with compiled bytecode, so the
     # GS2 manager owns them outright; there is no text fallback to drop back to
-    # (PLO_GANISCRIPT/PLO_NPCWEAPONSCRIPT/PLO_LOADSCRIPT payloads are bytecode,
+    # (PLO_GANISCRIPT/PLO_WEAPONBYTECODE2/PLO_LOADSCRIPT payloads are bytecode,
     # and script text posted into one of them is parsed as a container header).
 
     @handles(PLI.UPDATEGANI)

@@ -75,6 +75,11 @@ class ServerConfig:
     # Script mode: GServer-v2/server/src/scripting/Script.cpp:430-434;
     # option name from GServer-v2/bin/servers/default/config/serveroptions.txt:305.
     serverside: bool = True
+    baddyitems: bool = False
+    # Server.h:172: rejects client Z changes (PlayerProps.cpp:495-500).
+    lockplayerz: bool = False
+    # Server.h:165: Player::addWeapon(LevelItemType) is a no-op when off.
+    defaultweapons: bool = True
 
     # Builtin triggeractions (GServer-v2/server/include/Server.h:143-150).
     triggerhack_weapons: bool = False
@@ -198,6 +203,9 @@ class ServerConfig:
                             config.putnpc_enabled = scalar.lower() == 'true'
                         elif key in (
                             'serverside',
+                            'baddyitems',
+                            'lockplayerz',
+                            'defaultweapons',
                             'triggerhack_weapons', 'triggerhack_groups',
                             'triggerhack_guilds', 'triggerhack_rc',
                             'triggerhack_levels', 'triggerhack_props',
@@ -243,7 +251,7 @@ class ServerConfig:
             f.write(f"# pygserver configuration\n")
             f.write(f"name = {self.name}\n")
             f.write(f"description = {self.description}\n")
-            f.write(f"port = {self.port}\n")
+            f.write(f"serverport = {self.port}\n")
             f.write(f"staff = {','.join(self.staff)}\n")
             f.write(f"noverifylogin = {str(not self.verify_login).lower()}\n")
             f.write(f"startlevel = {self.start_level}\n")
@@ -253,10 +261,14 @@ class ServerConfig:
             f.write(f"heartlimit = {self.heart_limit}\n")
             f.write(f"apsystem = {str(self.apsystem).lower()}\n")
             f.write(f"dontupdateratingd = {str(self.dontupdateratingd).lower()}\n")
+            f.write(f"putnpcenabled = {str(self.putnpc_enabled).lower()}\n")
             for band, seconds in enumerate(self.aptime):
                 f.write(f"aptime{band} = {seconds}\n")
             for key in (
                 'serverside',
+                'baddyitems',
+                'lockplayerz',
+                'defaultweapons',
                 'triggerhack_weapons', 'triggerhack_groups',
                 'triggerhack_guilds', 'triggerhack_rc', 'triggerhack_levels',
                 'triggerhack_props', 'triggerhack_execscript', 'triggerhack_files',

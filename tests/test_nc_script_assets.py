@@ -1,6 +1,7 @@
 """NC weapon and class editing through the persistent GS2 script store."""
 
 import asyncio
+import zlib
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -21,7 +22,7 @@ def make_nc(tmp_path):
     weapons.mkdir()
     scripts.mkdir()
     server = SimpleNamespace(
-        config=SimpleNamespace(weapons_dir=str(weapons)),
+        config=SimpleNamespace(weapons_dir=str(weapons), serverside=True),
         npc_manager=None,
         get_all_players=lambda: [],
     )
@@ -58,6 +59,28 @@ def test_weapon_nc_round_trip_and_replacement_persists(tmp_path):
     run(nc._handle_weapon_delete(session, b"bow"))
     assert server.gs2_manager.get_weapon("bow") is None
     assert not Path(weapon.source_path).exists()
+
+
+def test_weapon_add_refreshes_list_only_for_new_name(tmp_path):
+    nc, session, server = make_nc(tmp_path)
+    compiled = iter([b"first bytecode", b"updated bytecode"])
+    server.gs2_manager.compiler.compile = lambda source, name: next(compiled)
+
+    run(nc._handle_weapon_add(session, weapon_add("wand", "a.png", "show();")))
+
+    reply = session.player.send_raw.await_args.args[0]
+    assert reply[0] == PLO.NC_WEAPONLISTGET + 32
+    assert b"wand" in reply
+    assert server.gs2_manager.get_weapon("wand").checksum == zlib.crc32(b"first bytecode")
+    session.player.send_raw.reset_mock()
+
+    run(nc._handle_weapon_add(session, weapon_add("WAND", "b.png", "hide();")))
+
+    session.player.send_raw.assert_not_awaited()
+    weapon = server.gs2_manager.get_weapon("wand")
+    assert weapon.image == "b.png"
+    assert weapon.checksum == zlib.crc32(b"updated bytecode")
+    assert weapon.header_with_crc.endswith("," + str(weapon.checksum))
 
 
 def test_class_nc_round_trip(tmp_path):
