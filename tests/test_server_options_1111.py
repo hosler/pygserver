@@ -76,14 +76,14 @@ def login(server, name, client_type, player_id=2):
 
 def test_onlystaff_refuses_a_non_staff_client_with_the_reference_message():
     server = make_server(onlystaff=True)
-    player = login(server, "mallory", 0)
+    player = login(server, "mallory", 5)
     assert not player.logged_in
     player.disconnect.assert_awaited_once_with(STAFF_ONLY)
     player.warp.assert_not_awaited()
     player.login_service.send_login_response.assert_not_awaited()
 
 
-@pytest.mark.parametrize("client_type", [0, 5])  # CLIENT, CLIENT3
+@pytest.mark.parametrize("client_type", [5])  # CLIENT3
 def test_onlystaff_admits_staff_clients_case_insensitively(client_type):
     server = make_server(onlystaff=True)
     player = login(server, "ADMIN", client_type)
@@ -93,7 +93,7 @@ def test_onlystaff_admits_staff_clients_case_insensitively(client_type):
 
 def test_onlystaff_off_admits_everyone():
     server = make_server(onlystaff=False)
-    player = login(server, "mallory", 0)
+    player = login(server, "mallory", 5)
     assert player.logged_in
     player.disconnect.assert_not_awaited()
 
@@ -124,14 +124,27 @@ def test_onlystaff_staff_lookalike_account_names_are_refused(account):
     player.disconnect.assert_awaited_once_with(STAFF_ONLY)
 
 
-@pytest.mark.parametrize("client_type", [2, 8, 7])  # slots for NPCSERVER, EXTERNAL, WEB... any
-def test_onlystaff_refuses_non_staff_on_every_connection_type(client_type):
-    # The reference tests client types only; here no type is exempt, so a
-    # login type that is neither client, RC nor NC cannot walk past the gate.
+@pytest.mark.parametrize("name", ["mallory", "admin"])
+@pytest.mark.parametrize("client_type", [2, 7, 8])  # NPCSERVER, unassigned, WEB
+def test_onlystaff_unsupported_login_types_are_dropped_and_touch_no_account(
+        tmp_path, client_type, name):
+    # PlayerLogin.cpp:79-83: an unserved type is dropped without a reply,
+    # before onlystaff is even consulted, staff name or not, and the stored
+    # account it names is neither loaded nor written.
+    from pygserver.account import Account, AccountManager
     server = make_server(onlystaff=True)
-    player = login(server, "mallory", client_type)
+    server.account_manager = AccountManager(server, str(tmp_path / "accounts"))
+    server.account_manager._save_account(Account(name, rupees=777))
+    server.account_manager._save_executor.submit(lambda: None).result()
+    path = tmp_path / "accounts" / f"{name}.json"
+    before = path.read_bytes()
+    player = login(server, name, client_type)
+    asyncio.run(player._cleanup())
+    server.account_manager._save_executor.submit(lambda: None).result()
     assert not player.logged_in
-    assert player.disconnect.await_args.args[0] in (STAFF_ONLY, RC_REFUSAL)
+    player.disconnect.assert_not_awaited()
+    assert player.account_name == ""
+    assert path.read_bytes() == before
 
 
 @pytest.mark.parametrize("client_type", [1, 3, 6])  # RC, NC, RC2
@@ -155,7 +168,7 @@ def test_onlystaff_staff_without_admin_ip_can_still_play_as_client():
     # Only RC and NC need the admin-IP match (Player.cpp:689); a staff client
     # does not, as long as the account has no IP range of its own.
     server = make_server(onlystaff=True, ip_range="")
-    player = login(server, "admin", 0)
+    player = login(server, "admin", 5)
     assert player.logged_in
 
 
@@ -309,7 +322,7 @@ def weapon_server(protected, weapons):
 
 def test_protected_weapons_are_granted_at_login_when_missing():
     server = weapon_server(["Beer", "bomb", "Missing"], ["Beer"])
-    player = login(server, "mallory", 0)
+    player = login(server, "mallory", 5)
     assert player.logged_in
     # `Missing` names no weapon on the server, so nothing is granted for it
     # (Player.cpp:1103-1107); `bomb` is a built-in weapon.
@@ -334,7 +347,7 @@ def test_protected_weapon_already_owned_is_not_granted_twice():
 
 def test_nothing_is_granted_without_the_option():
     server = weapon_server([], ["Beer"])
-    player = login(server, "mallory", 0)
+    player = login(server, "mallory", 5)
     assert player.weapons == []
 
 
@@ -498,7 +511,7 @@ def test_blank_account_name_is_never_staff(staff, name):
 @pytest.mark.parametrize("staff", [("admin", ""), ("",)])
 def test_onlystaff_blank_name_is_refused_even_with_a_blank_staff_entry(staff, name):
     server = make_server(onlystaff=True, staff=staff)
-    player = login(server, name, 0)
+    player = login(server, name, 5)
     assert not player.logged_in
     player.disconnect.assert_awaited_once_with(STAFF_ONLY)
 
@@ -524,14 +537,14 @@ def test_refused_onlystaff_login_writes_no_account_file(tmp_path):
     from pygserver.account import AccountManager
     server = make_server(onlystaff=True)
     server.account_manager = AccountManager(server, str(tmp_path / "accounts"))
-    for name, client_type in (("mallory", 0), ("", 0), ("rcmallory", 1), ("ncmallory", 3)):
+    for name, client_type in (("mallory", 5), ("", 5), ("rcmallory", 1), ("ncmallory", 3)):
         player = login(server, name, client_type)
         assert not player.logged_in
     server.account_manager._save_executor.submit(lambda: None).result()
     accounts = tmp_path / "accounts"
     assert not accounts.exists() or list(accounts.iterdir()) == []
     # Staff still get their account.
-    player = login(server, "admin", 0, player_id=3)
+    player = login(server, "admin", 5, player_id=3)
     assert player.logged_in
     server.account_manager._save_executor.submit(lambda: None).result()
     assert [p.name for p in accounts.iterdir()] == ["admin.json"]

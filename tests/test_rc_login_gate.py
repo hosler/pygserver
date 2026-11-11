@@ -270,6 +270,7 @@ def test_staff_option_change_grants_no_rights(tmp_path):
     persist(manager, ops)
     refused = login(server, "ops", RC2, player_id=2)
     assert not admitted(server, refused)
+    refused.connected = False  # disconnect is mocked; a real refusal closes it
 
     server.config.staff = ["ops"]
     player = login(server, "ops", RC2, player_id=3)

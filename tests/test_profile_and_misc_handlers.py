@@ -8,6 +8,8 @@ import sys
 import os
 from unittest.mock import MagicMock, AsyncMock
 
+from reborn_protocol.constants import PLTYPE
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..'))
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), '../../reborn-protocol'))
 
@@ -278,6 +280,7 @@ class TestServerWarp:
 
         mock_server = MagicMock()
         target_player = MagicMock()
+        target_player.connection_type = PLTYPE.CLIENT3
         target_player.send_raw = AsyncMock()
         mock_server.players = {7: target_player}
 
@@ -295,6 +298,21 @@ class TestServerWarp:
         pkt_reader = PacketReader(sent)
         assert pkt_reader.read_gchar() == PLO.SERVERWARP
         assert pkt_reader.remaining() == b"raw-serverwarp-payload"
+
+    def test_server_info_reply_not_relayed_to_rc_or_nc(self):
+        from pygserver.listserver import ServerListClient
+        from pygserver.protocol.packets import PacketBuilder, PacketReader
+
+        for kind in (PLTYPE.RC, PLTYPE.RC2, PLTYPE.NC):
+            mock_server = MagicMock()
+            target = MagicMock()
+            target.connection_type = kind
+            target.send_raw = AsyncMock()
+            mock_server.players = {7: target}
+            payload = PacketBuilder().write_gshort(7).write_bytes(b"x").build()
+            asyncio.run(ServerListClient(mock_server)._handle_server_info(
+                PacketReader(payload)))
+            target.send_raw.assert_not_awaited()
 
     def test_request_server_info_sends_svo_serverinfo(self):
         from pygserver.listserver import ServerListClient

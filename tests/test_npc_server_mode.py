@@ -73,6 +73,7 @@ async def test_login_paths_announce_mode_before_warp_and_only_once(
     if entry_point == 'local':
         assert await player._handle_login()
     else:
+        player.account_name = 'hosler'  # set by _handle_login before verification
         await player.send_login()
     await player.send_login()
 

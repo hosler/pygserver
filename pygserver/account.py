@@ -471,16 +471,38 @@ class AccountManager:
         """
         self._save_account(account)
 
+    @staticmethod
+    def player_state_saveable(player: 'Player') -> bool:
+        """Whether this connection's state may be written into its account.
+
+        Player.cpp:358-362 and PlayerClient.cpp:271-272 save only a client
+        whose login completed (`m_loaded`) and whose account is not
+        `loadOnly`. RC and NC connections never save their own state, and a
+        refused or unverified login never loaded the account it named, so
+        writing its default state would wipe the stored one.
+        """
+        return (getattr(player, 'account_loaded', False) is True
+                and bool(player.connection_type & PLTYPE.ANYCLIENT))
+
+    def save_player(self, player: 'Player') -> bool:
+        """Save a connection's state into its account if it is saveable."""
+        if not self.player_state_saveable(player):
+            return False
+        account = self.get_account(player.account_name)
+        if account is None or account.load_only:
+            return False
+        self.save_player_to_account(player, account)
+        return True
+
     async def save_all_accounts(self):
         """Save all cached accounts to disk."""
         saved = set()
         for player in list(getattr(self.server, 'players', {}).values()):
-            if (not player.logged_in
-                    or not player.connection_type & PLTYPE.ANYCLIENT):
+            if not self.player_state_saveable(player):
                 continue
             name = player.account_name.lower()
             account = self._accounts.get(name)
-            if account is not None:
+            if account is not None and not account.load_only:
                 self.save_player_to_account(player, account)
                 saved.add(name)
         for name, account in self._accounts.items():

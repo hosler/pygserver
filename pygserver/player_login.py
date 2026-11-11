@@ -53,6 +53,14 @@ logger = logging.getLogger(__name__)
 # speaks a version we handle).
 KNOWN_PROTOCOLS = ('G3D0311C', 'G3D0511C', 'GNW03014')
 
+# Login type byte -> connection type, for the types this server serves.
+ACCEPTED_LOGIN_TYPES = {
+    5: PLTYPE.CLIENT3,
+    1: PLTYPE.RC,
+    3: PLTYPE.NC,
+    6: PLTYPE.RC2,
+}
+
 
 class LoginService:
     """Drives one player's login from the raw packet to the starting warp."""
@@ -96,19 +104,24 @@ class LoginService:
             else:
                 codec.set_key(login.get('encryption_key', 0))
 
+            # PlayerLogin.cpp:58-85 maps `1 << byte` onto the client, RC, NC
+            # and NPC-server classes and drops anything else without a reply.
+            # Bytes 0, 4 and 8 (CLIENT, CLIENT2, WEB) are older cipher
+            # generations (PlayerClient.cpp:301-316) that this 6.037-only
+            # server cannot honour, and it has no NPC-server login (byte 2).
+            # Checked before the account name is taken, so a dropped
+            # connection carries no identity at all.
+            raw_client_type = login.get('client_type', -1)
+            if raw_client_type not in ACCEPTED_LOGIN_TYPES:
+                logger.warning(
+                    f"Rejected login from {player.id}: unsupported type byte "
+                    f"{raw_client_type!r}")
+                return False
+            player.connection_type = ACCEPTED_LOGIN_TYPES[raw_client_type]
+
             # Store account info
             player.account_name = login.get('username', f'player_{player.id}')
             player.nickname = player.account_name
-            raw_client_type = login.get('client_type', 0)
-            candidate_type = PLTYPE(1 << raw_client_type) \
-                if isinstance(raw_client_type, int) and raw_client_type >= 0 \
-                else PLTYPE.CLIENT
-            valid_types = {
-                member for member in PLTYPE
-                if member.value > 0 and member.value & (member.value - 1) == 0
-            }
-            player.connection_type = candidate_type \
-                if candidate_type in valid_types else PLTYPE.CLIENT
 
             # `onlystaff` needs only the account name, so a refused login must
             # not load or create an account file first (a flood of random names
@@ -125,22 +138,16 @@ class LoginService:
 
             account_manager = getattr(server, 'account_manager', None)
             if account_manager:
-                account_in_use = any(
-                    other is not player and other.connected
-                    and other.account_name.lower() == player.account_name.lower()
-                    for other in getattr(server, 'players', {}).values()
-                )
                 # QA fixtures restock ammo/reset position on disk between logins.
                 # Refresh idle accounts like GServer-v2/server/src/player/Player.cpp:663-666
                 # and server/src/loader/flatfile/FlatFileAccountLoader.cpp:100-116.
+                # Only the cache is refreshed here; the account is created and
+                # copied onto the player in complete_login, once every refusal
+                # has passed (Player.cpp:663 loads inside sendLogin).
                 account = account_manager.get_account(
-                    player.account_name, reload=not account_in_use)
-                if not account:
-                    account = account_manager.create_account(player.account_name)
-                account_manager.load_player_from_account(player, account)
-                player.admin_rights = account.admin_rights
-
-                if account.is_banned:
+                    player.account_name,
+                    reload=not self._account_online(player.account_name))
+                if account is not None and account.is_banned:
                     await player.disconnect(f"You are banned: {account.ban_reason}")
                     return False
 
@@ -158,6 +165,8 @@ class LoginService:
                 await listserver.verify_account(player, password)
                 return True
 
+            # A refusal inside complete_login has already disconnected; the
+            # read loop then ends on the closed session.
             await self.complete_login()
             return True
 
@@ -170,30 +179,40 @@ class LoginService:
             logger.error(traceback.format_exc())
             return False
 
-    async def complete_login(self):
+    async def complete_login(self) -> bool:
         """Send the login response, register the player and warp them in.
 
         Idempotent: a second call (list-server verification racing the local
-        fallback) does nothing.
+        fallback) does nothing. Returns False when the login was refused.
         """
         player = self.player
         if player.logged_in:
             logger.debug(f"complete_login: player {player.id} already logged in")
-            return
+            return True
 
         connection_type = player.connection_type
         is_rc = bool(connection_type & PLTYPE.ANYRC)
         is_nc = connection_type == PLTYPE.NC
+        account_manager = getattr(player.server, 'account_manager', None)
+
+        # Player.cpp:677-683: a banned account is refused before anything else.
+        # handle_login checked the name from the wire already; checked again
+        # because the list server may have replaced it (ServerList.cpp:779-780).
+        if account_manager:
+            account = account_manager.get_account(player.account_name)
+            if account is not None and account.is_banned:
+                await player.disconnect(f"You are banned: {account.ban_reason}")
+                return False
 
         # Player.cpp:686-694 sends the same PLO_DISCMESSAGE to RC and NC.
-        if is_rc and not player.server.register_rc_session(player):
-            logger.info(f"Refused RC login for {player.account_name}")
+        # Only decided here: the session is recorded after the double-login
+        # check below (Player.cpp:718-742 precede the login record), because
+        # a refused second login's cleanup would otherwise unregister state
+        # keyed by account name that the live session still owns.
+        if (is_rc or is_nc) and not player.server.control_login_allowed(player):
+            logger.info(f"Refused {'RC' if is_rc else 'NC'} login for {player.account_name}")
             await player.disconnect("You do not have RC rights.")
-            return
-        if is_nc and not player.server.register_nc_session(player):
-            logger.info(f"Refused NC login for {player.account_name}")
-            await player.disconnect("You do not have RC rights.")
-            return
+            return False
 
         # Player.cpp:697-706: `onlystaff` turns away every non-staff login.
         # The reference tests it for client types only, because RC and NC are
@@ -204,7 +223,28 @@ class LoginService:
                 and not player.server.is_staff(player.account_name)):
             logger.info(f"Refused non-staff login for {player.account_name}: staff only")
             await player.disconnect("This server is currently restricted to staff only.")
-            return
+            return False
+
+        if not await self._resolve_double_login():
+            return False
+
+        if is_rc and not player.server.register_rc_session(player):
+            logger.info(f"Refused RC login for {player.account_name}")
+            await player.disconnect("You do not have RC rights.")
+            return False
+        if is_nc and not player.server.register_nc_session(player):
+            logger.info(f"Refused NC login for {player.account_name}")
+            await player.disconnect("You do not have RC rights.")
+            return False
+
+        # Player.cpp:666: the account is copied onto the connection only now,
+        # after every refusal above, so a refused login never holds one.
+        if account_manager:
+            account = account_manager.get_account(player.account_name)
+            if not account:
+                account = account_manager.create_account(player.account_name)
+            account_manager.load_player_from_account(player, account)
+            player.admin_rights = account.admin_rights
 
         # GServer-v2/server/src/player/PlayerClient.cpp:453-471: whole days
         # truncate toward zero, and even capped deviation resets the clock.
@@ -259,9 +299,9 @@ class LoginService:
 
         if is_rc:
             await self.send_rc_login_sequence()
-            return
+            return True
         if is_nc:
-            return
+            return True
 
         for name, value in list(player.flags.items()):
             await player.send_raw(build_flag_set(name, value))
@@ -277,9 +317,69 @@ class LoginService:
         config = player.server.config
         await player.warp(config.start_level, config.start_x, config.start_y)
 
+        # PlayerClient.cpp:449,659: a client counts as loaded, and so is saved
+        # on disconnect, only once the login and first level have gone out.
+        # RC and NC never reach this line and never save their own state.
+        player.account_loaded = True
+
         rc_manager = getattr(player.server, 'rc_manager', None)
         if rc_manager:
             await rc_manager.notify_player_join(player)
+        return True
+
+    def _account_online(self, account_name: str) -> bool:
+        """Whether another live connection already uses this account name."""
+        player = self.player
+        name = account_name.lower()
+        return any(
+            other is not player and other.connected
+            and other.account_name.lower() == name
+            for other in list(getattr(player.server, 'players', {}).values()))
+
+    @staticmethod
+    def _login_class(connection_type) -> int:
+        """Player.cpp:725-726: clients, RCs and NCs are counted apart."""
+        if connection_type & PLTYPE.ANYCLIENT:
+            return 0
+        return 1 if connection_type & PLTYPE.ANYRC else 2
+
+    async def _resolve_double_login(self) -> bool:
+        """Player.cpp:719-741: one live login per account and class.
+
+        A same-class connection idle for more than 30 seconds is kicked;
+        otherwise this login is refused. Before an older connection of the
+        account is dropped (or once it is already closing) its state is
+        written into the account and it is barred from saving again, so the
+        state this login is about to load is the newest one and the older
+        connection's late cleanup cannot roll it back.
+        """
+        player = self.player
+        server = player.server
+        name = player.account_name.lower()
+        own_class = self._login_class(player.connection_type)
+        account_manager = getattr(server, 'account_manager', None)
+
+        def flush(other) -> None:
+            if account_manager:
+                account_manager.save_player(other)
+            other.account_loaded = False
+
+        for other in list(getattr(server, 'players', {}).values()):
+            if other is player or other.account_name.lower() != name:
+                continue
+            if not other.connected:
+                flush(other)
+                continue
+            if self._login_class(other.connection_type) != own_class:
+                continue
+            if time.time() - other.last_data_time > 30:
+                flush(other)
+                await other.disconnect("Someone else has logged into your account.")
+                continue
+            logger.info(f"Refused double login for {player.account_name}")
+            await player.disconnect("Account is already in use.")
+            return False
+        return True
 
     async def _grant_protected_weapons(self, player: 'Player', gs2) -> None:
         """PlayerClient.cpp:605-610: every `protectedweapons` entry the account

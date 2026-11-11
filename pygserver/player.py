@@ -169,20 +169,22 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
                     await new_leader.send_raw(build_is_leader())
 
         # Dismount horse if mounted
-        if hasattr(self.server, 'horse_manager'):
-            await self.server.horse_manager.handle_dismount(self)
+        horse_manager = getattr(self.server, 'horse_manager', None)
+        if horse_manager is not None:
+            await horse_manager.handle_dismount(self)
 
-        # Save account
-        if hasattr(self.server, 'account_manager'):
-            account = self.server.account_manager.get_account(self.account_name)
-            if account:
-                self.server.account_manager.save_player_to_account(self, account)
+        # Save account: only a fully accepted client login ever loaded one
+        # (AccountManager.player_state_saveable, Player.cpp:358-362).
+        account_manager = getattr(self.server, 'account_manager', None)
+        if account_manager is not None:
+            account_manager.save_player(self)
+        self.account_loaded = False
 
         # Unregister RC/NC sessions
-        if hasattr(self.server, 'rc_manager'):
-            self.server.rc_manager.unregister_session(self.id)
-        if hasattr(self.server, 'nc_manager'):
-            self.server.nc_manager.unregister_session(self.id)
+        for name in ('rc_manager', 'nc_manager'):
+            manager = getattr(self.server, name, None)
+            if manager is not None:
+                manager.unregister_session(self.id)
 
     async def disconnect(self, message: str = ""):
         """Disconnect the player."""
@@ -666,6 +668,7 @@ _STATE_ALIASES: Dict[str, Tuple[str, str]] = {
 
     # --- status -------------------------------------------------------------
     'logged_in': ('status', 'logged_in'),
+    'account_loaded': ('status', 'account_loaded'),
     'is_frozen': ('status', 'is_frozen'),
     'is_ghost': ('status', 'is_ghost'),
     'is_muted': ('status', 'is_muted'),

@@ -14,7 +14,7 @@ import time
 import socket as sock
 from typing import Optional, TYPE_CHECKING
 from reborn_protocol import (
-    SVI, SVO, PLO, PLPROP,
+    SVI, SVO, PLO, PLPROP, PLTYPE,
     PacketBuilder, PacketReader, Gen1Codec, Gen2Codec,
     CompressionType
 )
@@ -495,7 +495,9 @@ class ServerListClient:
             packet.write_gchar(PLO.DISCMESSAGE)
             packet.write_string(message)
             await player.send_packet(packet.build())
-            player.disconnect()
+            # ServerList.cpp:783-787: refused here, before the account is
+            # loaded, so this connection never saves one (account_loaded).
+            await player.disconnect()
         else:
             # Login successful
             logger.info(f"Login verified for {account}")
@@ -531,8 +533,9 @@ class ServerListClient:
         player_id = reader.read_gshort()
         serverpacket = reader.remaining()
 
+        # Game clients only; RC/NC never get it (ServerList.cpp:966-975).
         player = self.server.players.get(player_id)
-        if not player:
+        if not player or not (player.connection_type & PLTYPE.ANYCLIENT):
             return
 
         packet = PacketBuilder().write_gchar(PLO.SERVERWARP).write_bytes(serverpacket)

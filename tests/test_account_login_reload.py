@@ -1,6 +1,7 @@
 """Login refreshes idle accounts while preserving accounts used by live sessions."""
 
 import json
+import time
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
@@ -62,21 +63,52 @@ async def test_login_replaces_cached_account_with_disk_values(world, other_name,
 
 @pytest.mark.parametrize('logged_in', [True, False])
 async def test_duplicate_login_preserves_connected_players_account(world, logged_in):
+    # Player.cpp:719-741: a same-class login of an account whose live
+    # connection sent data within 30 seconds is refused, and the live
+    # connection's cached account is neither reloaded nor touched.
     server, manager, cached, path = world
     live = make_login_player(server, 3)
     live.account_name = 'TESTER'
     live.logged_in = logged_in
     live.bombs, live.arrows = 2, 1
     player = make_login_player(server)
+    player.disconnect = AsyncMock()
     stored = cached.to_dict()
     stored.update(bombs=10, arrows=5)
     path.write_text(json.dumps(stored))
 
+    await player._handle_login()
+
+    player.disconnect.assert_awaited_once_with("Account is already in use.")
+    assert not player.logged_in and not player.account_loaded
+    assert manager.get_account('tester') is cached
+    assert (cached.bombs, cached.arrows) == (0, 0)
+    assert (live.bombs, live.arrows) == (2, 1)
+
+
+async def test_idle_duplicate_is_kicked_and_its_state_carried_over(world):
+    # Player.cpp:729-731: an idle (>30 s) same-class connection is kicked.
+    # Its state is flushed first, so the new login loads it and the kicked
+    # connection's own cleanup cannot write an older copy back afterwards.
+    server, manager, cached, path = world
+    live = make_login_player(server, 3)
+    live.account_name = 'tester'
+    live.logged_in = live.account_loaded = True
+    live.bombs, live.arrows = 2, 1
+    live.last_data_time = time.time() - 31
+    live.disconnect = AsyncMock()
+    player = make_login_player(server)
+
     assert await player._handle_login()
 
-    assert manager.get_account('tester') is cached
-    assert (player.bombs, player.arrows) == (0, 0)
-    assert (live.bombs, live.arrows) == (2, 1)
+    live.disconnect.assert_awaited_once_with("Someone else has logged into your account.")
+    assert not live.account_loaded
+    assert player.logged_in and player.account_loaded
+    assert (player.bombs, player.arrows) == (2, 1)
+    live.bombs = 99
+    assert not manager.save_player(live)  # what Player._cleanup calls
+    manager._save_executor.submit(lambda: None).result()
+    assert json.loads(path.read_text())['bombs'] == 2
 
 
 @pytest.mark.parametrize('file_state', ['missing', 'invalid_json', 'unreadable'])

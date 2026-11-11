@@ -200,8 +200,10 @@ async def test_login_decay_precedes_props_and_runs_once(
         with patch('pygserver.player_login.time.time', return_value=now):
             assert await player._handle_login()
             if entry_point == 'listserver':
-                assert not player.logged_in
-                assert player.elo_deviation == initial_dev
+                # Player.cpp:663: nothing is loaded (or decayed) before
+                # the list server's verdict.
+                assert not player.logged_in and not player.account_loaded
+                assert (player.elo_deviation, player.last_spar_time) == (350.0, 0)
                 await player.send_login()
         with patch('pygserver.player_login.time.time', return_value=now + 86400):
             await player.send_login()

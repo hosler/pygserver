@@ -98,6 +98,11 @@ class Status:
 
     def __init__(self):
         self.logged_in = False
+        # Set only once a game-client login has been fully accepted and its
+        # account loaded (Player.cpp:771-773, PlayerClient.cpp:449,659 m_loaded).
+        # Every save of the player's state into its account checks it, so a
+        # refused, dropped or unverified connection can never write one.
+        self.account_loaded = False
         self.is_frozen = False
         self.is_ghost = False
         self.is_muted = False

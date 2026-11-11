@@ -89,6 +89,27 @@ def test_login_packet_key_layout_follows_client_type(
     assert login["password"] == "testpass"
 
 
+@pytest.mark.parametrize(
+    ("client_type", "expected"),
+    [(5, PLTYPE.CLIENT3), (1, PLTYPE.RC), (3, PLTYPE.NC), (6, PLTYPE.RC2)])
+def test_supported_login_type_bytes_are_accepted(client_type, expected):
+    server = make_server(staff=("admin",))
+    player = make_login_player(server, 3, "admin", client_type)
+
+    assert asyncio.run(player._handle_login()) is True
+    assert player.connection_type == expected
+
+
+@pytest.mark.parametrize("client_type", [0, 2, 4, 7, 8, 9, 12, 100])
+def test_unsupported_login_type_bytes_are_dropped(client_type):
+    server = make_server(staff=("admin",))
+    player = make_login_player(server, 3, "admin", client_type)
+
+    assert asyncio.run(player._handle_login()) is False
+    player.login_service.send_login_response.assert_not_awaited()
+    server.account_manager.load_player_from_account.assert_not_called()
+
+
 def test_staff_rc2_login_registers_sends_welcome_and_does_not_warp():
     server = make_server(staff=("admin",))
     player = make_login_player(server, 2, "admin", 6)
@@ -165,7 +186,7 @@ def flat_ids(trace):
     return [packet for _, packets in trace for packet in packets]
 
 
-@pytest.mark.parametrize('client_type', [0, 4, 5, 8])
+@pytest.mark.parametrize('client_type', [5])
 @pytest.mark.parametrize('connected', [True, False])
 def test_game_login_leads_with_serverlist_connected_then_reset_then_props(
         client_type, connected):

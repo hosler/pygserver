@@ -459,17 +459,6 @@ def build_is_leader() -> bytes:
     return builder.build()
 
 
-def build_server_warp(server: str, level: str, x: float, y: float) -> bytes:
-    """Build PLO_SERVERWARP packet."""
-    builder = PacketBuilder().write_gchar(PLO.SERVERWARP)
-    builder.write_gstring(server)
-    builder.write_gstring(level)
-    builder.write_gchar(int(x * 2))
-    builder.write_gchar(int(y * 2))
-    builder.write_newline()
-    return builder.build()
-
-
 def build_flag_set(flag_name: str, flag_value: str) -> bytes:
     """Build PLO_FLAGSET packet."""
     builder = PacketBuilder().write_gchar(PLO.FLAGSET)

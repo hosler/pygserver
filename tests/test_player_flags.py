@@ -23,7 +23,7 @@ def world(tmp_path):
     for pid, name in ((2, "quester"), (3, "observer")):
         player = Player(server, pid, AsyncMock(), MagicMock())
         player.account_name = name
-        player.logged_in = True
+        player.logged_in = player.account_loaded = True
         player.send_raw = AsyncMock()
         server.players[pid] = player
         players.append(player)
@@ -182,7 +182,7 @@ async def test_periodic_save_snapshots_live_flags_without_control_session_overwr
             stale = Player(server, pid, AsyncMock(), MagicMock())
             stale.account_name = owner.account_name
             stale.connection_type = connection
-            stale.logged_in = logged_in
+            stale.logged_in = stale.account_loaded = logged_in
             stale.flags = {"client.q": "stale"}
             server.players[pid] = stale
         script(server, owner, "set client.q; setstring client.n,5; set clientr.r;")
