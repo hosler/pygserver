@@ -107,9 +107,11 @@ def _normalized_push(target, from_x, from_y, distance=1.0):
 
 def _player_hurt_push(target, from_x, from_y):
     # Server::hitPlayer pushes four tiles, converts to pixels (*16), then
-    # recentres both wire components at 64.
+    # recentres both wire components at 64. The direction is measured from the
+    # player's event-box centre, top-left + (1.5, 2.0) tiles (12ad27cf,
+    # Server.cpp:1960-1963), not from the sprite origin.
     x, y = absolute_position(target)
-    dx, dy = x - to_num(from_x), y - to_num(from_y)
+    dx, dy = x + 1.5 - to_num(from_x), y + 2.0 - to_num(from_y)
     length = math.hypot(dx, dy)
     if length:
         dx, dy = dx / length * 4.0, dy / length * 4.0

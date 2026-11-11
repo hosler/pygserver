@@ -25,6 +25,12 @@ def account_payload(name="target", banned=True):
             .write_gstring("reason").build())
 
 
+def empty_prop_stream():
+    # [world][props][flag count][chest count][weapon count] (PlayerProps.cpp:1246-1307)
+    return (packet().write_gstring("main").write_gchar(0).write_gshort(0)
+            .write_gshort(0).write_gchar(0).build())
+
+
 def rights_payload(name="target", rights=RCRight.BAN, folders="rw levels/*"):
     return (packet().write_gstring(name).write_gint5(rights)
             .write_gstring("127.0.0.*,10.*").write_gstring_short(folders).build())
@@ -68,8 +74,8 @@ GATES = [
     (PLI.RC_FOLDERCONFIGSET, 0x20000, b"levels/*", "admin is not authorized to change the folder config.", "folders"),
     (PLI.RC_PLAYERPROPSGET2, 0x20, packet().write_gshort(2).build(), "You are not authorized to view player props.", "props_read"),
     (PLI.RC_PLAYERPROPSGET3, 0x20, packet().write_gstring("target").build(), "You are not authorized to view player props.", "props_read"),
-    (PLI.RC_PLAYERPROPSSET, 0x40, packet().write_gshort(2).build(), "admin is not authorized to set the properties of target", "props_write"),
-    (PLI.RC_PLAYERPROPSSET2, 0x40, packet().write_gstring("target").build(), "admin is not authorized to set the properties of target", "props_write"),
+    (PLI.RC_PLAYERPROPSSET, 0x40, packet().write_gshort(2).build() + empty_prop_stream(), "admin is not authorized to set the properties of target", "props_write"),
+    (PLI.RC_PLAYERPROPSSET2, 0x40, packet().write_gstring("target").build() + empty_prop_stream(), "admin is not authorized to set the properties of target", "props_write"),
     (PLI.RC_PLAYERPROPSRESET, 0x100, b"target", "You are not authorized to reset accounts.", "reset"),
     (PLI.RC_DISCONNECTPLAYER, 0x10, packet().write_gshort(2).write_string("reason").build(), "admin is not authorized to disconnect players.", "disconnect"),
     (PLI.RC_UPDATELEVELS, 0x08, b"", "admin is not authorized to update levels.", "levels"),
@@ -91,9 +97,10 @@ def effect(rc, name, caplog):
     rc.flush()
     return {
         "options": lambda: rc.server.config.start_level == "new",
-        "folders": lambda: "Folder config set by admin" in caplog.text,
+        "folders": lambda: ((rc.root / "config/foldersconfig.txt").is_file()
+                            and (rc.root / "config/foldersconfig.txt").read_text() == "levels/*\n"),
         "props_read": lambda: rc.manager._build_player_props.called,
-        "props_write": lambda: any(b"modified props" in c.args[0] for c in rc.player.send_raw.await_args_list),
+        "props_write": lambda: any(b"set the attributes of player" in c.args[0] for c in rc.player.send_raw.await_args_list),
         "reset": lambda: rc.target_player.rupees == 0,
         "disconnect": lambda: bool(rc.target_player.disconnect.await_count),
         "levels": lambda: bool(rc.server.world.reload_levels.await_count),
@@ -200,9 +207,9 @@ def test_attributes_self_other_gate(rc, own, right, allowed, by_name):
     rc.session.rights = right
     payload = packet().write_gstring(name).build() if by_name else packet().write_gshort(2).build()
     handler = rc.manager._handle_player_props_set2 if by_name else rc.manager._handle_player_props_set
-    asyncio.run(handler(rc.session, payload))
+    asyncio.run(handler(rc.session, payload + empty_prop_stream()))
     replies = [c.args[0] for c in rc.player.send_raw.await_args_list]
-    assert any(b"modified props" in reply for reply in replies) == allowed
+    assert any(b"set the attributes of player" in reply for reply in replies) == allowed
 
 
 def test_default_account_edit_and_delete_protection(rc):
@@ -251,6 +258,9 @@ def test_server_admin_options_preserved(rc, staff_admin):
     ("_handle_player_ban_get", b"target"), ("_handle_player_rights_get", b"admin"),
 ])
 def test_control_only_reads_need_no_permission_bits(rc, handler, payload):
+    # PlayerRCPackets.cpp:142: the folder config reply needs the file to exist.
+    (rc.root / "config").mkdir(exist_ok=True)
+    (rc.root / "config/foldersconfig.txt").write_text("file *.png\n")
     rc.session.rights = 0
     asyncio.run(getattr(rc.manager, handler)(rc.session, payload))
     assert rc.player.send_raw.await_count == 1

@@ -30,6 +30,7 @@ from dataclasses import dataclass
 from reborn_protocol.gs1.runtime import UNSET
 from reborn_protocol.gs1.values import to_num
 
+from .. import npc_motion
 from ..attachments import absolute_position
 
 #: array name -> element kind
@@ -124,6 +125,12 @@ def coordinate_limit(host, target):
 def sanitize(host, target, attr, value):
     """Clamp `value` for state attribute `attr`; DROP if non-finite.
     Attributes with no numeric limit pass through unchanged."""
+    if attr in _COORD_ATTRS and hasattr(target, "move_queue"):
+        # An NPC's x/y are not clamped: the pixel wrap of NPC.cpp:1870-1935.
+        number = to_num(value)
+        wrapped = npc_motion.script_coordinate(
+            getattr(host, "server", None), target, attr, number)
+        return DROP if wrapped is None else wrapped
     if attr in _COORD_ATTRS:
         low, high, integral = 0.0, coordinate_limit(host, target), False
     else:
@@ -356,9 +363,46 @@ def _says_number(chat):
         return 0.0
 
 
+def player_weaponscount(player):
+    """weaponscount: how many weapons the player holds (Player.cpp:1613-1618,
+    b46a9c03)."""
+    return float(len(getattr(player, "weapons", None) or ()))
+
+
+def player_levelorg(player, axis):
+    """levelorgx / levelorgy: minus the attached NPC's global tile position
+    (axis 0 = x, 1 = y), 0 when the player is attached to nothing
+    (Player.cpp:1623-1645, b46a9c03). Global means on its gmap: the NPC's
+    level-local tile plus 64 per grid step."""
+    kind, npc_id = getattr(player, "attach_npc", (0, 0))
+    if kind != 0 or not npc_id:
+        return 0.0
+    server = getattr(player, "server", None)
+    level = getattr(player, "level", None)
+    npc = level.get_npc(npc_id) if hasattr(level, "get_npc") else None
+    manager = getattr(server, "npc_manager", None)
+    if npc is None and manager is not None:
+        npc = manager.get_npc(npc_id)
+    if npc is None:
+        return 0.0
+    tile = _num(getattr(npc, "y" if axis else "x", 0))
+    world = getattr(server, "world", None)
+    npc_level = getattr(npc, "level", None)
+    info = (world.get_gmap_for_level(npc_level.name)
+            if world is not None and npc_level is not None else None)
+    if info is not None:
+        tile += 64.0 * info[2 if axis else 1]
+    from .. import collision
+    return (-collision.tiles_to_pixels(tile)) / 16.0
+
+
 def _player_get(player, field):
     if field in ("x", "y"):
         return float(absolute_position(player)[field == "y"])
+    if field == "weaponscount":
+        return player_weaponscount(player)
+    if field in ("levelorgx", "levelorgy"):
+        return player_levelorg(player, field == "levelorgy")
     if field == "headset":
         return _headset(getattr(player, "head_image", ""))
     if field == "saysnumber":
@@ -379,12 +423,13 @@ def _npc_get(npc, field, sub):
     if field in ("x", "y"):
         return _num(getattr(npc, field, 0))
     if field in ("width", "height"):
-        # NPC::getComputedShape (NPC.h:551): the explicit setshape box in
-        # tiles; 0 when none was set, except a showcharacter NPC is 3x3.
+        # NPC::getComputedShape (NPC.h:551): the explicit setshape box (pixels
+        # stored, reported /16 as NPC.cpp:1832-1835 does); 0 when none was
+        # set, except a showcharacter NPC is 3x3.
         shape = getattr(npc, "shape", None)
-        if shape and shape[0] and shape[1]:
-            return _num(shape[field == "height"])
-        return 3.0 if getattr(npc, "image", "") in ("#c#", "#c") else 0.0
+        if getattr(npc, "image", "") in ("#c#", "#c"):
+            return 3.0
+        return _num(shape[field == "height"]) / 16.0 if shape else 0.0
     if field == "headset":
         return _headset(getattr(npc, "head_image", ""))
     if field == "sprite":
@@ -552,6 +597,8 @@ def write_field(ref, field, value, sub=()):
         clean = sanitize(host, target, attr, value)
         if clean is not DROP:
             setattr(target, attr, clean)
+            if attr in ("x", "y"):
+                npc_motion.cancel_moves(target)  # NPC.cpp:1879,1910
             host._dirty(target)
         return True
     # bombs/arrows/items/explos/horses/signs/compus are all read-only

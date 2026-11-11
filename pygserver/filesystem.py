@@ -8,6 +8,7 @@ Based on GServer-v2 file serving implementation.
 import asyncio
 import logging
 import os
+import re
 import hashlib
 import time
 import zlib
@@ -558,26 +559,147 @@ class FileSystem:
             return False
         return not has_control_chars(name)
 
-    def _folders_config_dirs(self) -> List[str]:
-        """First folder of each foldersconfig.txt pattern (`heads/*` -> heads).
+    # -- foldersconfig.txt ------------------------------------------------------
+    #
+    # Server.cpp:497-512 files every pattern under `world/`, so a pattern can
+    # never name a folder outside it. Here a pattern's first folder becomes a
+    # sibling public root (see above), so it is held to what a world can
+    # legitimately hold: a CLIENT_FILE_DIRS name or a folder that exists under
+    # `world/`, never a dot-folder or a PRIVATE_DIRS name, and never a folder
+    # that resolves outside the server folder. The same checks gate the RC
+    # set (rc.py) and every read of the file, which may be hand-edited.
+    FOLDERS_CONFIG_MAX_LINES = 1024
+    FOLDERS_CONFIG_MAX_LINE = 1024
+    # The file is split on '\n' only. A line still holding another character
+    # str.splitlines() breaks on, or any other C0/C1 control, is dropped whole:
+    # a later reader must never see two lines where this one saw one.
+    _FOLDERS_CONFIG_BAD_CHARS = re.compile('[\x00-\x08\x0a-\x1f\x7f-\x9f\u2028\u2029]')
+    _folders_config_cache: Optional[tuple] = None
 
-        Server.cpp:497-512 reads `<category> <glob>` lines after dropping `#`
-        comments. A glob with no folder (`*.png`) names `world/` itself.
-        """
+    @staticmethod
+    def split_folders_config_line(line: str) -> Optional[Tuple[str, str]]:
+        """(lowercase category, glob) of one line, None for a blank or
+        comment-only line. `#` starts a comment (Server.cpp:491-494)."""
+        body = line.split('#', 1)[0].strip(' \t')
+        if not body:
+            return None
+        parts = re.split('[ \t]+', body, maxsplit=1)
+        glob = parts[1].strip(' \t').replace('\\', '/') if len(parts) > 1 else ''
+        return parts[0].lower(), glob
+
+    def _folders_config_first_allowed(self, first: str) -> bool:
+        """A pattern's first folder is either a CLIENT_FILE_DIRS name or a
+        folder that exists inside `world/` (where the reference files every
+        pattern, Server.cpp:497-512)."""
+        if not first or first.startswith('.'):
+            return False
+        if first.lower() in {name.lower() for name in self.CLIENT_FILE_DIRS}:
+            return True
+        world = self.base_path / 'world'
         try:
-            text = (self.base_path / 'config' / 'foldersconfig.txt').read_text(
-                encoding='latin-1')
+            if not (world / first).is_dir():
+                return False
+            (world / first).resolve().relative_to(world.resolve())
+        except (OSError, ValueError, RuntimeError):
+            return False
+        return True
+
+    def _folders_config_root(self, first: str) -> Optional[Path]:
+        """The sibling public root a pattern's first folder names, or None.
+        On top of `_folders_config_first_allowed`: never a PRIVATE_DIRS name
+        (a `npcs/*` line still sorts `world/npcs`), and never a folder that
+        resolves outside the server folder."""
+        if (set(first) & set('*?[') or not self._folders_config_first_allowed(first)
+                or first.lower() in self.PRIVATE_DIRS):
+            return None
+        root = self.base_path / first
+        if first.lower() in {name.lower() for name in self.CLIENT_FILE_DIRS}:
+            # Public whatever the config says; these may be links to shared
+            # asset folders (pyReborn's LocalWorld), so no containment check.
+            return root
+        try:
+            root.resolve().relative_to(self.base_path.resolve())
+        except (OSError, ValueError, RuntimeError):
+            return None
+        return root
+
+    def folders_config_glob_allowed(self, glob: str) -> bool:
+        """Whether a foldersconfig.txt pattern stays inside the folders a
+        client may already read: no absolute path, drive, dot segment (`.`,
+        `..`, `.git`), and a first folder `_folders_config_first_allowed`
+        accepts. A pattern with no folder (`*.png`) or a wildcard first
+        segment names `world/` itself and adds no root."""
+        if glob.startswith('/') or ':' in glob:
+            return False
+        segments = glob.split('/')
+        if any(segment.startswith('.') for segment in segments):
+            return False
+        if len(segments) == 1 or set(segments[0]) & set('*?['):
+            return True
+        return self._folders_config_first_allowed(segments[0])
+
+    def folders_config_line_allowed(self, line: str) -> bool:
+        if (len(line) > self.FOLDERS_CONFIG_MAX_LINE
+                or self._FOLDERS_CONFIG_BAD_CHARS.search(line)):
+            return False
+        parsed = self.split_folders_config_line(line)
+        return parsed is None or self.folders_config_glob_allowed(parsed[1])
+
+    def folders_config_path(self) -> Path:
+        return self.base_path / 'config' / 'foldersconfig.txt'
+
+    def folders_config_entries(self) -> List[Tuple[str, str]]:
+        """(category, glob) of every allowed foldersconfig.txt line.
+
+        Parsed once per version of the file, keyed on its (mtime_ns, size,
+        inode); `invalidate_folders_config` drops the cached copy.
+        """
+        path = self.folders_config_path()
+        try:
+            info = os.stat(path)
+        except OSError:
+            self._folders_config_cache = None
+            return []
+        key = (info.st_mtime_ns, info.st_size, info.st_ino)
+        cached = self._folders_config_cache
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        try:
+            with open(path, 'rb') as stream:
+                text = stream.read(self.FOLDERS_CONFIG_MAX_LINES
+                                   * (self.FOLDERS_CONFIG_MAX_LINE + 1)).decode('latin-1')
         except OSError:
             return []
-        names: List[str] = []
-        for line in text.splitlines():
-            parts = line.split('#', 1)[0].split(None, 1)
-            if len(parts) != 2 or '/' not in parts[1].replace('\\', '/'):
+        entries: List[Tuple[str, str]] = []
+        for line in text.split('\n')[:self.FOLDERS_CONFIG_MAX_LINES]:
+            if line.endswith('\r'):
+                line = line[:-1]
+            if not self.folders_config_line_allowed(line):
                 continue
-            first = parts[1].replace('\\', '/').split('/', 1)[0].strip()
-            if (first and first not in ('.', '..') and not set(first) & set('*?[')
-                    and first.lower() not in self.PRIVATE_DIRS
-                    and first not in names):
+            parsed = self.split_folders_config_line(line)
+            if parsed is not None:
+                entries.append(parsed)
+        self._folders_config_cache = (key, entries)
+        return entries
+
+    def invalidate_folders_config(self):
+        """Forget the parsed foldersconfig.txt and the public index built from
+        it, so a narrowed config stops serving its old roots at once."""
+        self._folders_config_cache = None
+        self._public_index = {}
+        self._public_signature = None
+        self._public_index_time = float('-inf')
+
+    def _folders_config_dirs(self) -> List[str]:
+        """First folder of each allowed foldersconfig.txt pattern
+        (`heads/*` -> heads). A glob with no folder names `world/` itself."""
+        names: List[str] = []
+        for _category, glob in self.folders_config_entries():
+            if '/' not in glob:
+                continue
+            first = glob.split('/', 1)[0].strip()
+            if (first not in names
+                    and self._folders_config_root(first) is not None):
                 names.append(first)
         return names
 

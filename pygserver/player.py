@@ -469,6 +469,9 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
             showimgs = npc.build_showimgs_packet()
             if showimgs is not None:
                 await self.send_raw(showimgs)
+            if npc.move_queue:  # Level::sendNPCToPlayer, Level.cpp:1484
+                from .npc_motion import send_queue_to_player
+                await send_queue_to_player(npc, self.server, self)
 
         # Send items on level
         if hasattr(self.server, 'item_manager'):

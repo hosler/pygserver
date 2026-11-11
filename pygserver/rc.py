@@ -9,7 +9,6 @@ import asyncio
 import csv
 import dataclasses
 import io
-import locale
 import math
 import os
 import tempfile
@@ -41,8 +40,13 @@ from .protocol.packets import (
     build_rc_file_browser_message,
     build_player_props,
 )
-from .config import ServerConfig
+from reborn_protocol.props import PLAYER_PROPS, parse_prop_stream
+
+from .protocol.builders.admin import from_csv, guntokenize_text, to_csv
+from .protocol.parsers import _INBOUND_PROP_HANDLERS, _INBOUND_STREAM, _store
+from .config import OPTIONS_FILE_ENCODING, ServerConfig, atomic_write_text
 from .level import ITEM_NAME_TO_ID
+from .text_safety import has_control_chars, sanitize_value, strip_control_chars
 
 if TYPE_CHECKING:
     from .server import GameServer
@@ -65,6 +69,7 @@ runallscriptevents clientsidesigns clientsidelinks localhost
 INTERNAL_CONFIG_NAMES = frozenset("""
 port host max_players server_name staff verify_login enable_listserver
 hq_password hq_level base_dir levels_dir weapons_dir npcs_dir accounts_dir gmaps
+options_path
 """.split())
 # Loader keys that the reference's AdminServerOptions list has no entry for but
 # that grant admin-level control here (login verification bypass).
@@ -113,7 +118,7 @@ def _probe_option(key: str, value: str):
     Returns (fields, aptime) for a recognised key, ({}, {}) for an unknown key,
     and raises ValueError when the value does not convert.
     """
-    encoding = locale.getpreferredencoding(False)
+    encoding = OPTIONS_FILE_ENCODING   # what ServerConfig.from_file reads
     with tempfile.TemporaryDirectory() as scratch:
         path = os.path.join(scratch, "serveroptions.txt")
         try:
@@ -123,7 +128,7 @@ def _probe_option(key: str, value: str):
             raise ValueError("unencodable option") from exc
         probe = _OptionProbe.from_file(path)
     fields = {name: val for name, val in probe._assigned.items()
-              if name in _CONFIG_FIELDS and name != 'aptime'}
+              if name in _CONFIG_FIELDS and name not in ('aptime', 'options_path')}
     for val in list(fields.values()) + list(probe._aptime_assigned.values()):
         if isinstance(val, float) and not math.isfinite(val):
             raise ValueError("non-finite number")
@@ -146,6 +151,44 @@ IMPORTANT_FILES = {
     "config/servermessage.html": RCRight.SETSERVEROPTIONS,
     "config/serveroptions.txt": RCRight.SETSERVEROPTIONS,
 }
+
+
+def _store_rc_head(props, value):
+    # PlayerProps.cpp:397-400: a preset head id names head<id>.png.
+    props[PLPROP.HEADIMAGE] = value if isinstance(value, str) else f"head{value}.png"
+
+
+# Decoders for the RC prop stream: the client-prop table plus the account
+# counters the RC editor shows (PlayerProps.h:229-245).
+_RC_PROP_HANDLERS = {
+    **_INBOUND_PROP_HANDLERS,
+    PLPROP.HEADIMAGE: _store_rc_head,
+    PLPROP.KILLSCOUNT: _store(PLPROP.KILLSCOUNT),
+    PLPROP.DEATHSCOUNT: _store(PLPROP.DEATHSCOUNT),
+    PLPROP.RATING: _store(PLPROP.RATING),
+}
+_GATTRIB_INDEX = {
+    prop_id: int(desc.name[len('GATTRIB'):]) - 1
+    for prop_id, desc in PLAYER_PROPS.items() if desc.name.startswith('GATTRIB')}
+# Props echoed to the edited player after an RC edit, and the attribute each
+# is read back from; position goes out with the closing re-warp instead.
+_RC_PUSHED_PROPS = (
+    (PLPROP.NICKNAME, 'nickname'), (PLPROP.MAXPOWER, 'max_hearts'),
+    (PLPROP.CURPOWER, 'hearts'), (PLPROP.RUPEESCOUNT, 'rupees'),
+    (PLPROP.ARROWSCOUNT, 'arrows'), (PLPROP.BOMBSCOUNT, 'bombs'),
+    (PLPROP.GLOVEPOWER, 'glove_power'), (PLPROP.SWORDPOWER, 'sword_power'),
+    (PLPROP.SHIELDPOWER, 'shield_power'), (PLPROP.GANI, 'gani'),
+    (PLPROP.HEADIMAGE, 'head_image'), (PLPROP.COLORS, 'colors'),
+    (PLPROP.STATUS, 'client_status'), (PLPROP.MAGICPOINTS, 'mp'),
+    (PLPROP.KILLSCOUNT, 'kills'), (PLPROP.DEATHSCOUNT, 'deaths'),
+    (PLPROP.ALIGNMENT, 'ap'), (PLPROP.BODYIMAGE, 'body_image'),
+    (PLPROP.RATING, 'elo_rating'),
+)
+# The ones other players on the level see (PlayerProps.h clientPropsSharedLocal).
+_RC_RELAYED_PROPS = frozenset((
+    PLPROP.NICKNAME, PLPROP.SWORDPOWER, PLPROP.SHIELDPOWER, PLPROP.GANI,
+    PLPROP.HEADIMAGE, PLPROP.COLORS, PLPROP.MAGICPOINTS, PLPROP.ALIGNMENT,
+    PLPROP.BODYIMAGE, *_GATTRIB_INDEX))
 
 
 def _wildcard_match(pattern: str, text: str) -> bool:
@@ -419,43 +462,64 @@ class RCManager:
         reader = PacketReader(data)
         options_str = reader.remaining().decode('latin-1', errors='replace')
 
-        # Parse and apply options
-        options = self._decode_lines(options_str)
+        # PlayerRCPackets.cpp:78-81: the body is comma-text, closed with a comma.
+        if not options_str.endswith(','):
+            options_str += ','
+        options = guntokenize_text(options_str).split('\n')
         # PlayerRCPackets.cpp:84; PlayerRC.h:27
         if not session.has_right(RCRight.MODIFYSTAFFACCOUNT):
             options = [line for line in options
                        if line.partition('=')[0].strip().lower()
                        not in ADMIN_SERVER_OPTIONS | INTERNAL_CONFIG_NAMES]
+        accepted: List[tuple] = []
         for message in self._apply_server_options(
                 '\n'.join(options),
-                allow_admin=session.has_right(RCRight.MODIFYSTAFFACCOUNT)):
+                allow_admin=session.has_right(RCRight.MODIFYSTAFFACCOUNT),
+                accepted=accepted):
             await self._reply(session, message)
 
-        # Notify other RCs
-        msg = f"{session.player.account_name} updated server options"
-        await self._broadcast_rc_message(msg)
+        # PlayerRCPackets.cpp:107-112 rewrites serveroptions.txt with the sent
+        # text. Here only the accepted lines are merged into the file this
+        # config was loaded from; lines the RC did not send are kept.
+        path = getattr(self.server.config, 'options_path', '')
+        if path and accepted:
+            try:
+                ServerConfig.update_options_file(path, accepted)
+            except (OSError, ValueError) as error:
+                logger.error("Could not save server options: %s", error)
+                await self._reply(session, "Server: Could not save the server options.")
+
+        await self._broadcast_rc_message(
+            f"{session.player.account_name} has updated the server options.")
 
     def _build_server_options_string(self) -> str:
-        """Build server options string for RC."""
+        """serveroptions.txt as one toCSV row (PlayerRCPackets.cpp:50-57).
+
+        Read from the file the config came from; an in-memory config is
+        serialised the way ServerConfig.to_file would write it.
+        """
         config = self.server.config
-        lines = []
-
-        # Add common options
-        if hasattr(config, 'server_name'):
-            lines.append(f"name={config.server_name}")
-        if hasattr(config, 'description'):
-            lines.append(f"description={config.description}")
-        if hasattr(config, 'start_level'):
-            lines.append(f"startlevel={config.start_level}")
-        if hasattr(config, 'start_x'):
-            lines.append(f"startx={config.start_x}")
-        if hasattr(config, 'start_y'):
-            lines.append(f"starty={config.start_y}")
-
-        return '\n'.join(lines)
+        path = getattr(config, 'options_path', '')
+        lines: Optional[List[str]] = None
+        if path:
+            try:
+                lines = Path(path).read_text(
+                    encoding='latin-1').replace('\r', '').split('\n')
+            except OSError:
+                lines = None
+        if lines is None:
+            lines = (config.option_lines() if isinstance(config, ServerConfig)
+                     else [])
+            lines += [f"{key} = {value}"
+                      for key, value in self.extra_server_options.items()]
+        options = to_csv(lines)
+        if options.endswith(','):
+            options = options[:-1]
+        return options
 
     def _apply_server_options(self, options_str: str,
-                              allow_admin: bool = True) -> List[str]:
+                              allow_admin: bool = True,
+                              accepted: Optional[list] = None) -> List[str]:
         """Apply option lines; returns reference-style rejection messages.
 
         Only keys the config loader understands reach the typed config, each
@@ -474,7 +538,7 @@ class RCManager:
             value = value.strip()
             shown = key[:MAX_EXTRA_OPTION_KEY]
             if (not key or any(c.isspace() or not c.isprintable() for c in key)
-                    or '\r' in value or '\0' in value):
+                    or has_control_chars(value.replace('\t', ''))):
                 rejected.append(f"Server: Invalid server option {shown!r}.")
                 continue
             try:
@@ -490,6 +554,8 @@ class RCManager:
                     rejected.append(f"Server: Server option {shown} is too large.")
                 else:
                     self.extra_server_options[key] = value
+                    if accepted is not None:
+                        accepted.append((key, value))
                 continue
             if not allow_admin and (
                     key in ADMIN_SERVER_OPTIONS | ADMIN_ONLY_LOADER_KEYS
@@ -500,6 +566,8 @@ class RCManager:
                 setattr(config, name, converted)
             for index, converted in aptime.items():
                 config.aptime[index] = converted
+            if accepted is not None:
+                accepted.append((key, value))
         return rejected
 
     # =========================================================================
@@ -509,9 +577,10 @@ class RCManager:
     async def _handle_folder_config_get(self, session: RCSession, data: bytes):
         """Handle RC_FOLDERCONFIGGET - Get folder configuration."""
         # PlayerRCPackets.cpp:136: control connection only.
-
-        config = build_rc_folder_config(self._get_folder_config())
-        await session.player.send_raw(config)
+        # :142-146: nothing is sent when there is no foldersconfig.txt.
+        folders = self._get_folder_config()
+        if folders is not None:
+            await session.player.send_raw(build_rc_folder_config(folders))
 
     async def _handle_folder_config_set(self, session: RCSession, data: bytes):
         """Handle RC_FOLDERCONFIGSET - Set folder configuration."""
@@ -521,14 +590,54 @@ class RCManager:
                 f"Server: {session.player.account_name} is not authorized to change the folder config."):
             return
 
+        filesystem = getattr(self.server, 'filesystem', None)
+        path = self._folder_config_path()
+        if path is None:
+            return
         reader = PacketReader(data)
         config_str = reader.remaining().decode('latin-1', errors='replace')
-        # Apply folder config
-        logger.info(f"Folder config set by {session.player.account_name}")
+        # PlayerRCPackets.cpp:164-169: the whole file is replaced by the lines.
+        # Unlike there, a line whose glob could make a folder outside the
+        # world public, or that holds a control or line-break character, is
+        # dropped (filesystem.py folders_config_line_allowed).
+        sent_lines = from_csv(config_str)
+        lines = [line for line in sent_lines
+                 if filesystem.folders_config_line_allowed(line)]
+        lines = lines[:filesystem.FOLDERS_CONFIG_MAX_LINES]
+        if len(lines) != len(sent_lines):
+            logger.info("Folder config from %s: dropped %d line(s)",
+                        session.player.account_name, len(sent_lines) - len(lines))
+        try:
+            atomic_write_text(path, ''.join(line + '\n' for line in lines))
+        except (OSError, ValueError) as error:
+            logger.error("Could not save the folder config: %s", error)
+            await self._reply(session, "Server: Could not save the folder config.")
+            return
+        filesystem.invalidate_folders_config()
 
-    def _get_folder_config(self) -> str:
-        """Get folder configuration string."""
-        return "levels\ngani\nimages\n"
+        await self._broadcast_rc_message(
+            f"{session.player.account_name} updated the folder config.")
+
+    def _folder_config_path(self) -> Optional[Path]:
+        """config/foldersconfig.txt under the served folder, the file the file
+        system reads its public roots from (filesystem.py)."""
+        filesystem = getattr(self.server, 'filesystem', None)
+        if not isinstance(getattr(filesystem, 'base_path', None), (str, os.PathLike)):
+            return None
+        return Path(filesystem.folders_config_path())
+
+    def _get_folder_config(self) -> Optional[str]:
+        """foldersconfig.txt as one toCSV row (PlayerRCPackets.cpp:142-145),
+        or None when there is no such file."""
+        path = self._folder_config_path()
+        if path is None:
+            return None
+        try:
+            text = path.read_text(encoding=OPTIONS_FILE_ENCODING)
+        except OSError:
+            return None
+        return to_csv([line[:-1] if line.endswith('\r') else line
+                       for line in text.split('\n')])
 
     # =========================================================================
     # Settings Handlers
@@ -601,26 +710,10 @@ class RCManager:
             await session.player.send_raw(packet)
 
     async def _handle_player_props_set(self, session: RCSession, data: bytes):
-        """Handle RC_PLAYERPROPSSET - Set player properties.
-
-        Wire format (PlayerRCPackets.cpp msgPLI_RC_PLAYERPROPSSET):
-        [GUSHORT player id][prop stream: world/props/flags/chests/weapons -
-        see Player::setPropsFromRCPacket]. Applying the prop stream is not
-        implemented here (stub), so it is left unparsed - only the leading
-        id is read, to identify the target and to stop this handler from
-        misreading the id as a length-prefixed name (the previous
-        `read_string()` call had no length argument and always raised).
-
-        NOTE: if the prop stream is ever applied here, any CURLEVEL change
-        must route through player.warp() rather than mutating position
-        directly - GServer-v2 always re-warps at the end of
-        setPropsFromRCPacket (commit 36f409da) so the client's level state
-        stays in sync.
-        """
+        """Handle RC_PLAYERPROPSSET: [GUSHORT player id][RC prop stream]
+        (PlayerRCPackets.cpp:206-231)."""
         reader = PacketReader(data)
         player_id = reader.read_gshort()
-        # Remainder is the prop stream (world/props/flags/chests/weapons) -
-        # not applied; see docstring.
 
         player = self.server.get_player(player_id)
         if player is None:
@@ -629,39 +722,378 @@ class RCManager:
         # PlayerRCPackets.cpp:213
         if not await self._can_set_attributes(session, target_name):
             return
-
-        await self._broadcast_rc_message(
-            f"{session.player.account_name} modified props for {target_name}"
-        )
+        await self._set_props_from_rc(session, reader, target_name, player)
 
     async def _handle_player_props_set2(self, session: RCSession, data: bytes):
-        """Handle RC_PLAYERPROPSSET2 - Set player properties by account name.
-
-        Wire format (msgPLI_RC_PLAYERPROPSSET2): [GUCHAR-len account
-        name][prop stream] - unlike RC_PLAYERPROPSSET's GUSHORT player id,
-        so this does NOT simply delegate to _handle_player_props_set (that
-        would misread the name's length byte as the high byte of an id).
-        Same stub caveat as _handle_player_props_set applies to the prop
-        stream.
-        """
+        """Handle RC_PLAYERPROPSSET2: [GUCHAR-len account][RC prop stream]
+        for an online or offline account (PlayerRCPackets.cpp:615-654)."""
         reader = PacketReader(data)
         player_name = reader.read_gstring()
         if not self._valid_account_path(player_name):
             return
-        # PlayerRCPackets.cpp:632,642
-        if not await self._can_set_attributes(session, player_name):
+        player = self.server.get_player_by_name(player_name)
+        if player is not None and not self._is_game_client(player):
+            player = None
+        account_manager = getattr(self.server, 'account_manager', None)
+        account = (account_manager.get_account(player_name)
+                   if account_manager is not None else None)
+        # :621-630: an unknown account is ignored without a reply.
+        if player is None and account is None:
             return
-        if (player_name == "(defaultaccount)"
+        # Accounts are looked up case-insensitively, so the packet's spelling
+        # is never used as a key: the online player's name (what chests and
+        # sessions are keyed on) or the stored account's own name.
+        target_name = (player.account_name if player is not None
+                       else account.account_name)
+        # PlayerRCPackets.cpp:632,642
+        if not await self._can_set_attributes(session, target_name):
+            return
+        # :642, case-folded like the account store.
+        if (player_name.lower() == "(defaultaccount)"
                 and not session.has_right(RCRight.MODIFYSTAFFACCOUNT)):
             await self._reply(
                 session, "Server: You are not authorized to modify the default account.")
             return
-        # Remainder is the prop stream (world/props/flags/chests/weapons) -
-        # not applied; see _handle_player_props_set docstring.
+        await self._set_props_from_rc(session, reader, target_name, player)
+
+    @staticmethod
+    def _is_game_client(player: Any) -> bool:
+        return bool(getattr(player, 'connection_type', PLTYPE.CLIENT)
+                    & PLTYPE.ANYCLIENT)
+
+    async def _set_props_from_rc(self, session: RCSession, reader: PacketReader,
+                                 target_name: str, player: Optional['Player']):
+        """Player::setPropsFromRCPacket (PlayerProps.cpp:1241-1322), then the
+        account save and RC notice of PlayerRCPackets.cpp:224-228.
+
+        The whole stream is decoded before anything changes: a truncated
+        stream is refused rather than read as zero counts, which would wipe
+        the account's flags and weapons.
+        """
+        stream = self._parse_rc_prop_stream(reader)
+        if stream is None:
+            await self._reply(session, "Server: Invalid player properties packet.")
+            return
+        props, flags, chests, weapons = stream
+
+        account_manager = getattr(self.server, 'account_manager', None)
+        account = (account_manager.get_account(target_name)
+                   if account_manager is not None else None)
+        online = player if player is not None and self._is_game_client(player) else None
+        if online is None and account is None:
+            return
+
+        state = online if online is not None else account
+        changes = self._rc_prop_changes(session, props, state)
+        for target in (online, account):
+            if target is not None:
+                self._apply_rc_prop_changes(target, changes, target is online)
+
+        flag_sync = self._sync_rc_flags(online, account, flags)
+        chest_ids = [f"{level}:{x},{y}" for level, x, y in chests]
+        if account is not None:
+            account.chests_opened = chest_ids
+        self._sync_rc_chests(target_name, chests)
+        added, removed = self._sync_rc_weapons(online, account, weapons)
+
+        if online is not None:
+            await self._push_rc_changes(online, changes, flag_sync, added, removed, weapons)
+
+        if account is not None and account_manager is not None:
+            account_manager.save_account(account)
 
         await self._broadcast_rc_message(
-            f"{session.player.account_name} modified props for {player_name}"
-        )
+            f"{session.player.account_name} set the attributes of player {target_name}")
+
+    @staticmethod
+    def _parse_rc_prop_stream(reader: PacketReader):
+        """Decode [world][props][flags][chests][weapons] (PlayerProps.cpp:
+        1246-1307); None when any section runs past the packet."""
+        data, pos = reader.data, reader.pos
+
+        def take(count: int) -> bytes:
+            nonlocal pos
+            if count < 0 or pos + count > len(data):
+                raise ValueError("truncated")
+            chunk = data[pos:pos + count]
+            pos += count
+            return chunk
+
+        def gchar() -> int:
+            value = take(1)[0] - 32
+            if value < 0:
+                raise ValueError("bad length")
+            return value
+
+        def gshort() -> int:
+            high, low = take(2)
+            if high < 32 or low < 32:
+                raise ValueError("bad count")
+            return ((high - 32) << 7) + (low - 32)
+
+        def text(count: int) -> str:
+            return take(count).decode('latin-1')
+
+        try:
+            take(gchar())                                  # world name, unused
+            props_blob = take(gchar())
+            flags = [text(gchar()) for _ in range(gshort())]
+            chests = []
+            for _ in range(gshort()):
+                length = gchar()
+                if length < 2:
+                    raise ValueError("bad chest")
+                x, y = gchar(), gchar()
+                chests.append((text(length - 2), x, y))
+            weapons = []
+            for _ in range(gchar()):
+                length = gchar()
+                if length:                                 # :1298 skips empties
+                    weapons.append(text(length))
+        except (ValueError, IndexError):
+            return None
+        props, _clean, _end = parse_prop_stream(
+            props_blob, 0, _INBOUND_STREAM, _RC_PROP_HANDLERS)
+        props = {key: sanitize_value(value) for key, value in props.items()}
+        return props, flags, chests, weapons
+
+    def _rc_prop_changes(self, session: RCSession, props: Dict[Any, Any],
+                         state: Any) -> Dict[str, Any]:
+        """Player::setProp for SetBy::SERVER (PlayerProps.cpp:126-1180),
+        reduced to the props the RC editor shows (PlayerProps.h:229-245) plus
+        the hi-res position and gani attributes. Returns attribute -> value."""
+        config = self.server.config
+        changes: Dict[str, Any] = {}
+        if PLPROP.NICKNAME in props:
+            # :196, Player.cpp:906-911: a server-set nickname is taken as is.
+            changes['nickname'] = props[PLPROP.NICKNAME][:223]
+        max_hearts = getattr(state, 'max_hearts', 3.0)
+        hearts = getattr(state, 'hearts', max_hearts)
+        if PLPROP.MAXPOWER in props:
+            apply_max = getattr(config, 'apply_max_hearts',
+                                lambda value: max(0, min(int(value), 20)))
+            max_hearts = float(apply_max(props[PLPROP.MAXPOWER]))
+            # :217-218 fills the hearts; clamped to the new maximum here.
+            hearts = max_hearts
+            changes['max_hearts'] = max_hearts
+            changes['hearts'] = hearts
+        if PLPROP.CURPOWER in props:
+            new_hearts = max(0.0, min(props[PLPROP.CURPOWER] / 2.0, max_hearts))
+            # :234-235: under 40 AP a heal is refused, for a server set too.
+            if not (getattr(state, 'ap', 50) < 40 and new_hearts > hearts):
+                changes['hearts'] = new_hearts
+        if PLPROP.RUPEESCOUNT in props and self._can_change_gralats(session):
+            changes['rupees'] = min(int(props[PLPROP.RUPEESCOUNT]), 9999999)
+        for prop_id, attr, limit in (
+                (PLPROP.ARROWSCOUNT, 'arrows', 99),       # :266
+                (PLPROP.BOMBSCOUNT, 'bombs', 99),         # :276
+                (PLPROP.GLOVEPOWER, 'glove_power', 3),    # :289
+                (PLPROP.MAGICPOINTS, 'mp', 100),
+                (PLPROP.ALIGNMENT, 'ap', 100)):           # :843
+            if prop_id in props:
+                changes[attr] = max(0, min(int(props[prop_id]), limit))
+        for prop_id, attr in ((PLPROP.KILLSCOUNT, 'kills'),
+                              (PLPROP.DEATHSCOUNT, 'deaths')):
+            if prop_id in props:
+                changes[attr] = max(0, int(props[prop_id]))
+        if PLPROP.SWORDPOWER in props:
+            changes['sword_power'] = config.apply_sword_power(props[PLPROP.SWORDPOWER])
+            if props.get('sword_image'):
+                changes['sword_image'] = props['sword_image'][:223]
+        if PLPROP.SHIELDPOWER in props:
+            changes['shield_power'] = config.apply_shield_power(props[PLPROP.SHIELDPOWER])
+            if props.get('shield_image'):
+                changes['shield_image'] = props['shield_image'][:223]
+        if PLPROP.GANI in props:
+            changes['gani'] = (props[PLPROP.GANI] or 'idle')[:223]
+        if PLPROP.HEADIMAGE in props:
+            changes['head_image'] = props[PLPROP.HEADIMAGE][:123]
+        if PLPROP.BODYIMAGE in props:
+            changes['body_image'] = props[PLPROP.BODYIMAGE][:223]
+        if PLPROP.COLORS in props:
+            changes['colors'] = list(props[PLPROP.COLORS])
+        if PLPROP.STATUS in props:
+            changes['client_status'] = int(props[PLPROP.STATUS])
+        if PLPROP.RATING in props:
+            changes['elo_rating'], changes['elo_deviation'] = (
+                float(value) for value in props[PLPROP.RATING])
+        if PLPROP.X2 in props:
+            changes['x'] = float(props[PLPROP.X2])
+        elif PLPROP.X in props:
+            changes['x'] = props[PLPROP.X] / 2.0
+        if PLPROP.Y2 in props:
+            changes['y'] = float(props[PLPROP.Y2])
+        elif PLPROP.Y in props:
+            changes['y'] = props[PLPROP.Y] / 2.0
+        if props.get(PLPROP.CURLEVEL):
+            changes['level_name'] = props[PLPROP.CURLEVEL]
+        gattribs = {_GATTRIB_INDEX[prop_id]: value[:223]
+                    for prop_id, value in props.items()
+                    if prop_id in _GATTRIB_INDEX and isinstance(value, str)}
+        if gattribs:
+            changes['gattribs'] = gattribs
+        return changes
+
+    def _can_change_gralats(self, session: RCSession) -> bool:
+        """PlayerProps.cpp:1205-1210."""
+        if getattr(self.server.config, 'normaladminscanchangegralats', True):
+            return True
+        is_staff = getattr(self.server, 'is_staff', None)
+        staff = bool(is_staff(session.player.account_name)) if callable(is_staff) else False
+        return staff and session.has_right(RCRight.SETRIGHTS)
+
+    @staticmethod
+    def _apply_rc_prop_changes(target: Any, changes: Dict[str, Any], is_player: bool):
+        """Write decoded changes onto a live player or a stored account."""
+        for attr, value in changes.items():
+            if attr in ('level_name', 'gattribs'):
+                continue
+            if attr in ('gani', 'client_status') and not is_player:
+                continue
+            setattr(target, attr, list(value) if isinstance(value, list) else value)
+        gattribs = changes.get('gattribs', {})
+        if is_player:
+            current = getattr(target, 'gattribs', None)
+            if isinstance(current, dict):
+                current.update(gattribs)
+        else:
+            if 'level_name' in changes:
+                target.level_name = changes['level_name']
+            stored = getattr(target, 'gattribs', None)
+            if isinstance(stored, list):
+                for index, value in gattribs.items():
+                    if 0 <= index < len(stored):
+                        stored[index] = value
+
+    @staticmethod
+    def _sync_rc_flags(online: Any, account: Any, flags: List[str]):
+        """Player::synchronizeFlags (Player.cpp:1017-1083): the sent list
+        replaces the flags. A flag cut at 220 chars by the props reply keeps
+        its stored value when that still starts with the sent one
+        (PlayerProps.cpp:1259-1276)."""
+        current = dict(getattr(online if online is not None else account,
+                               'flags', {}) or {})
+        result: Dict[str, str] = {}
+        for entry in flags:
+            entry = strip_control_chars(entry)
+            if len(entry) > 220:
+                name, _, value = entry[:220].partition('=')
+                existing = current.get(name)
+                if isinstance(existing, str) and existing.startswith(value.strip()):
+                    result.setdefault(name, existing)
+                    continue
+            name, _, value = entry.partition('=')
+            if name:
+                result.setdefault(name, value)
+        for target in (online, account):
+            if target is not None:
+                target.flags = dict(result)
+        return current, result
+
+    def _sync_rc_chests(self, account_name: str, chests: List[tuple]):
+        """Replace which level chests count as opened for this account."""
+        items = getattr(self.server, 'item_manager', None)
+        level_chests = getattr(items, '_chests', None)
+        if not isinstance(level_chests, dict):
+            return
+        wanted = {(level, x, y) for level, x, y in chests}
+        for level_name, entries in level_chests.items():
+            for chest in entries:
+                if (level_name, chest.x, chest.y) in wanted:
+                    chest.opened_by.add(account_name)
+                else:
+                    chest.opened_by.discard(account_name)
+
+    def _weapon_exists(self, name: str) -> bool:
+        """Server::getWeapon: a stored weapon or a built-in one
+        (Server.cpp:1050-1056)."""
+        from .items import DEFAULT_WEAPON_IDS
+        manager = getattr(self.server, 'gs2_manager', None)
+        stored = manager.get_weapon(name) if manager is not None else None
+        return stored is not None or name in DEFAULT_WEAPON_IDS
+
+    def _sync_rc_weapons(self, online: Any, account: Any, weapons: List[str]):
+        """Player::synchronizeWeapons (Player.cpp:1154-1177): drop what is not
+        listed, add what is listed and exists on the server (:1103-1107)."""
+        source = online if online is not None else account
+        current = list(getattr(source, 'weapons', []) or [])
+        removed = [name for name in current if name not in weapons]
+        kept = [name for name in current if name in weapons]
+        added = []
+        for name in weapons:
+            name = strip_control_chars(name)
+            if name and name not in kept and self._weapon_exists(name):
+                kept.append(name)
+                added.append(name)
+        for target in (online, account):
+            if target is not None:
+                target.weapons = list(kept)
+        return added, removed
+
+    async def _push_rc_changes(self, player: Any, changes: Dict[str, Any],
+                               flag_sync: tuple, added: List[str],
+                               removed: List[str], sent_weapons: List[str]):
+        """Tell the edited player and the level what changed, then re-warp
+        (PlayerProps.cpp:1253, 1277, 1308-1321)."""
+        from .protocol.packets import (
+            build_flag_del, build_flag_set, build_npc_weapon_del,
+            build_other_player_props)
+        own = {}
+        for prop_id, attr in _RC_PUSHED_PROPS:
+            if attr in changes:
+                own[prop_id] = self._rc_prop_value(player, prop_id, attr)
+        gattribs = changes.get('gattribs', {})
+        for prop_id, index in _GATTRIB_INDEX.items():
+            if index in gattribs:
+                own[prop_id] = gattribs[index]
+        if own:
+            await player.send_props(own)
+            level = getattr(player, 'level', None)
+            visible = {prop_id: value for prop_id, value in own.items()
+                       if prop_id in _RC_RELAYED_PROPS}
+            if visible and level is not None:
+                await self.server.broadcast_to_world(
+                    level.name, build_other_player_props(player.id, visible),
+                    exclude={player.id})
+
+        before, after = flag_sync
+        for name in before:
+            if name not in after:
+                await player.send_raw(build_flag_del(name))
+        for name, value in after.items():
+            if before.get(name) != value:
+                await player.send_raw(build_flag_set(name, value if value else True))
+
+        for name in removed:
+            await player.send_raw(build_npc_weapon_del(name))
+        manager = getattr(self.server, 'gs2_manager', None)
+        if manager is not None:
+            for name in added:
+                await manager.announce_weapon(player, name)
+        # :1310-1314: the built-in bomb and bow go unless the list kept them.
+        if not any(name in ('bomb', 'Bomb') for name in sent_weapons):
+            await player.send_raw(build_npc_weapon_del("Bomb"))
+        if not any(name in ('bow', 'Bow') for name in sent_weapons):
+            await player.send_raw(build_npc_weapon_del("Bow"))
+
+        level = getattr(player, 'level', None)
+        level_name = changes.get('level_name') or (level.name if level is not None else '')
+        if level_name and callable(getattr(player, 'warp', None)):
+            await player.warp(level_name, player.x, player.y)
+
+    @staticmethod
+    def _rc_prop_value(player: Any, prop_id: int, attr: str) -> Any:
+        if prop_id == PLPROP.MAXPOWER:
+            return int(player.max_hearts)
+        if prop_id == PLPROP.CURPOWER:
+            return int(player.hearts * 2)
+        if prop_id == PLPROP.SWORDPOWER:
+            return (player.sword_power, player.sword_image)
+        if prop_id == PLPROP.SHIELDPOWER:
+            return (player.shield_power, player.shield_image)
+        if prop_id == PLPROP.RATING:
+            return (int(player.elo_rating), int(player.elo_deviation))
+        return getattr(player, attr)
 
     async def _handle_player_props_reset(self, session: RCSession, data: bytes):
         """Handle RC_PLAYERPROPSRESET - Reset player properties."""
@@ -704,16 +1136,27 @@ class RCManager:
             PLPROP.ARROWSCOUNT: player.arrows,
         }
 
-    @staticmethod
-    def _build_rc_player_props_packet(player: 'Player', props: Dict[int, Any]) -> bytes:
-        """Wrap a standard player-property stream in the RC response tail."""
+    def _build_rc_player_props_packet(self, player: 'Player', props: Dict[int, Any]) -> bytes:
+        """Wrap a standard player-property stream in the RC response tail,
+        opened chests included (PlayerProps.cpp:1377-1382): an RC edit sends
+        the chest list back as a replacement, so leaving it out wiped it."""
         props_packet = build_player_props(props)
         props_blob = props_packet[1:-1]
         return build_rc_player_props(
             player.id, player.account_name, props_blob,
             flags=getattr(player, 'flags', {}),
+            chests=self._opened_chests(player.account_name),
             weapons=getattr(player, 'weapons', ()),
         )
+
+    def _opened_chests(self, account_name: str) -> List[tuple]:
+        items = getattr(self.server, 'item_manager', None)
+        level_chests = getattr(items, '_chests', None)
+        if not isinstance(level_chests, dict):
+            return []
+        return [(level_name, chest.x, chest.y)
+                for level_name, entries in level_chests.items()
+                for chest in entries if account_name in chest.opened_by]
 
     async def _handle_disconnect_player(self, session: RCSession, data: bytes):
         """Handle RC_DISCONNECTPLAYER - Disconnect a player."""
@@ -768,7 +1211,7 @@ class RCManager:
         if not self._valid_account_path(player_name):
             return
         # PlayerRCPackets.cpp:807
-        if (player_name != session.player.account_name
+        if (not self._is_own_account(session, player_name)
                 and not await self._require_right(
                     session, RCRight.SETRIGHTS,
                     "Server: You are not authorized to view that player's rights.")):
@@ -809,7 +1252,7 @@ class RCManager:
             if account:
                 account.admin_rights = mask_rc_rights(
                     session.rights, rights,
-                    player_name.lower() == session.player.account_name.lower())
+                    self._is_own_account(session, account.account_name))
                 # PlayerRCPackets.cpp:885-900: IPs are unrestricted; folders are filtered.
                 account.admin_ip = admin_ip
                 account.folders = [
@@ -1014,8 +1457,8 @@ class RCManager:
         if not self._valid_account_path(account_name):
             return
 
-        # PlayerRCPackets.cpp:450
-        if account_name == "(defaultaccount)":
+        # PlayerRCPackets.cpp:450; the account store ignores case.
+        if account_name.lower() == "(defaultaccount)":
             await self._reply(
                 session, "Server: You are not allowed to delete the default account.")
             return
@@ -1888,8 +2331,16 @@ class RCManager:
         await self._reply(session, message)
         return False
 
+    @staticmethod
+    def _is_own_account(session: RCSession, name: str) -> bool:
+        """Whether `name` is the sender's account. Accounts are stored and
+        looked up case-insensitively (account.py get_account), so a
+        wrong-case spelling of the sender's own name is the same account."""
+        return name.lower() == session.player.account_name.lower()
+
     async def _can_set_attributes(self, session: RCSession, name: str) -> bool:
-        right = (RCRight.SETSELFATTRIBUTES if name == session.player.account_name
+        # PlayerRCPackets.cpp:213,632.
+        right = (RCRight.SETSELFATTRIBUTES if self._is_own_account(session, name)
                  else RCRight.SETATTRIBUTES)
         if not session.has_right(right):
             logger.info("%s attempted to set a player's properties.",

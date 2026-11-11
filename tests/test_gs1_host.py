@@ -977,8 +977,9 @@ def test_hitplayer_uses_halfhearts_and_cpp_push_encoding():
         npc = make_npc("if (created) { hitplayer 0,3.9,9,10; }", level)
         run_npc_event(npc, "created", Server(), None)
         await asyncio.sleep(0)
-        # normalized (target-from)=(1,0), push 4 tiles, *16, midpoint 64
-        assert cm.damaged == [(target.id, 3, 128, 64)]
+        # (player centre = top-left + (1.5, 2.0)) - from = (2.5, 2.0), normalized,
+        # push 4 tiles, *16, midpoint 64 (12ad27cf; was (128, 64) from top-left)
+        assert cm.damaged == [(target.id, 3, 113, 103)]
 
     asyncio.run(main())
 
@@ -1110,10 +1111,13 @@ def test_hideimgs_all_open_ended_and_inclusive_forms(command, remaining):
     assert set(npc.showimgs) == remaining
 
 
-def test_setshape_converts_pixel_dimensions_to_tiles():
-    npc = make_npc("if (created) { setshape 1,32,17; }")
+@pytest.mark.parametrize("args,expected", [
+    ("1,32,17", (32, 17)), ("1,0,0", (0, 0)), ("1,17,17", (17, 17)),
+    ("1,16.9,3.2", (16, 3)), ("2,40,40", None)])
+def test_setshape_stores_exact_pixels(args, expected):
+    npc = make_npc("if (created) { setshape " + args + "; }")
     run_npc_event(npc, "created", None, None)
-    assert npc.shape == (2, 2)
+    assert getattr(npc, "shape", None) == expected
 
 
 def test_timevar2_is_unix_seconds_and_playerfreezetime_counts_down():

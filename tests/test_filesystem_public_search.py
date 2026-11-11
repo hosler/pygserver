@@ -93,6 +93,9 @@ def test_foldersconfig_adds_public_folders_but_never_private_ones(tmp_path):
           "file    ../outside/*\n"
           "file    *.gani\n")
     touch(tmp_path / "extras" / "extra.png")
+    # A non-standard first folder must also exist under world/ (filesystem.py
+    # _folders_config_root); see tests/test_rcnc_1110_rc.py for the refusals.
+    (tmp_path / "world" / "extras").mkdir(parents=True)
     touch(tmp_path / "accounts" / "acct.txt")
     touch(tmp_path.parent / "outside" / "out.png")
     fs = make_fs(tmp_path)

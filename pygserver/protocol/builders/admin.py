@@ -15,6 +15,106 @@ from typing import Any, Dict, Optional  # noqa: F401  - kept: original import bl
 
 logger = logging.getLogger(__name__)
 
+
+# =============================================================================
+# Comma-text codecs used by the RC/NC config and script packets
+# =============================================================================
+
+def to_csv(fields: Sequence[str]) -> str:
+    """string::toCSV (GServer-v2 StringUtils.h:975-1011): a field holding a
+    quote, comma, backslash or any byte outside 32..126 (a tab-indented script
+    line, a latin-1 letter; :984-986) is quoted, with quotes and backslashes
+    doubled inside."""
+    parts = []
+    for value in fields:
+        if any(c in '",\\' or not 32 <= ord(c) <= 126 for c in value):
+            parts.append('"' + ''.join(c * 2 if c in '"\\' else c
+                                       for c in value) + '"')
+        else:
+            parts.append(value)
+    return ','.join(parts)
+
+
+def from_csv(text: str) -> List[str]:
+    """string::fromCSV (StringUtils.h:1046-1135), including its quirks: a
+    trailing empty field is dropped and text after a closing quote up to the
+    next comma is skipped."""
+    tokens: List[str] = []
+    token: List[str] = []
+    word_start, quoted = True, False
+    i, n = 0, len(text)
+    while i < n:
+        c = text[i]
+        if word_start and c == '"':
+            word_start, quoted = False, True
+            i += 1
+            continue
+        if quoted:
+            following = text[i + 1] if i + 1 < n else None
+            if c in ('\\', '"') and following == c:
+                token.append(c)
+                i += 2
+                continue
+            if c == '"':
+                word_start, quoted = True, False
+                tokens.append(''.join(token))
+                token = []
+                comma = text.find(',', i + 1)
+                if comma < 0:
+                    break
+                i = comma + 1
+                continue
+            token.append(c)
+        elif c == ',':
+            word_start = True
+            tokens.append(''.join(token))
+            token = []
+        else:
+            token.append(c)
+            word_start = False
+        i += 1
+    if token:
+        tokens.append(''.join(token))
+    return tokens
+
+
+def guntokenize_text(text: str) -> str:
+    """CString::guntokenize (gs2lib CString.cpp:1101-1174): comma-text to
+    newline-separated text. A lone backslash is dropped, `\\\\` becomes one."""
+    out: List[str] = []
+    n = len(text)
+    i = 0
+    in_quotes = bool(text) and text[0] == '"'
+    if in_quotes:
+        i = 1
+    while i < n:
+        c = text[i]
+        if c == ',' and not in_quotes:
+            out.append('\n')
+            while i + 1 < n and text[i + 1] == ' ':
+                i += 1
+            if i + 1 < n and text[i + 1] == '"':
+                in_quotes = True
+                i += 1
+        elif c == '"':
+            if not in_quotes:
+                out.append(c)
+            elif i + 1 < n:
+                if text[i + 1] == '"':
+                    out.append('"')
+                    i += 1
+                elif text[i + 1] == ',':
+                    in_quotes = False
+        elif c == '\\':
+            if i + 1 < n and text[i + 1] == '\\':
+                out.append('\\')
+                i += 1
+        else:
+            out.append(c)
+        i += 1
+    return ''.join(out)
+
+
 # =============================================================================
 # RC (Remote Control) Packets
 # =============================================================================
@@ -69,7 +169,9 @@ def build_rc_player_props(player_id: int, account: str, props: bytes,
     flags = flags or {}
     builder.write_gshort(len(flags))
     for name, value in flags.items():
-        builder.write_gstring(f"{name}={value}"[:223])
+        entry = f"{name}={value}"
+        # PlayerProps.cpp:1370-1371: a long flag is cut and marked.
+        builder.write_gstring(entry[:220] + "[!]" if len(entry) > 220 else entry)
 
     builder.write_gshort(len(chests))
     for chest in chests:
@@ -308,10 +410,11 @@ def build_nc_npc_flags(npc_id: int, flags: List[str]) -> bytes:
 
 
 def build_nc_class_get(name: str, script: str) -> bytes:
-    """Build PLO_NC_CLASSGET packet."""
+    """Build PLO_NC_CLASSGET: `{CHAR len}{name}` then the source lines as one
+    raw toCSV row (PlayerNCPackets.cpp:452)."""
     builder = PacketBuilder().write_gchar(PLO.NC_CLASSGET)
     builder.write_gstring(name)
-    builder.write_gstring_short(script)
+    builder.write_string(to_csv(script.split("\n")))
     builder.write_newline()
     return builder.build()
 
@@ -342,10 +445,11 @@ def build_nc_weapon_list(weapons: List[str]) -> bytes:
 
 
 def build_nc_weapon_get(name: str, image: str, script: str) -> bytes:
-    """Build PLO_NC_WEAPONGET packet."""
+    """Build PLO_NC_WEAPONGET: `{CHAR len}{name}{CHAR len}{image}` then the
+    raw source with every newline sent as 0xA7 (PlayerNCPackets.cpp:601-618)."""
     builder = PacketBuilder().write_gchar(PLO.NC_WEAPONGET)
     builder.write_gstring(name)
     builder.write_gstring(image)
-    builder.write_string(script)
+    builder.write_string(script.replace("\n", "\xa7"))
     builder.write_newline()
     return builder.build()

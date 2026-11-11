@@ -433,6 +433,9 @@ class GameServer:
 
         if player.id in self.players:
             del self.players[player.id]
+        forget = getattr(getattr(self, 'npc_manager', None), 'forget_player', None)
+        if forget is not None:
+            forget(player)
 
         # Part chat channels + roster pushes (after the players-dict removal
         # so the parted player gets no roster traffic)

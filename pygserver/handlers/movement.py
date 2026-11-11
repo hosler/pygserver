@@ -155,6 +155,9 @@ class MovementHandlers:
 
         if PLPROP.GANI in props:
             self.gani = props[PLPROP.GANI]
+            npc_manager = getattr(self.server, 'npc_manager', None)
+            if npc_manager is not None and self.level:
+                await npc_manager.on_player_gani(self)
 
         # Local level chat (PLPROP_CURCHAT, sent by Client.send_level_chat via
         # PLI_PLAYERPROPS) fires the GS1 "playerchats" NPC event, e.g. the

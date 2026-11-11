@@ -10,7 +10,10 @@ from typing import TYPE_CHECKING, Optional, Dict, List, Set, Callable
 from dataclasses import dataclass
 
 from .irc import guntokenize
-from .protocol.constants import PLI, NPCBLOCKFLAG, NPCVISFLAG
+from .items import DEFAULT_WEAPON_IDS
+from .protocol.builders.admin import from_csv
+from .protocol.constants import PLI, PLTYPE, NPCBLOCKFLAG, NPCVISFLAG
+from .text_safety import has_control_chars
 from .protocol.packets import (
     PacketReader,
     build_nc_level_dump,
@@ -25,6 +28,7 @@ from .protocol.packets import (
     build_nc_class_delete,
     build_nc_weapon_list,
     build_nc_weapon_get,
+    build_npc_weapon_del,
     build_rc_chat,
 )
 
@@ -177,13 +181,13 @@ class NCManager:
     async def _handle_npc_delete(self, session: NCSession, data: bytes):
         """Handle NC_NPCDELETE - Delete an NPC (PlayerNCPackets.cpp:64).
 
-        The reference only deletes database NPCs; pygserver keeps no such
-        distinction, so any NPC the manager holds can be removed.
+        Only database NPCs, i.e. the ones NC_NPCADD created (:75); level and
+        server-spawned NPCs are left alone.
         """
         npc_id = PacketReader(data).read_gint3()
 
         npc = self.server.npc_manager.get_npc(npc_id)
-        if npc:
+        if npc is not None and getattr(npc, 'database_npc', False):
             await self.server.npc_manager.destroy_npc(npc)
             await self._broadcast_to_ncs(build_nc_npc_delete(npc_id))
             await self._send_to_ncs(
@@ -201,7 +205,8 @@ class NCManager:
         npc_id = PacketReader(data).read_gint3()
 
         npc = self.server.npc_manager.get_npc(npc_id)
-        if npc:
+        # PlayerNCPackets.cpp:99: database NPCs only.
+        if npc is not None and getattr(npc, 'database_npc', False):
             if npc.level is not None:
                 from .protocol.packets import build_npc_del
                 await self.server.broadcast_to_level(
@@ -342,8 +347,9 @@ class NCManager:
             return
 
         # An unknown or empty level leaves the NPC unattached (:371-387).
-        level = self.server.world.get_level(level_name) if level_name else None
+        level, x, y = self._npc_add_location(level_name, x, y)
         npc = manager.create_npc(name=name, level=level, x=x, y=y, npc_id=npc_id)
+        npc.database_npc = True
         npc.script_type = npc_type
         npc.scripter = scripter
         npc.mark_dirty()
@@ -352,6 +358,29 @@ class NCManager:
             npc.id, name, npc_type, level.name if level else ""))
         await self._send_to_ncs(f"NPC {name} added by {session.player.account_name}")
         logger.info(f"NC {session.player.account_name} created NPC {npc.id} on {level_name}")
+
+    def _npc_add_location(self, level_name: str, x: float, y: float):
+        """Level and level-local position for NC_NPCADD.
+
+        PlayerNCPackets.cpp:392-408 puts an NPC named on a gmap segment onto
+        the gmap, its position shifted by the segment's offset. NPCs here live
+        on the segment itself in its own coordinates, which is the same place.
+        Named on the gmap itself (Server.cpp:1350-1355), the position is
+        gmap-wide and picks the segment it falls in.
+        """
+        world = self.server.world
+        if not level_name:
+            return None, x, y
+        if level_name.endswith('.gmap') and hasattr(world, 'get_gmap'):
+            gmap = world.get_gmap(level_name) or world.get_gmap(level_name[:-5])
+            if gmap is not None:
+                local_x, local_y, grid_x, grid_y = gmap.world_to_local(x, y)
+                segment = gmap.get_level_at(grid_x, grid_y)
+                level = world.get_level(segment) if segment else None
+                if level is not None:
+                    return level, local_x, local_y
+                return None, x, y
+        return world.get_level(level_name), x, y
 
     async def _handle_local_npcs_get(self, session: NCSession, data: bytes):
         """Handle NC_LOCALNPCSGET - Dump the NPCs on a level
@@ -430,10 +459,15 @@ class NCManager:
         logger.debug(f"NC {session.player.account_name} editing class {class_name}")
 
     async def _handle_class_add(self, session: NCSession, data: bytes):
-        """Handle NC_CLASSADD - Add/update a class."""
+        """Handle NC_CLASSADD: `{CHAR len}{name}` then the source as a toCSV
+        row of lines (PlayerNCPackets.cpp:468-470)."""
         reader = PacketReader(data)
         class_name = reader.read_gstring()
-        script = reader.remaining().decode('latin-1', errors='replace')
+        script = "\n".join(from_csv(
+            reader.remaining().decode('latin-1', errors='replace')))
+        if not class_name or has_control_chars(class_name):
+            await self._send_error(session, "class", "invalid class name")
+            return
 
         from .gs1_host import compile_gs1
         try:
@@ -445,15 +479,20 @@ class NCManager:
         manager = await self._require_gs2_manager(session, "class")
         if manager is None:
             return
+        existing = manager.get_class(class_name) is not None
         try:
             manager.upsert_class(class_name, script)
         except OSError as error:
             await self._send_error(session, "class", f"save failed: {error}")
             return
 
-        # Notify NC sessions
-        packet = build_nc_class_add(class_name)
-        await self._broadcast_to_ncs(packet)
+        # PlayerNCPackets.cpp:481-490: only a new class is announced; either
+        # way every NC is told who added or updated it.
+        if not existing:
+            await self._broadcast_to_ncs(build_nc_class_add(class_name))
+        await self._send_to_ncs(
+            f"Script {class_name} {'updated' if existing else 'added'} "
+            f"by {session.player.account_name}")
 
         logger.info(f"NC {session.player.account_name} updated class {class_name}")
 
@@ -507,7 +546,9 @@ class NCManager:
             return
         weapon = manager.get_weapon(weapon_name)
         if weapon is None:
-            await self._send_error(session, "weapon", f"not found: {weapon_name}")
+            # PlayerNCPackets.cpp:595-598: told to every NC.
+            await self._broadcast_to_ncs(build_rc_chat(
+                f"{session.player.account_name} prob: weapon {weapon_name} doesn't exist"))
             return
 
         packet = build_nc_weapon_get(weapon.name, weapon.image, weapon.source)
@@ -516,11 +557,23 @@ class NCManager:
         logger.debug(f"NC {session.player.account_name} editing weapon {weapon_name}")
 
     async def _handle_weapon_add(self, session: NCSession, data: bytes):
-        """Handle NC_WEAPONADD - Add/update a weapon."""
+        """Handle NC_WEAPONADD: `{CHAR len}{name}{CHAR len}{image}` then the
+        source with newlines sent as 0xA7 (PlayerNCPackets.cpp:633-638)."""
         reader = PacketReader(data)
         weapon_name = reader.read_gstring()
         image = reader.read_gstring()
-        script = reader.remaining().decode('latin-1', errors='replace')
+        script = reader.remaining().decode('latin-1', errors='replace').replace('\xa7', '\n')
+        if (not weapon_name or has_control_chars(weapon_name)
+                or has_control_chars(image)):
+            await self._send_error(session, "weapon", "invalid weapon name or image")
+            return
+        # :646-648: a built-in weapon (Server.cpp:1050-1056) is never replaced.
+        # Stored weapons are keyed by lowercase name (gs2.py get_weapon), so
+        # `Bow` would shadow the built-in `bow`: compare the same way.
+        manager = getattr(self.server, 'gs2_manager', None)
+        if (weapon_name.strip().lower() in DEFAULT_WEAPON_IDS and manager is not None
+                and manager.get_weapon(weapon_name) is None):
+            return
 
         from .gs1_host import compile_gs1
         try:
@@ -546,7 +599,11 @@ class NCManager:
                     held.lower() for held in (getattr(player, 'weapons', []) or [])}:
                 await manager.announce_weapon(player, weapon_name)
 
-        # server/src/player/packets/PlayerNCPackets.cpp:677-679.
+        await self._send_to_ncs(
+            f"Weapon/GUI-script {weapon_name} {'updated' if existing else 'added'} "
+            f"by {session.player.account_name}")
+        # PlayerNCPackets.cpp:677-679: only a new weapon refreshes the
+        # sender's list.
         if not existing:
             await self._handle_weapon_list_get(session, b"")
 
@@ -580,9 +637,20 @@ class NCManager:
         except OSError as error:
             await self._send_error(session, "weapon", f"delete failed: {error}")
             return
+        # PlayerNCPackets.cpp:692-710: every NC hears the outcome, the sender
+        # gets the fresh list after a delete, and Server.cpp:2464 drops the
+        # weapon from every game client.
         if not deleted:
-            await self._send_error(session, "weapon", f"not found: {weapon_name}")
+            await self._send_to_ncs(
+                f"{session.player.account_name} prob: weapon {weapon_name} doesn't exist")
             return
+        await self._send_to_ncs(
+            f"Weapon {weapon_name} deleted by {session.player.account_name}")
+        packet = build_npc_weapon_del(weapon_name)
+        for player in self.server.get_all_players():
+            if getattr(player, 'connection_type', PLTYPE.CLIENT) & PLTYPE.ANYCLIENT:
+                await player.send_raw(packet)
+        await self._handle_weapon_list_get(session, b"")
 
         logger.info(f"NC {session.player.account_name} deleted weapon {weapon_name}")
 

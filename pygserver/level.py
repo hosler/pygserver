@@ -14,11 +14,17 @@ from pathlib import Path
 
 from reborn_protocol.coords import LEVEL_SIZE, in_level_bounds, level_index
 
+from . import tiletypes
+
 if TYPE_CHECKING:
     from .player import Player
     from .npc import NPC
 
 logger = logging.getLogger(__name__)
+
+
+class LevelLoadError(ValueError):
+    """A level file the reference loader refuses (too short to carry a version)."""
 
 
 # Item name -> id, mirrors GServer-v2 LevelItem::ItemNames (index == LevelItemType).
@@ -125,6 +131,8 @@ class Level:
 
         except FileNotFoundError:
             logger.warning(f"Level file not found: {file_path}")
+        except LevelLoadError:
+            raise
         except Exception as e:
             logger.error(f"Error loading level {file_path}: {e}")
 
@@ -285,12 +293,19 @@ class Level:
         """
         Parse NW level file format.
 
+        Raises LevelLoadError for data shorter than the 8-byte version header:
+        the reference loader returns false there (LevelLoader.cpp:263-265,
+        0baf970a) rather than registering a blank level.
+
         NW format sections:
         - BOARD: Tile data as base64-encoded text rows
         - LINKS: Level warps
         - SIGNS: Sign text
         - NPCS: Level NPCs
         """
+        if len(data) < 8:
+            raise LevelLoadError(
+                f"level data is {len(data)} bytes; needs the 8-byte version header")
         # Decode to text for parsing BOARD lines
         try:
             text = data.decode('latin-1', errors='replace')
@@ -435,6 +450,25 @@ class Level:
             idx = level_index(x, y) * 2
             self._tiles[idx] = tile_id & 0xFF
             self._tiles[idx + 1] = (tile_id >> 8) & 0xFF
+
+    def tile_type_at(self, x: int, y: int,
+                     tileset: int = tiletypes.TILESET_CLASSIC) -> int:
+        """Tile type at whole-tile (x, y) of THIS level (Level::getTileTypeAt,
+        Level.cpp:3083-3101): outside 0..63 is BLOCKING and an id >= 4096 is
+        BLOCKING. Neighbouring gmap segments are resolved by
+        collision.tile_type_at, which calls this for the in-range case."""
+        if not in_level_bounds(x, y):
+            return tiletypes.BLOCKING
+        return tiletypes.strict_tile_type(self.get_tile(x, y), tileset)
+
+    def is_on_wall(self, x: int, y: int,
+                   tileset: int = tiletypes.TILESET_CLASSIC) -> bool:
+        """Level::isOnWall(tile) (Level.cpp:2872-2884): throw-through, jump
+        stone and blocking tiles are walls."""
+        return self.tile_type_at(x, y, tileset) in tiletypes.WALL_TYPES
+
+    #: Older spelling kept for callers that already use it.
+    is_blocking = is_on_wall
 
     def get_board_packet(self) -> bytes:
         """Get tile data as board packet (8192 bytes)."""
@@ -608,7 +642,11 @@ class LevelManager:
         level_path = self.find_level_path(name)
         if level_path is None:
             return None
-        level = Level.load(str(level_path))
+        try:
+            level = Level.load(str(level_path))
+        except LevelLoadError as e:
+            logger.warning(f"Refusing level {level_path}: {e}")
+            return None
         self._levels[name] = level
         return level
 

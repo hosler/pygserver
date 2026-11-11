@@ -4,9 +4,73 @@ pygserver.config - Server configuration
 Defines server settings and paths.
 """
 
+import os
+import secrets
+import stat
 from dataclasses import dataclass, field
 from typing import List, Dict, Optional
 from pathlib import Path
+
+
+# serveroptions.txt and foldersconfig.txt travel as raw bytes on the wire
+# (RC_SERVEROPTIONSGET/SET, RC_FOLDERCONFIGGET/SET), which this server decodes
+# as latin-1; the files are read and written the same way so every byte
+# round-trips.
+OPTIONS_FILE_ENCODING = 'latin-1'
+# Characters str.splitlines() treats as a line end, beyond '\n' itself.
+LINE_BREAK_CHARS = frozenset('\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029')
+
+
+def atomic_write_text(path, text: str,
+                      encoding: str = OPTIONS_FILE_ENCODING) -> None:
+    """Replace a text file in one step without changing what it is.
+
+    The write lands on a symlink's target rather than replacing the link,
+    keeps the existing file's permission bits (a new file gets 0666 less the
+    umask, like open()), and goes through a temporary file in the target's
+    own folder that is fsynced before the rename and removed on any error.
+    Text that does not encode raises before the disk is touched.
+    """
+    data = text.encode(encoding)
+    real = Path(os.path.realpath(path))
+    real.parent.mkdir(parents=True, exist_ok=True)
+    try:
+        mode: Optional[int] = stat.S_IMODE(os.stat(real).st_mode)
+    except FileNotFoundError:
+        mode = None
+    for _attempt in range(16):
+        temporary = real.parent / f".{real.name}.{secrets.token_hex(6)}.tmp"
+        try:
+            fd = os.open(temporary, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o666)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise FileExistsError(f"no free temporary name beside {real}")
+    try:
+        with os.fdopen(fd, 'wb') as stream:
+            stream.write(data)
+            stream.flush()
+            os.fsync(stream.fileno())
+        if mode is not None:
+            os.chmod(temporary, mode)
+        os.replace(temporary, real)
+    except BaseException:
+        try:
+            os.unlink(temporary)
+        except OSError:
+            pass
+        raise
+    try:
+        directory = os.open(real.parent, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(directory)
+    except OSError:
+        pass
+    finally:
+        os.close(directory)
 
 
 @dataclass
@@ -81,6 +145,22 @@ class ServerConfig:
     # Server.h:165: Player::addWeapon(LevelItemType) is a no-op when off.
     defaultweapons: bool = True
 
+    # Level tileset selection (Server.h:510-511, Server.cpp:1384-1405): which
+    # tile-type table collision reads. `newtilesets` flips every level to the
+    # new-format table, `newtilesetlevels` (comma list of globs/prefixes) only
+    # the matching ones.
+    newtilesets: bool = False
+    newtilesetlevels: List[str] = field(default_factory=list)
+
+    # Server.h:178: gani names (comma list, no attributes) whose being set on a
+    # player makes the server test the sword rectangle for NPC `washit`
+    # (PlayerProps.cpp:373). An empty value turns the feature off.
+    playerswordganis: List[str] = field(default_factory=lambda: ["sword"])
+
+    # scriptengine-gs1.txt `explodedwithjolt` (ScriptEngineGS1.h:173): the
+    # joltbomb flag on exploded events. Default true, like the reference.
+    explodedwithjolt: bool = True
+
     # Builtin triggeractions (GServer-v2/server/include/Server.h:143-150).
     triggerhack_weapons: bool = False
     triggerhack_groups: bool = True
@@ -94,6 +174,15 @@ class ServerConfig:
     # Ambient world population: number of wandering VillagerNPCs to spawn on
     # the start level at boot (0 disables). See npcs/villager.py.
     villager_count: int = 8
+
+    # Server.h:161: whether an RC without staff + set-rights may change a
+    # player's gralats (PlayerProps.cpp:1205-1210).
+    normaladminscanchangegralats: bool = True
+
+    # The serveroptions.txt this config was loaded from; RC option edits are
+    # written back here. Empty for an in-memory config, which then persists
+    # nothing.
+    options_path: str = ""
 
     @classmethod
     def from_server_dir(cls, server_dir: str) -> 'ServerConfig':
@@ -114,6 +203,10 @@ class ServerConfig:
             config = cls.from_file(str(config_file))
         else:
             config = cls()
+        config.options_path = str(config_file)
+
+        config._apply_script_engine_gs1(
+            server_path / "config" / "scriptengine-gs1.txt")
 
         # Set paths relative to server directory
         config.base_dir = str(server_path)
@@ -124,6 +217,22 @@ class ServerConfig:
 
         return config
 
+    def _apply_script_engine_gs1(self, path) -> None:
+        """Read the options this server honours from scriptengine-gs1.txt
+        (same `key=value`, `#` comment format as serveroptions.txt)."""
+        try:
+            with open(path, 'r') as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or line.startswith('#') or '=' not in line:
+                        continue
+                    key, value = line.split('=', 1)
+                    if key.strip().lower() == 'explodedwithjolt':
+                        self.explodedwithjolt = (
+                            value.split('#', 1)[0].strip().lower() == 'true')
+        except OSError:
+            pass  # absent file: reference defaults
+
     @classmethod
     def from_file(cls, path: str) -> 'ServerConfig':
         """
@@ -132,8 +241,10 @@ class ServerConfig:
         Format is key = value pairs, one per line.
         """
         config = cls()
+        config.options_path = str(path)
         try:
-            with open(path, 'r') as f:
+            # The encoding RC_SERVEROPTIONSSET writes the file with.
+            with open(path, 'r', encoding=OPTIONS_FILE_ENCODING) as f:
                 for line in f:
                     line = line.strip()
                     if not line or line.startswith('#'):
@@ -199,6 +310,14 @@ class ServerConfig:
                             config.apsystem = scalar.lower() == 'true'
                         elif key in ('aptime0', 'aptime1', 'aptime2', 'aptime3', 'aptime4'):
                             config.aptime[int(key[-1])] = int(scalar)
+                        elif key == 'newtilesets':
+                            config.newtilesets = scalar.lower() == 'true'
+                        elif key == 'playerswordganis':
+                            config.playerswordganis = [
+                                g.strip() for g in value.split(',') if g.strip()]
+                        elif key == 'newtilesetlevels':
+                            config.newtilesetlevels = [
+                                g.strip() for g in value.split(',') if g.strip()]
                         elif key == 'putnpcenabled':
                             config.putnpc_enabled = scalar.lower() == 'true'
                         elif key in (
@@ -206,6 +325,7 @@ class ServerConfig:
                             'baddyitems',
                             'lockplayerz',
                             'defaultweapons',
+                            'normaladminscanchangegralats',
                             'triggerhack_weapons', 'triggerhack_groups',
                             'triggerhack_guilds', 'triggerhack_rc',
                             'triggerhack_levels', 'triggerhack_props',
@@ -245,32 +365,83 @@ class ServerConfig:
         """Apply the reference's heartlimit and hard maximum of 20 hearts."""
         return max(0, min(int(hearts), self.heart_limit, 20))
 
+    def option_lines(self) -> List[str]:
+        """The serveroptions.txt lines `to_file` writes."""
+        lines = [
+            "# pygserver configuration",
+            f"name = {self.name}",
+            f"description = {self.description}",
+            f"serverport = {self.port}",
+            f"staff = {','.join(self.staff)}",
+            f"noverifylogin = {str(not self.verify_login).lower()}",
+            f"startlevel = {self.start_level}",
+            f"startx = {self.start_x}",
+            f"starty = {self.start_y}",
+            f"maxplayers = {self.max_players}",
+            f"heartlimit = {self.heart_limit}",
+            f"apsystem = {str(self.apsystem).lower()}",
+            f"dontupdateratingd = {str(self.dontupdateratingd).lower()}",
+            f"putnpcenabled = {str(self.putnpc_enabled).lower()}",
+        ]
+        lines += [f"aptime{band} = {seconds}"
+                  for band, seconds in enumerate(self.aptime)]
+        for key in (
+            'serverside',
+            'baddyitems',
+            'lockplayerz',
+            'defaultweapons',
+            'triggerhack_weapons', 'triggerhack_groups',
+            'triggerhack_guilds', 'triggerhack_rc', 'triggerhack_levels',
+            'triggerhack_props', 'triggerhack_execscript', 'triggerhack_files',
+        ):
+            lines.append(f"{key} = {str(getattr(self, key)).lower()}")
+        return lines
+
     def to_file(self, path: str):
         """Save configuration to file."""
-        with open(path, 'w') as f:
-            f.write(f"# pygserver configuration\n")
-            f.write(f"name = {self.name}\n")
-            f.write(f"description = {self.description}\n")
-            f.write(f"serverport = {self.port}\n")
-            f.write(f"staff = {','.join(self.staff)}\n")
-            f.write(f"noverifylogin = {str(not self.verify_login).lower()}\n")
-            f.write(f"startlevel = {self.start_level}\n")
-            f.write(f"startx = {self.start_x}\n")
-            f.write(f"starty = {self.start_y}\n")
-            f.write(f"maxplayers = {self.max_players}\n")
-            f.write(f"heartlimit = {self.heart_limit}\n")
-            f.write(f"apsystem = {str(self.apsystem).lower()}\n")
-            f.write(f"dontupdateratingd = {str(self.dontupdateratingd).lower()}\n")
-            f.write(f"putnpcenabled = {str(self.putnpc_enabled).lower()}\n")
-            for band, seconds in enumerate(self.aptime):
-                f.write(f"aptime{band} = {seconds}\n")
-            for key in (
-                'serverside',
-                'baddyitems',
-                'lockplayerz',
-                'defaultweapons',
-                'triggerhack_weapons', 'triggerhack_groups',
-                'triggerhack_guilds', 'triggerhack_rc', 'triggerhack_levels',
-                'triggerhack_props', 'triggerhack_execscript', 'triggerhack_files',
-            ):
-                f.write(f"{key} = {str(getattr(self, key)).lower()}\n")
+        with open(path, 'w', encoding=OPTIONS_FILE_ENCODING,
+                  errors='replace') as f:
+            for line in self.option_lines():
+                f.write(line + "\n")
+
+    @staticmethod
+    def update_options_file(path: str, updates) -> None:
+        """Write `key = value` pairs into an existing options file in place.
+
+        Every line whose key is updated is rewritten (the loader applies lines
+        in order, so a duplicate left stale would win); every other line,
+        comment and key is kept; new keys are appended. The file is replaced
+        atomically. Keys and values are refused if they could start a new line
+        or change what the loader reads as the key.
+        """
+        pending: Dict[str, str] = {}
+        for key, value in updates:
+            key = str(key).strip().lower()
+            value = str(value).strip()
+            if (not key or key.startswith('#') or '=' in key
+                    or any(c.isspace() or not c.isprintable() for c in key)
+                    or any(c in value for c in '\n\0')
+                    or LINE_BREAK_CHARS.intersection(value)):
+                raise ValueError(f"invalid option line for {key!r}")
+            pending[key] = value
+        if not pending:
+            return
+        try:
+            text = Path(path).read_text(encoding=OPTIONS_FILE_ENCODING)
+        except FileNotFoundError:
+            text = ""
+        lines = text.split('\n')
+        if lines and lines[-1] == '':
+            lines.pop()
+        written = set()
+        for index, line in enumerate(lines):
+            stripped = line.strip()
+            if not stripped or stripped.startswith('#') or '=' not in stripped:
+                continue
+            key = stripped.split('=', 1)[0].strip().lower()
+            if key in pending:
+                lines[index] = f"{key} = {pending[key]}"
+                written.add(key)
+        lines += [f"{key} = {value}" for key, value in pending.items()
+                  if key not in written]
+        atomic_write_text(path, '\n'.join(lines) + '\n')

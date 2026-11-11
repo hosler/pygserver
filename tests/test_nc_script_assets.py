@@ -44,20 +44,20 @@ def class_add(name, script):
 def test_weapon_nc_round_trip_and_replacement_persists(tmp_path):
     nc, session, server = make_nc(tmp_path)
 
-    run(nc._handle_weapon_add(session, weapon_add("bow", "bow.png", "setcharani idle,;")))
+    run(nc._handle_weapon_add(session, weapon_add("longbow", "bow.png", "setcharani idle,;")))
     run(nc._handle_weapon_list_get(session, b""))
-    assert b"bow" in session.player.send_raw.await_args.args[0]
-    run(nc._handle_weapon_get(session, b"bow"))
+    assert b"longbow" in session.player.send_raw.await_args.args[0]
+    run(nc._handle_weapon_get(session, b"longbow"))
     assert b"bow.png" in session.player.send_raw.await_args.args[0]
     assert b"setcharani idle,;" in session.player.send_raw.await_args.args[0]
 
-    run(nc._handle_weapon_add(session, weapon_add("bow", "new.png", "setcharani walk,;")))
-    weapon = server.gs2_manager.get_weapon("bow")
+    run(nc._handle_weapon_add(session, weapon_add("longbow", "new.png", "setcharani walk,;")))
+    weapon = server.gs2_manager.get_weapon("longbow")
     parsed = parse_weapon_file(Path(weapon.source_path).read_text(encoding="latin-1"))
-    assert parsed == ("bow", "new.png", "setcharani walk,;")
+    assert parsed == ("longbow", "new.png", "setcharani walk,;")
 
-    run(nc._handle_weapon_delete(session, b"bow"))
-    assert server.gs2_manager.get_weapon("bow") is None
+    run(nc._handle_weapon_delete(session, b"longbow"))
+    assert server.gs2_manager.get_weapon("longbow") is None
     assert not Path(weapon.source_path).exists()
 
 

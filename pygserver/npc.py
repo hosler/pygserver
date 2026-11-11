@@ -12,9 +12,11 @@ import time
 from typing import TYPE_CHECKING, Optional, Dict, Any, List, Callable, Tuple
 from pathlib import Path
 
+from . import collision, npc_motion
 from .attachments import absolute_position
 
-from .protocol.packets import PacketBuilder, build_npc_props
+from .protocol.packets import (
+    PacketBuilder, build_npc_del, build_npc_moved, build_npc_props)
 from .protocol.constants import PLO, NPCPROP
 from .text_safety import strip_control_chars
 
@@ -124,6 +126,8 @@ class NPC:
         self.visible = True
         self.block_flags = 0
         self.vis_flags = 0
+        # `noplayeronwall;` - onwall() ignores players for this NPC.
+        self.no_player_on_wall = False
 
         # NPCPROP_HURTDXDY: signed push (dx, dy) in half pixels, each clamped to
         # [-32, 32] (hurtPushDeltaInHalfPixels, NPC.h:622); None until something
@@ -142,10 +146,9 @@ class NPC:
         self.script_instance: Optional[Any] = None
 
         # GS1 script (legacy Reborn scripting): parsed program + persistent
-        # NPC-scoped variable dicts. Only this./thiso. survive across events;
-        # local. is TEMPORARY (like temp.) and gets a fresh dict per script
-        # execution in gs1_host.run_npc_event, so it is deliberately NOT
-        # given a slot here (see memory: gs1-python-port, upstream d6c78ef3).
+        # NPC-scoped variable dicts. this./thiso. and local. survive across
+        # events (local. is created on first use by gs1.execution, per NPC and
+        # per joined class; upstream 07932208); temp. is fresh every run.
         self.gs1_program: Optional[Any] = None
         self.gs1_source = ""
         self.client_script: str = ""
@@ -172,6 +175,25 @@ class NPC:
         # advanced by NPCManager.tick() using real elapsed time.
         self._move_target: Optional[tuple] = None
         self._move_speed = 0.0
+
+        # Move queue (npc_motion.py): timed moves announced to clients with
+        # PLO_MOVE(2). `_move_events` counts finished informwhendone moves not
+        # yet fired as `movementfinished`; `_position_check` asks the manager
+        # to clamp / roll the position after the queue or a prop moved it.
+        self.move_queue = npc_motion.new_queue()
+        self._move_events = 0
+        self._position_check = False
+        # Players who knew this NPC on the segment it just left, player -> that
+        # level's name. They keep hearing about it while it stays on a
+        # neighbouring segment of the gmap (NPCManager._npc_recipients). The
+        # player object is kept with the id and compared by identity: ids are
+        # reused by later logins, which must not inherit a predecessor's hold
+        # (NPCManager.forget_player purges on disconnect).
+        self._seam_players: Dict[int, Tuple['Player', str]] = {}
+        self._last_relocate = 0.0
+        # Wall probes left for script-driven move flushes this tick
+        # (npc_motion.WALL_BUDGET); the tick loop refills it.
+        self._wall_budget = npc_motion.WALL_BUDGET
 
         # Timer
         self._timer_end: float = 0.0
@@ -295,6 +317,10 @@ class NPC:
             if value == getattr(self, attr, 0):
                 return {}
             setattr(self, attr, value)
+            if attr in ('x', 'y'):
+                # A client moving the NPC ends a running move, and the
+                # testForLinks clamp follows (NPC.cpp:2038).
+                npc_motion.cancel_moves(self)
             return {prop_id: value, paired: value}
         if 23 <= prop_id <= 32:
             saves = getattr(self, 'saves', [0] * 10)
@@ -358,8 +384,13 @@ class NPC:
                 updates[18] = 0
         return updates
 
-    def build_props_packet(self, *, include_script: bool = True) -> bytes:
-        """Build NPC properties, including the client script for full sends."""
+    def build_props_packet(self, *, include_script: bool = True,
+                           include_position: bool = True) -> bytes:
+        """Build NPC properties, including the client script for full sends.
+
+        `include_position=False` leaves out X/Y/X2/Y2: a client that is
+        animating a PLO_MOVE ends the move when it receives a position prop
+        (NPC.cpp:493-500)."""
         props = {
             NPCPROP.IMAGE: self.image,
             NPCPROP.X: self.x,
@@ -376,6 +407,9 @@ class NPC:
             NPCPROP.SPRITE: int(self.direction) & 0x03,
             NPCPROP.GLOVEPOWER: self.glove_power,
         }
+        if not include_position:
+            for prop in (NPCPROP.X, NPCPROP.Y, NPCPROP.X2, NPCPROP.Y2):
+                del props[prop]
         if include_script and self.client_script:
             script = self.client_script.replace("\n", "\xa7").encode(
                 "latin-1", errors="replace")
@@ -518,8 +552,7 @@ class NPCApi:
 
     @x.setter
     def x(self, value: float):
-        self._npc.x = value
-        self._npc.mark_dirty()
+        self._write_position('x', value)
 
     @property
     def y(self) -> float:
@@ -527,7 +560,19 @@ class NPCApi:
 
     @y.setter
     def y(self, value: float):
-        self._npc.y = value
+        self._write_position('y', value)
+
+    def _write_position(self, attr: str, value: float):
+        """Same rules as a script `x = ...`: pixel wrap, moves cancelled."""
+        try:
+            tiles = npc_motion.script_coordinate(
+                self._manager.server, self._npc, attr, float(value))
+        except (TypeError, ValueError):
+            return
+        if tiles is None:
+            return
+        setattr(self._npc, attr, tiles)
+        npc_motion.cancel_moves(self._npc)
         self._npc.mark_dirty()
 
     @property
@@ -703,6 +748,14 @@ class NPCManager:
     Handles NPC creation, destruction, script loading, and event dispatch.
     """
 
+    #: How long a sword-gani washit shadows the client's hit report.
+    SWORD_SWING_SECONDS = 0.6
+    #: Longest a tick advances the NPC move queues, like the 0.25 s clamp on
+    #: smooth movement: a stalled loop does not replay seconds of motion.
+    MAX_MOVE_TICK_MS = 250
+    #: Minimum gap between two gmap rolls of one NPC.
+    RELOCATE_COOLDOWN = 0.5
+
     def __init__(self, server: 'GameServer'):
         self.server = server
 
@@ -717,6 +770,10 @@ class NPCManager:
         # Last tick() timestamp, used to compute real elapsed time for
         # smooth (per-tick) NPC movement. None until the first tick.
         self._last_move_tick: Optional[float] = None
+        self._move_clock_ns: Optional[int] = None
+
+        # (player id, npc id) -> when a sword-gani rectangle last fired washit.
+        self._sword_hits: Dict[Tuple[int, int], float] = {}
 
     def _allocate_id(self) -> int:
         """Next NPC id that no NPC or weapon runtime already holds."""
@@ -828,6 +885,9 @@ class NPCManager:
         prog = (compile_gs1(server_code, raise_errors=raise_errors)
                 if server_code.strip() else None)
         npc.gs1_program = prog
+        # A new script is a new wrapper in the reference: no old locals.
+        npc.gs1_scopes.pop("local", None)
+        npc.gs1_scopes.pop("local_classes", None)
         npc.gs1_source = code
         npc.client_script = client_code
         # Test doubles stand in for Level here, so look the hook up.
@@ -858,15 +918,90 @@ class NPCManager:
         sword swing (see gs1_host._c_hitnpc, combat.handle_hit_objects)."""
         self._fire_gs1(npc, 'washit', player)
 
+    async def on_player_gani(self, player: 'Player'):
+        """Serverside sword washit (98f18f46, PlayerProps.cpp:362-391): a
+        gani named in `playerswordganis` hits every visible NPC whose event
+        box meets the sword rectangle in front of the player (inclusive
+        edges). The `spin` gani's four-point test is left to the client's
+        PLI_HITOBJECTS. Needs the NPC server, i.e. `serverside`."""
+        config = self.server.config
+        level = player.level
+        if level is None or not getattr(config, 'serverside', True):
+            return
+        name = (getattr(player, 'gani', '') or 'idle').split(',', 1)[0]
+        if name == 'spin' or name not in getattr(config, 'playerswordganis', ()):
+            return
+        x, y = absolute_position(player)
+        rect = collision.sword_hit_rect(
+            collision.tiles_to_pixels(x), collision.tiles_to_pixels(y),
+            getattr(player, 'direction', 2))
+        # The reference searches by distance in whole-map coordinates
+        # (Level::findIntersectingNPCsForEvent, Level.cpp:3546-3562), so an NPC
+        # on a neighbouring segment can be hit: shift its box into this level's
+        # frame.
+        for near, (shift_x, shift_y) in self.nearby_levels(level):
+            for npc in self.get_npcs_on_level(near):
+                box = collision.npc_event_rect(npc)
+                if box is not None:
+                    box = (box[0] + shift_x, box[1] + shift_y, box[2], box[3])
+                if collision.rects_intersect(rect, box):
+                    self._note_sword_hit(player, npc)
+                    self._fire_gs1(npc, 'washit', player)
+
+    def _gmap_info(self, level: 'Level'):
+        lookup = getattr(getattr(self.server, 'world', None),
+                         'get_gmap_for_level', None)
+        return lookup(level.name) if lookup is not None else None
+
+    def nearby_levels(self, level: 'Level'):
+        """`level` and the gmap segments around it as (level, pixel offset of
+        that segment from `level`); just `level` off a gmap. Missing segments
+        are skipped."""
+        found = [(level, (0, 0))]
+        info = self._gmap_info(level)
+        if info is None:
+            return found
+        world = self.server.world
+        gmap, grid_x, grid_y = info
+        for step_y in (-1, 0, 1):
+            for step_x in (-1, 0, 1):
+                if not step_x and not step_y:
+                    continue
+                name = gmap.get_level_at(grid_x + step_x, grid_y + step_y)
+                near = world.get_level(name) if name else None
+                if near is not None:
+                    found.append((near, (step_x * 1024, step_y * 1024)))
+        return found
+
+    def _note_sword_hit(self, player: 'Player', npc: NPC):
+        now = time.monotonic()
+        if len(self._sword_hits) > 256:
+            self._sword_hits = {key: when for key, when in self._sword_hits.items()
+                                if now - when < self.SWORD_SWING_SECONDS}
+        self._sword_hits[(player.id, npc.id)] = now
+
+    def sword_hit_recent(self, player: 'Player', npc: NPC) -> bool:
+        """True while a gani-rectangle washit from `player` on `npc` is
+        still within the same swing; PLI_HITOBJECTS skips its own washit then
+        so one swing fires one event (the reference tolerates both)."""
+        when = self._sword_hits.get((player.id, npc.id))
+        return when is not None and time.monotonic() - when < self.SWORD_SWING_SECONDS
+
     async def on_npc_wasshot(self, npc: NPC, source: str,
                               player: Optional['Player'] = None):
         """Fire `wasshot` on an NPC hit by an arrow. `source` is
         "player"/"baddy"/"npc" (see _fire_gs1)."""
         self._fire_gs1(npc, 'wasshot', player, source=source)
 
-    async def on_npc_exploded(self, npc: NPC, player: Optional['Player'] = None):
-        """Fire `exploded` on an NPC caught in a bomb explosion radius."""
-        self._fire_gs1(npc, 'exploded', player)
+    async def on_npc_exploded(self, npc: NPC, player: Optional['Player'] = None,
+                              carryobject_type=None):
+        """Fire `exploded` on an NPC caught in a bomb explosion radius.
+
+        `carryobject_type` is the blast's CarryObjectType (BOMB or JOLTBOMB,
+        Level.cpp:2255-2262); it rides the event so `explodedwithjolt` can
+        read it (25396a18)."""
+        self._fire_gs1(npc, 'exploded', player,
+                       carryobject_type=carryobject_type)
 
     async def on_npc_waspelt(self, npc: NPC, carryobject_type,
                              player: Optional['Player'] = None):
@@ -929,29 +1064,192 @@ class NPCManager:
             npc.level.remove_npc(npc)
 
             # Notify players on level
-            from .protocol.packets import build_npc_del
             packet = build_npc_del(npc.id)
             if notify:
                 await self.server.broadcast_to_level(level_name, packet)
+                # Holders on a segment the NPC left. One that has since
+                # walked onto the NPC's own level just got the broadcast.
+                for player, home in list(getattr(npc, '_seam_players', {}).values()):
+                    if self._holds(player, home) and home != level_name:
+                        await player.send_raw(packet)
+        getattr(npc, '_seam_players', {}).clear()
 
     async def warp_npc(self, npc: NPC, level_name: str, x: float, y: float):
-        """Warp an NPC to a new location."""
-        old_level = npc.level
-
-        # Remove from old level
-        if old_level:
-            old_level.remove_npc(npc)
-
-        # Find new level
+        """Warp an NPC to a new location (NPC::warp, NPC.cpp:166-240)."""
         new_level = self.server.world.get_level(level_name)
-        if new_level:
-            npc.x = x
-            npc.y = y
-            new_level.add_npc(npc)
+        if new_level is None:
+            return  # NPC::warp(nullptr) is a no-op; the NPC stays where it is
+        # A forced move ends any running move (NPC.cpp:185).
+        npc.move_queue.clear()
+        npc.x = x
+        npc.y = y
+        if new_level is npc.level:
+            npc.mark_dirty()
+            return
+        await self.relocate_npc(npc, new_level)
 
-            # Notify players
-            packet = npc.build_props_packet()
-            await self.server.broadcast_to_level(new_level.name, packet)
+    async def relocate_npc(self, npc: NPC, new_level: 'Level'):
+        """Move `npc` into `new_level` and tell the clients.
+
+        NPC.cpp:206-231: PLO_NPCMOVED (new level and local position) makes a
+        client that knows the NPC re-home or hide it; players on the new level
+        then get the full props, show-images and running move queue as for a
+        new arrival (Level::sendNPCToPlayer, Level.cpp:1466-1485). The
+        reference sends PLO_NPCMOVED to every player and keeps updating the
+        ones nearby; only the old level's players held the NPC before, so only
+        they are told, and while the NPC stays on a neighbouring segment of the
+        gmap they keep receiving its updates (`_npc_recipients`)."""
+        old_level = npc.level
+        if old_level is not None:
+            old_level.remove_npc(npc)
+            await self.server.broadcast_to_level(
+                old_level.name,
+                build_npc_moved(npc.id, new_level.name, npc.x, npc.y))
+            # Players of the segment it left (not those it never reached).
+            near = {level.name for level, _ in self.nearby_levels(new_level)}
+            if old_level.name in near:
+                for player in self.server.audience.players_on_level(old_level.name):
+                    npc._seam_players[player.id] = (player, old_level.name)
+        new_level.add_npc(npc)
+        npc._dirty = False
+        npc._last_relocate = time.monotonic()
+        # The new level has heard of none of the moves yet; the tick sends the
+        # whole queue to it with the next batch (NPC.cpp:1484 equivalent).
+        for move in npc.move_queue:
+            move.sent = False
+        props = npc.build_props_packet()
+        await self.server.broadcast_to_level(new_level.name, props)
+        showimgs = npc.build_showimgs_packet()
+        if showimgs is not None:
+            await self.server.broadcast_to_level(new_level.name, showimgs)
+        # Holders that are still in reach (this also covers the ones from an
+        # earlier roll) get the exact position, not just PLO_NPCMOVED's half
+        # tiles; the ones the NPC left behind are told to forget it now, as
+        # nothing may be dirty afterwards to trigger that.
+        for holder in await self._seam_holders(npc):
+            await holder.send_raw(props)
+
+    def forget_player(self, player: 'Player') -> None:
+        """A player left the server: no NPC may keep it as a holder (its id
+        can be handed to the next login)."""
+        for npc in self._npcs.values():
+            held = npc._seam_players.get(player.id)
+            if held is not None and held[0] is player:
+                del npc._seam_players[player.id]
+
+    def _holds(self, player, home: str) -> bool:
+        """True while `player` is still connected and still on the segment
+        `home` it held an NPC from."""
+        if self.server.get_player(getattr(player, 'id', None)) is not player:
+            return False
+        return getattr(getattr(player, 'level', None), 'name', None) == home
+
+    async def _seam_holders(self, npc: NPC) -> List['Player']:
+        """Reconcile the players holding `npc` from a segment it left, and
+        return the ones that still do. A holder is dropped once it enters the
+        NPC's level (it got the NPC as an arrival), leaves its segment or
+        disconnects; one the NPC has moved out of reach of is told to delete
+        it so it does not keep a frozen copy."""
+        if not npc._seam_players or npc.level is None:
+            return []
+        level_name = npc.level.name
+        near = {near.name for near, _ in self.nearby_levels(npc.level)}
+        holders = []
+        for player_id, (player, home) in list(npc._seam_players.items()):
+            if not self._holds(player, home) or home == level_name:
+                del npc._seam_players[player_id]
+            elif home not in near:
+                del npc._seam_players[player_id]
+                await player.send_raw(build_npc_del(npc.id))
+            else:
+                holders.append(player)
+        return holders
+
+    async def _npc_recipients(self, npc: NPC) -> List['Player']:
+        """Players on the NPC's level plus those still holding it from a
+        segment it left (see relocate_npc and _seam_holders)."""
+        recipients = self.server.audience.players_on_level(npc.level.name)
+        if not npc._seam_players:
+            return recipients
+        recipients.extend(await self._seam_holders(npc))
+        return recipients
+
+    async def _broadcast_to_npc(self, npc: NPC, packet: bytes):
+        if not npc._seam_players:
+            await self.server.broadcast_to_level(npc.level.name, packet)
+            return
+        for player in await self._npc_recipients(npc):
+            await player.send_raw(packet)
+
+    async def confine_position(self, npc: NPC):
+        """NPC::testForLinks position handling (cc20c9d0, NPC.cpp:2038-2091).
+
+        Off a gmap the NPC is clamped to local pixels 0..976 (61 tiles) on
+        both axes. On a gmap there is no clamp: a position outside the
+        segment rolls the NPC into the neighbouring segment, i.e. into that
+        level. The reference computes the roll with a truncating divide and
+        abs(), which leaves a small negative offset where it is and mirrors a
+        larger one; we floor instead so walking left rolls left. A neighbour
+        that does not exist leaves the NPC where it is (it would otherwise
+        vanish into a segment nobody can load).
+
+        An NPC that just rolled waits RELOCATE_COOLDOWN seconds before it may
+        roll again, so one that oscillates across a seam cannot make every tick
+        send the whole NPC (script included) to a level."""
+        npc._position_check = False
+        level = npc.level
+        if level is None:
+            return
+        px = collision.tiles_to_pixels(npc.x)
+        py = collision.tiles_to_pixels(npc.y)
+        info = self._gmap_info(level)
+        if info is None:
+            clamped = (min(max(px, 0), 61 * 16), min(max(py, 0), 61 * 16))
+            if clamped != (px, py):
+                if clamped[0] != px:
+                    npc.x = clamped[0] / 16.0
+                if clamped[1] != py:
+                    npc.y = clamped[1] / 16.0
+                npc.mark_dirty()
+            return
+        world = self.server.world
+        gmap, grid_x, grid_y = info
+        shift_x, shift_y = px // 1024, py // 1024
+        if not shift_x and not shift_y:
+            return
+        name = gmap.get_level_at(grid_x + shift_x, grid_y + shift_y)
+        target = world.get_level(name) if name else None
+        if target is None:
+            return
+        if time.monotonic() - npc._last_relocate < self.RELOCATE_COOLDOWN:
+            npc._position_check = True      # roll once the cooldown is over
+            return
+        npc.x = (px - shift_x * 1024) / 16.0
+        npc.y = (py - shift_y * 1024) / 16.0
+        await self.relocate_npc(npc, target)
+
+    async def _run_move_queues(self, delta_ms: int):
+        """NPCServer.cpp:208: step every NPC's move queue, then let
+        `movementfinished` scripts run."""
+        for npc in list(self._npcs.values()):
+            npc_motion.refill_wall_budget(npc)
+            if npc.move_queue and delta_ms:
+                npc_motion.process_queue(npc, self.server, delta_ms)
+        for npc in list(self._npcs.values()):
+            if npc._position_check:
+                await self.confine_position(npc)
+            while npc._move_events:
+                npc._move_events -= 1
+                if npc.id in self._npcs:
+                    self._fire_gs1(npc, 'movementfinished')
+
+    async def _send_new_moves(self):
+        for npc in list(self._npcs.values()):
+            if npc.level is None or not any(
+                    not move.sent for move in npc.move_queue):
+                continue
+            await npc_motion.send_unsent_moves(
+                npc, self.server, await self._npc_recipients(npc))
 
     async def tick(self):
         """Process NPC timers and re-broadcast changed NPCs (every server tick)."""
@@ -965,10 +1263,21 @@ class NPCManager:
             dt = max(0.0, min(now - self._last_move_tick, 0.25))
         self._last_move_tick = now
 
+        # Whole milliseconds since the last tick for the move queues; the
+        # sub-millisecond remainder carries over so no time is lost.
+        now_ns = time.monotonic_ns()
+        if self._move_clock_ns is None:
+            self._move_clock_ns = now_ns
+        delta_ms = (now_ns - self._move_clock_ns) // 1_000_000
+        self._move_clock_ns += delta_ms * 1_000_000
+        delta_ms = min(delta_ms, self.MAX_MOVE_TICK_MS)
+
         for npc in list(self._npcs.values()):
             if npc.is_moving and npc.advance_movement(dt):
                 api = npc.get_api(self)
                 await npc.trigger_event('on_move_done', api)
+
+        await self._run_move_queues(delta_ms)
 
         timed_npcs = list(self._npcs.values()) + list(self._weapon_runtimes.values())
         for npc in timed_npcs:
@@ -998,9 +1307,15 @@ class NPCManager:
                 if npc.level:
                     # Movement/appearance updates only carry the script after
                     # an attachment or NC edit; level-entry sends remain full.
-                    packet = npc.build_props_packet(include_script=npc._script_dirty)
+                    packet = npc.build_props_packet(
+                        include_script=npc._script_dirty,
+                        include_position=not npc.move_queue)
                     npc._script_dirty = False
-                    await self.server.broadcast_to_level(npc.level.name, packet)
+                    await self._broadcast_to_npc(npc, packet)
+
+        # PLO_MOVE(2) for the moves queued since the last tick, after the props
+        # (NPCServer.cpp:231).
+        await self._send_new_moves()
 
     async def on_player_enters(self, player: 'Player', level: 'Level'):
         """Trigger on_player_enters for NPCs on level."""
@@ -1057,15 +1372,22 @@ class NPCManager:
             return
         # Strict containment, matching the reference: triggerDistance there is
         # only a candidate-search radius; the hit test is positionInRectangle
-        # against the unexpanded {position, shape} rect (GServer-v2
-        # server/include/npcserver/NPCServer.h addEventToLevelNPCsAtPosition).
+        # against the NPC's EVENT box (GServer-v2 server/include/npcserver/
+        # NPCServer.h addEventToLevelNPCsAtPosition, 56ac0f20): an invisible
+        # NPC gets none, a character NPC is its 32x32 feet box, and NOBLOCK
+        # does not matter. A shapeless non-character NPC keeps pygserver's
+        # 2x2-tile box (the reference has no such default).
+        # The point stays unrounded so a sub-pixel miss still misses.
+        point = (x * 16, y * 16)
         for npc in self.get_npcs_on_level(level):
             if npc is source_npc:
                 continue
-            shape = getattr(npc, 'shape', None) or (2, 2)
-            width, height = shape[:2]
-            if (npc.x <= x <= npc.x + width
-                    and npc.y <= y <= npc.y + height):
+            rect = collision.npc_event_rect(npc)
+            if rect is None:
+                continue
+            if not getattr(npc, 'shape', None) and not collision.npc_is_character(npc):
+                rect = (rect[0], rect[1], 32, 32)
+            if collision.rect_contains_point(rect, *point):
                 self._fire_gs1(npc, 'action' + event, player,
                                source='npc' if source_npc is not None else 'player',
                                params=fields[1:])

@@ -69,10 +69,18 @@ class CarryObjectSprite(IntEnum):
 
 
 class CarryObjectType(IntEnum):
+    # GServer-v2 utilities/CommonTypes.h:485-501. The script-facing value an
+    # event carries (`peltwith*`, `explodedwithjolt`), not the wire sprite.
+    NONE = 0
+    BOMB = 1
     BUSH = 2
     STONE = 3
     VASE = 4
     SIGN = 5
+    SUPERBOMB = 6
+    JOLTBOMB = 7
+    HOTJOLTBOMB = 8
+    HOTBOMB = 9
     BLACKSTONE = 10
     NPC = 11
     PLAYER = 12
@@ -515,7 +523,11 @@ class CombatManager:
                 if hasattr(npc, 'mark_dirty'):
                     npc.mark_dirty()
                 if hasattr(npc_mgr, 'on_npc_exploded'):
-                    await npc_mgr.on_npc_exploded(npc, attacker)
+                    # Level.cpp:2255-2262: a power-3 blast is a joltbomb.
+                    await npc_mgr.on_npc_exploded(
+                        npc, attacker,
+                        CarryObjectType.JOLTBOMB if power == 3
+                        else CarryObjectType.BOMB)
 
     async def _destroy_blast_blocks(self, level: 'Level', cells):
         # FourPlay TServerLevel.cpp:1542: replace only complete matching blocks.
@@ -1254,6 +1266,10 @@ class CombatManager:
                 npc.hearts = max(0.0, npc.hearts - power)
                 if hasattr(npc, 'mark_dirty'):
                     npc.mark_dirty()
+                # A sword gani already fired washit for this swing.
+                recent = getattr(npc_mgr, 'sword_hit_recent', None)
+                if recent is not None and recent(player, npc):
+                    continue
                 if hasattr(npc_mgr, 'on_npc_washit'):
                     await npc_mgr.on_npc_washit(npc, player)
 

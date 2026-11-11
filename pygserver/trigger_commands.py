@@ -13,6 +13,7 @@ import logging
 import struct
 
 from .gs2 import parse_csv_tolerant
+from .npc_motion import send_move_packets
 from .protocol.constants import NPCPROP, PLPROP, PLO
 from .protocol.packets import (
     PacketBuilder,
@@ -100,22 +101,13 @@ async def _npc_move(server, player, fields, action):
         return False
     npc = server.npc_manager.get_npc(npc_id)
     if npc is not None:
-        from .handlers.versions import client_version
-        from reborn_protocol.props import NPC_PROPS, encode_value
-        # NPC.cpp:485-565: pixel sign/magnitude coordinates since version 2.3.
-        classic = (PacketBuilder().write_gchar(PLO.MOVE).write_gint3(npc_id)
-                   .write_gchar(int(npc.x * 2)).write_gchar(int(npc.y * 2))
-                   .write_gchar(dx * 2 + 100).write_gchar(dy * 2 + 100)
-                   .write_gshort(ticks).write_gchar(options)
-                   .write_newline().build())
-        modern = PacketBuilder().write_gchar(PLO.MOVE2).write_gint3(npc_id)
-        for value in (npc.x, npc.y, dx, dy):
-            modern.write_bytes(encode_value(NPC_PROPS[NPCPROP.X2], value))
-        modern.write_gshort(ticks).write_gchar(options).write_newline()
+        # TriggerCommandHandlers.cpp:261-266 builds the packet by hand; the
+        # shared builders emit the same bytes the NPC move queue sends.
+        move = [(int(npc.x * 16), int(npc.y * 16), dx * 16, dy * 16,
+                 ticks, options)]
         if npc.level is not None:
-            for recipient in server.audience.players_in_world(npc.level.name):
-                await recipient.send_raw(
-                    modern.build() if client_version(recipient) >= 2.3 else classic)
+            await send_move_packets(
+                npc.id, move, server.audience.players_in_world(npc.level.name))
         npc.x = _tile_position(npc.x + dx)
         npc.y = _tile_position(npc.y + dy)
     return True

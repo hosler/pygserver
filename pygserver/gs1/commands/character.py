@@ -5,6 +5,7 @@ import time
 
 from reborn_protocol.gs1.values import to_num, to_str
 
+from ... import collision, npc_motion
 from ...attachments import absolute_position
 from ..host import (
     NPC_CHARPROP, PLAYER_CHARPROP, PLAYER_PROP_WIRE, PLPROP, _CLASSIC_COLOR_INDEX, _NPC_GATTRIB_PROPS, _PLAYER_GATTRIB_PROPS, _charprop_target,
@@ -57,33 +58,54 @@ def _c_show(self, a, npc, player, ctx):
         self._dirty(npc)
 
 def _c_move(self, a, npc, player, ctx):
-    if npc is not None and len(a) >= 2:
-        npc.x = to_num(getattr(npc, "x", 0)) + to_num(a[0])
-        npc.y = to_num(getattr(npc, "y", 0)) + to_num(a[1])
-        self._dirty(npc)
+    # move dx,dy,time,options: queue a timed move (GS1Commands.cpp:1681-1694,
+    # NPC::addMoveToQueue). The delta goes through toLocalPixelPosition, whose
+    # int32 overload is `% 1024` (Extents.h:441-446), so a delta of 64 tiles
+    # or more wraps. Missing time/options are 0 (the reference rejects any
+    # argument count but four).
+    if npc is None or len(a) < 2 or not hasattr(npc, "move_queue"):
+        return
+    delta = tuple(int(math.fmod(collision.tiles_to_pixels(to_num(value)), 1024))
+                  for value in a[:2])
+    duration = to_num(a[2]) if len(a) > 2 else 0.0
+    options = to_num(a[3]) if len(a) > 3 else 0.0
+    if not (math.isfinite(duration) and math.isfinite(options)):
+        return
+    npc_motion.queue_move(npc, self.server, delta, duration,
+                          max(0, min(255, math.floor(options))))
 
 def _c_setnick(self, a, npc, player, ctx):
     if npc is not None and a:
         npc.nickname = to_str(a[0])
         self._dirty(npc)
 
+def _c_noplayeronwall(self, a, npc, player, ctx):
+    # noplayeronwall; - onwall/onwall2 stop counting players as walls for
+    # this NPC (GS1Commands.cpp:1698-1708, NPC::noPlayerOnWall).
+    if npc is not None:
+        npc.no_player_on_wall = True
+
+def _floor_u16(value):
+    """DoubleAsIntegralFloor<uint16_t>: floor, clamped into 0..65535."""
+    try:
+        return max(0, min(0xFFFF, math.floor(value)))
+    except (OverflowError, ValueError):
+        return 0
+
+
 def _c_setshape(self, a, npc, player, ctx):
     # setshape type,width,height — type 1 is a fully-solid box; other type
     # values are unimplemented in the GServer-v2 C++ oracle too
-    # (GS1Commands.cpp:2384 fn_setshape returns early unless type == 1).
-    # width/height arguments are pixels and the stored collision shape uses
-    # tiles, matching the client host's conversion. Not a wire prop (no NPCPROP for a
-    # shape rect) — this is server-side collision geometry; note for the
-    # touch-handling owner: nothing in gs1_host.py currently *reads*
-    # npc.shape for collision, so a touch-handler change elsewhere would be
-    # needed to make setshape blocking actually take effect.
+    # (GS1Commands.cpp:2765 fn_setshape returns early unless type == 1).
+    # npc.shape holds exact pixels like the reference (GS1Commands.cpp:2780:
+    # DoubleAsIntegralFloor<uint16_t>, no tile rounding); collision.py's NPC
+    # boxes and the npcs[].width/height getters are its readers. It is not a
+    # wire prop.
     if npc is None or len(a) < 3:
         return
     if int(to_num(a[0])) != 1:
         return
-    width = max(1, (int(to_num(a[1])) + 15) // 16)
-    height = max(1, (int(to_num(a[2])) + 15) // 16)
-    npc.shape = (width, height)
+    npc.shape = (_floor_u16(to_num(a[1])), _floor_u16(to_num(a[2])))
 
 def _gattribs_of(obj):
     ga = getattr(obj, "gattribs", None)
@@ -553,6 +575,7 @@ _COMMANDS = {
     'throwcarry': _c_throwcarry,
     'takeplayercarry': _c_takeplayercarry,
     'dontblock': _c_dontblock,
+    'noplayeronwall': _c_noplayeronwall,
     'blockagain': _c_blockagain,
     'canbecarried': _c_canbecarried,
     'cannotbecarried': _c_cannotbecarried,

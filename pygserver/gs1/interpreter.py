@@ -31,6 +31,17 @@ class ServerInterpreter(Interpreter):
         return super()._value_of(text)
 
     def _ex_Call(self, node):
+        # getnearestplayers(x, y, condition): the reference hands the host the
+        # unevaluated condition and re-runs it per player (ca160f9e,
+        # GS1Functions.cpp:597-660), so the third argument is NOT evaluated
+        # eagerly here like every other call argument.
+        if (node.name == "getnearestplayers" and len(node.args) >= 3
+                and node.name not in self.ctx.functions):
+            args = [self.eval(arg) for arg in node.args[:2]]
+            condition = node.args[2]
+            result = self.ctx.host._nearest_players(
+                args, self.ctx, lambda: self.eval(condition))
+            return result
         if node.name == "getflagkeys" and node.name not in self.ctx.functions:
             args = [self.eval(arg) for arg in node.args]
             prefix = to_str(args[0]) if args else ""

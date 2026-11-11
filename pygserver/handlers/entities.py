@@ -1,5 +1,6 @@
 """Baddies, client-created level NPCs, and the player's weapon list."""
 
+import fnmatch
 import logging
 import os
 from pathlib import Path
@@ -23,6 +24,56 @@ def _level_mod_time(level) -> float:
         return os.stat(path).st_mtime if path else 0.0
     except OSError:
         return 0.0
+
+
+def _folders_config_entries(filesystem):
+    """(category, glob) lines of config/foldersconfig.txt, after the comment
+    and whitespace rules of Server::loadFolderConfig (Server.cpp:497-512).
+    The file system parses and caches them per version of the file, and
+    drops any line whose glob could leave the public folders."""
+    return filesystem.folders_config_entries()
+
+
+def _glob_matches(path: str, glob: str) -> bool:
+    """string::match (StringUtils.h:1622-1700): case-sensitive, `*` also
+    crosses `/`, `?` is one character, nothing else is special."""
+    return fnmatch.fnmatchcase(path, glob.replace('[', '[[]'))
+
+
+def find_putnpc_script(filesystem, name):
+    """The PLI_PUTNPC script file, FileCategory::FILE by bare name
+    (PlayerClientPackets.cpp:768).
+
+    With a foldersconfig.txt, only files whose world-relative path matches a
+    `file <glob>` line qualify (FileSystem.cpp:398-411, 750-764), drawn from
+    the public folders a client can already fetch by bare name. Without one,
+    the lookup stays in the world folder. A path or a name outside those
+    folders is never read (the reference's direct-path check at
+    FileSystem.cpp:475-481 is left out on purpose).
+    """
+    entries = _folders_config_entries(filesystem)
+    if not entries:
+        return filesystem._find_file(
+            name, dirs=filesystem.NPC_SCRIPT_DIRS, strict=True)
+    globs = [glob for category, glob in entries if category == 'file' and glob]
+    if not globs or filesystem._find_file(name, strict=True) is None:
+        return None
+    base = Path(filesystem.base_path)
+    world = base / 'world'
+    candidates = list(filesystem._public_index.get(name.lower(), ()))
+    candidates.sort(key=lambda path: path.name != name)
+    for path in candidates:
+        try:
+            relative = path.relative_to(world)
+        except ValueError:
+            try:
+                relative = path.relative_to(base)
+            except ValueError:
+                continue
+        if (path.is_file()
+                and any(_glob_matches(relative.as_posix(), glob) for glob in globs)):
+            return path
+    return None
 
 
 class EntityHandlers:
@@ -155,13 +206,11 @@ class EntityHandlers:
 
         filesystem = getattr(self.server, 'filesystem', None)
         manager = getattr(self.server, 'npc_manager', None)
-        # PlayerClientPackets.cpp:769 looks the script up by bare name in the
-        # file folders only. The name is client-supplied, so it must be a bare
-        # name resolved inside the world folder: never a path, which would
-        # let a client broadcast accounts/ or config/ files as NPC code.
-        script_path = (
-            filesystem._find_file(scriptfile, dirs=filesystem.NPC_SCRIPT_DIRS,
-                                  strict=True) if filesystem else None)
+        # The name is client-supplied, so it must be a bare name resolved in
+        # a public folder: never a path, which would let a client broadcast
+        # accounts/ or config/ files as NPC code.
+        script_path = (find_putnpc_script(filesystem, scriptfile)
+                       if filesystem else None)
         if script_path is None or manager is None:
             return
 

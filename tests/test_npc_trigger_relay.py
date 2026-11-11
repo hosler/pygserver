@@ -31,7 +31,7 @@ def make_world(tmp_path):
 
 def add_npc(server, level, npc_id, x, y, code, fire_created=True):
     npc = NPC(npc_id)
-    npc.x, npc.y, npc.shape = x, y, (2, 2)
+    npc.x, npc.y, npc.shape = x, y, (32, 32)
     level.add_npc(npc)
     server.npc_manager._npcs[npc_id] = npc
     server.npc_manager.attach_gs1(npc, code, fire_created=fire_created, raise_errors=True)

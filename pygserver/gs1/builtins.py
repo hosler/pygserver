@@ -9,7 +9,7 @@ from ..combat import CarryObjectSprite
 from . import objects
 from .host import (
     NPC_ATTR, PLAYER_ATTR, _NW_CLOCK_FIELDS, _PELTWITH_TYPE, _SHOTBY_SOURCE,
-    _nw_clock_value,
+    _nw_clock_value, _source_player,
 )
 from reborn_protocol.gs1.values import to_str  # noqa: F401  - kept: original import block (star-import consumers rely on it)
 # ---------------------------------------------------------------------------
@@ -20,6 +20,9 @@ from reborn_protocol.gs1.values import to_str  # noqa: F401  - kept: original im
 # GS1Host.get_builtin then falls back to PLAYER_ATTR / NPC_ATTR and finally to
 # the plain flag lookup.
 # ---------------------------------------------------------------------------
+
+#: CarryObjectType JOLTBOMB / HOTJOLTBOMB (CommonTypes.h:485-501).
+_JOLT_TYPES = (7, 8)
 
 #: carry*-flag name -> the carrysprite value it tests.
 _CARRY_SPRITE = {
@@ -171,6 +174,34 @@ def _b_peltwith(self, name, indices, ctx, npc, player):
     return getattr(ctx, "carryobject_type", None) == _PELTWITH_TYPE[name]
 
 
+def _b_player_weaponscount(self, name, indices, ctx, npc, player):
+    # weaponscount / playerweaponscount (b46a9c03). The reference hides the
+    # bare spelling; hiding is not implemented here, so both read the player.
+    player = _source_player(ctx)
+    return UNSET if player is None else objects.player_weaponscount(player)
+
+
+def _b_player_levelorg(self, name, indices, ctx, npc, player):
+    player = _source_player(ctx)
+    if player is None:
+        return UNSET
+    return objects.player_levelorg(player, name.endswith("y"))
+
+
+def _b_explodedwithjolt(self, name, indices, ctx, npc, player):
+    """True while an `exploded` event caused by a joltbomb blast runs (25396a18,
+    GS1Flags.cpp:166-178), gated by the scriptengine-gs1.txt option of the same
+    name. The reference only ADDS the flag on exploded events, so after a jolt
+    blast it stays true until the next exploded event; this is derived from the
+    running event instead, so it is false again for every other event (a
+    deliberate divergence: the stale value is a bug, not a feature)."""
+    config = getattr(self.server, "config", None)
+    if getattr(config, "explodedwithjolt", True) is False:
+        return False
+    return (ctx.active_event == "exploded"
+            and getattr(ctx, "carryobject_type", None) in _JOLT_TYPES)
+
+
 # -- player flags with real pygserver-side backing state
 
 def _b_weaponsenabled(self, name, indices, ctx, npc, player):
@@ -237,6 +268,12 @@ _BUILTINS = {
     "playerismale": _b_player_gender, "playerisfemale": _b_player_gender,
     "isleader": _b_isleader, "visible": _b_visible,
     "isonmap": _b_isonmap, "compsdead": _b_compsdead,
+    "explodedwithjolt": _b_explodedwithjolt,
+    "weaponscount": _b_player_weaponscount,
+    "playerweaponscount": _b_player_weaponscount,
+    "levelorgx": _b_player_levelorg, "levelorgy": _b_player_levelorg,
+    "playerlevelorgx": _b_player_levelorg,
+    "playerlevelorgy": _b_player_levelorg,
     **{n: _b_carries_object for n in _CARRY_SPRITE},
     **{n: _b_nw_clock for n in _NW_CLOCK_FIELDS},
     **{n: _b_shotby for n in _SHOTBY_SOURCE},

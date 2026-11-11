@@ -236,7 +236,7 @@ def test_npcs_array_count_fields_and_self_reference():
         " this.cw = npcs[2].width; this.plain = npcs[0].width; }", level)
     other = npc_with("", level, name="other", npc_id=2)
     other.x, other.y, other.hearts = 5.5, 6.25, 2.0
-    other.shape = (3, 4)
+    other.shape = (48, 64)
     third = npc_with("", level, name="third", npc_id=3)
     third.image = "#c#"
     other.gs1_scopes["this"]["save"] = [0, 0, 9, 0, 0, 0, 0, 0, 0, 0]
@@ -628,7 +628,9 @@ def test_non_finite_and_out_of_range_writes_never_reach_a_packet_builder():
     assert (bob.hearts, bob.rupees, bob.arrows) == (111.5, 0, 0)
     assert (bob.sword_power, bob.direction, bob.max_hearts) == (20, 3, 0)
     assert (bob.mp, bob.kills, bob.deaths) == (0, 0, 0)
-    assert (target.x, target.hearts) == (64.0, 2.0)
+    # An NPC's x is not clamped but wrapped like the reference (NPC.cpp:1870-
+    # 1935): an out-of-range cast is INT_MIN on x86, whose pixel wraps to 0.
+    assert (target.x, target.hearts) == (0.0, 2.0)
     build_other_player_props(2, {PLPROP.X2: bob.x, PLPROP.Y2: bob.y})
     build_player_props(bob._gs1_dirty_props)
     target.build_props_packet()
@@ -649,7 +651,7 @@ def test_bare_player_and_npc_attribute_writes_are_clamped_too():
         f" x = {BIG}; timeout = {NAN}; }}", level)
     run(host, server=server, player=server.players[1])
     assert server.players[1].x == 64.0 and server.players[1].hearts == 3.0
-    assert host.x == 64.0 and host._timer_end == 0
+    assert host.x == 0.0 and host._timer_end == 0   # NPC x wraps, see above
 
 
 def test_player_field_writes_reach_the_owner_and_the_other_clients():

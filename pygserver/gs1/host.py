@@ -29,10 +29,13 @@ from reborn_protocol.gs1.host_shared import (
     A_CLASS_NPC_ATTR, A_CLASS_PLAYER_ATTR, host_value,
 )
 
-from .. import tiletypes
+from .. import collision, npc_motion, tiletypes
+from .player_flags import flag_table
 from .players import players_on_level_for, leader_player_for_level
 
 logger = logging.getLogger(__name__)
+
+_DBL_EPSILON = 2.220446049250313e-16  # DoubleIsZero threshold
 
 # Surface GS1 script/command failures (they used to be swallowed at DEBUG,
 # invisible by default) without spamming: dedup per (site, exception type,
@@ -221,6 +224,8 @@ class _GS1ObjectRef:
                                      self.host._num_or_str(value))
             if clean is not objects.DROP:
                 setattr(self.target, attr, clean)
+                if attr in ("x", "y"):
+                    npc_motion.cancel_moves(self.target)  # NPC.cpp:1879,1910
                 self.host._dirty(self.target)
         return True
 
@@ -321,6 +326,21 @@ class GS1Host(Host):
                 level.set_tile(x, y, int(to_num(value)))
                 self._broadcast_tiles(level, x, y, 1, 1)
             return True
+        if name == "board":
+            # 1641f88b (GS1Variables.cpp:41-59): board[i] = n writes the NPC's
+            # own level board. Ignored without an index, outside 0..4095,
+            # without a level, or for a non-number. The reference sends no
+            # board-modify packet (unlike tiles[]), so neither do we: connected
+            # clients keep their copy until they re-enter the level.
+            level = getattr(npc, "level", None) if npc is not None else None
+            if (indices and level is not None and hasattr(level, "set_tile")
+                    and not isinstance(value, str)):
+                slot, number = to_num(indices[0]), to_num(value)
+                if (math.isfinite(slot) and math.isfinite(number)
+                        and 0 <= int(slot) < LEVEL_SIZE * LEVEL_SIZE):
+                    level.set_tile(int(slot) % LEVEL_SIZE, int(slot) // LEVEL_SIZE,
+                                   int(number) & 0xFFFF)
+            return True
         if name in PLAYER_ATTR and player is not None:
             self._set_player_attr(player, PLAYER_ATTR[name], value, ctx)
             return True
@@ -329,6 +349,8 @@ class GS1Host(Host):
                                      self._num_or_str(value))
             if clean is not objects.DROP:
                 setattr(npc, NPC_ATTR[name], clean)
+                if NPC_ATTR[name] in ("x", "y"):
+                    npc_motion.cancel_moves(npc)  # NPC.cpp:1879,1910
                 self._dirty(npc)
             return True
         if name == "sprite" and npc is not None and hasattr(npc, "flags"):
@@ -648,14 +670,94 @@ class GS1Host(Host):
         else:
             npc._timer_remaining = seconds
 
-    def _onwall(self, args, ctx):
-        lvl = getattr(ctx.this_obj, "level", None) or getattr(ctx.player, "level", None)
-        if lvl is None or len(args) < 2 or not hasattr(lvl, "is_blocking"):
+    # -- tiles and walls (collision.py holds the geometry) ------------------
+
+    def _probe(self, args, ctx, rect_form):
+        """Parse onwall/onwater style arguments into (level, point|rect).
+
+        x,y are tiles (float32, truncated to pixels with the epsilon nudge,
+        GS1Functions.cpp:1116-1188); width/height are floor(v*16) px, uint16.
+        None when the call is malformed or there is no level."""
+        level = self._level_of(ctx)
+        if level is None or len(args) < (4 if rect_form else 2):
+            return None
+        px = collision.tiles_to_pixels(to_num(args[0]))
+        py = collision.tiles_to_pixels(to_num(args[1]))
+        if not rect_form:
+            return level, (px, py), None
+        size = []
+        for value in args[2:4]:
+            number = to_num(value) * 16
+            size.append(max(0, min(0xFFFF, math.floor(number)))
+                        if math.isfinite(number) else 0)
+        return level, None, (px, py, size[0], size[1])
+
+    def _onwall(self, args, ctx, rect_form=False):
+        """onwall(x,y) / onwall2(x,y,w,h): a wall tile, then (only for a
+        script owned by an NPC) a player or ANOTHER NPC at the spot. A hit on
+        the probing NPC itself never counts (86df2119); see
+        collision.find_npc_at for the divergence from the reference's
+        first-hit-only scan."""
+        probe = self._probe(args, ctx, rect_form)
+        if probe is None:
             return 0.0
+        level, point, rect = probe
+        if point is not None:
+            if collision.is_on_wall_pixel(self.server, level, *point):
+                return 1.0
+        elif collision.is_on_wall_rect(self.server, level, *rect):
+            return 1.0
+        owner = self._object_owner(ctx)
+        if owner is None or not hasattr(owner, "gs1_scopes"):
+            return 0.0
+        blocked = collision.blocked_by_objects(
+            level, owner, self._players_on_level(ctx), point=point, rect=rect)
+        return 1.0 if blocked else 0.0
+
+    def _onwater(self, args, ctx, rect_form=False):
+        """onwater(x,y) / onwater2(x,y,w,h): water tiles only (not lava)."""
+        probe = self._probe(args, ctx, rect_form)
+        if probe is None:
+            return 0.0
+        level, point, rect = probe
+        if point is not None:
+            wet = collision.is_on_water_pixel(self.server, level, *point)
+        else:
+            wet = collision.is_on_water_rect(self.server, level, *rect)
+        return 1.0 if wet else 0.0
+
+    def _area_npcs(self, args, ctx):
+        """getareanpcs(x,y,w,h) (GS1Functions.cpp:489-506): the NPCs of the
+        script's level, visible or not, whose bounding box meets the area
+        (inclusive edges); width and height are at least 16 px.
+
+        Returns indices into the level NPC list, the values `npcs[]` takes
+        (the documented contract). The reference code returns NPC ids, which
+        `npcs[]` does not accept, so the doc'd idiom only works with indices."""
+        level = self._level_of(ctx)
+        if level is None or len(args) < 4:
+            return []
         try:
-            return 1.0 if lvl.is_blocking(int(to_num(args[0])), int(to_num(args[1]))) else 0.0
-        except Exception:
-            return 0.0
+            px = math.floor(to_num(args[0]) * 16)
+            py = math.floor(to_num(args[1]) * 16)
+            size = [max(16, max(0, min(0xFFFF, math.floor(to_num(v) * 16))))
+                    for v in args[2:4]]
+        except (OverflowError, ValueError):
+            return []
+        area = (px, py, size[0], size[1])
+        return [float(index)
+                for index, npc in enumerate(collision._level_npcs(level))
+                if collision.rects_intersect(area, collision.npc_bounding_rect(npc))]
+
+    def _tiletype(self, args, ctx):
+        """tiletype(x,y) (351966c1, GS1Functions.cpp:1700-1716): the type of
+        the tile at level tile (x,y); 22 off the level, past a gmap, for an id
+        >= 4096, or with no level."""
+        level = self._level_of(ctx)
+        if level is None or len(args) < 2:
+            return float(tiletypes.BLOCKING)
+        return float(collision.tile_type_at_script_tile(
+            self.server, level, to_num(args[0]), to_num(args[1])))
 
     def _playersays(self, args, ctx, contains):
         # playersays(text) / playersays(index,text) — GS1Functions.cpp:963.
@@ -738,25 +840,11 @@ class GS1Host(Host):
 
     @staticmethod
     def _collision_rect(obj, player):
-        getter = getattr(obj, "getCollisionBoundingBox", None)
-        if getter is None:
-            getter = getattr(obj, "get_collision_bounding_box", None)
-        if getter is not None:
-            rect = getter()
-            if isinstance(rect, (tuple, list)) and len(rect) >= 4:
-                return tuple(to_num(v) for v in rect[:4])
-        px, py = (absolute_position(obj) if player else
-                  (getattr(obj, "x", 0), getattr(obj, "y", 0)))
-        x, y = to_num(px) * 16, to_num(py) * 16
-        if player:
-            return x + 8, y + 16, 32, 32
-        shape = getattr(obj, "shape", None)
-        if shape and len(shape) >= 2:
-            return x, y, to_num(shape[0]), to_num(shape[1])
-        # Character NPCs use the same feet-centred 2x2 collision square.
-        if getattr(obj, "gani", "") or getattr(obj, "body_image", "") or getattr(obj, "head_image", ""):
-            return x + 8, y + 16, 32, 32
-        return None
+        """Pixel box testnpc/testplayer test a point against, or None.
+        NPC rules (invisible, NOBLOCK, character) live in collision.py."""
+        rect = (collision.player_collision_rect(obj) if player
+                else collision.npc_collision_rect(obj))
+        return None if rect is None else tuple(float(v) for v in rect)
 
     def _sorted_by_distance(self, args, ctx):
         if len(args) < 2:
@@ -780,37 +868,64 @@ class GS1Host(Host):
         ctx.player = ranked[0]
         return float(getattr(ranked[0], "id", 0)) if return_id else True
 
-    def _nearest_players(self, args, ctx):
-        """getnearestplayers(x,y[,condition]) -> player ids sorted nearest-first.
+    def _nearest_players(self, args, ctx, condition=None):
+        """getnearestplayers(x,y[,condition]) -> indices into the level player
+        list (the `players[]` order), nearest first (ca160f9e,
+        GS1Functions.cpp:597-660).
 
-        Deviations from upstream fn_getnearestplayers (GS1Functions.cpp:597,
-        the per-candidate re-evaluation added in 81ec8a13):
+        `condition` is a zero-argument callable that evaluates the third
+        argument's expression (see ServerInterpreter._ex_Call): it is re-run
+        once per level player with that player as the current source, so
+        `playerhearts>0` reads each candidate's hearts, and a player whose
+        result is ~0 (|v| < DBL_EPSILON) is dropped. Without a condition every
+        player qualifies (the reference's 2-argument form reads past the
+        argument list; ours is the documented optional-condition behaviour).
 
-        1. The optional 3rd "condition" argument is NOT evaluated per
-           candidate. Upstream pushes each candidate player as the current
-           script source and re-runs the condition EXPRESSION once per
-           player (so e.g. `getnearestplayers(x,y,playerhearts>0)` reads a
-           different playerhearts each time), skipping players where it's
-           falsy. That requires the interpreter to hand the *unevaluated*
-           AST node down to the host so it can be re-run under a different
-           ctx.player. reborn_protocol.gs1.interp.Interpreter evaluates all
-           call arguments eagerly, exactly once, before call_function() ever
-           runs (`[self.eval(a) for a in node.args]`) — there is no hook
-           here to re-run args[2] per candidate without changing that
-           evaluation strategy, which lives in reborn-protocol (out of scope
-           for this host). So the condition argument is silently ignored
-           rather than half-applied (a single-evaluation, applied-to-all-or-
-           none filter could easily look "correct" for a condition that
-           doesn't happen to read per-player state and then quietly do the
-           wrong thing for one that does — worse than a documented no-op).
-        2. Return semantics: upstream returns INDICES into level->getPlayers()
-           (a `players[]`-style array a script would index elsewhere in the
-           same script). This host has no players[] array-indexing construct
-           (see call_function's getnpc/getplayer note above), so this keeps
-           returning player IDs instead, as it already did.
+        Deviation: the reference keys candidates by distance in a std::map, so
+        two equidistant players collapse to the first; ours keeps both, in
+        level order (stable sort).
         """
-        ranked = self._sorted_by_distance(args, ctx)
-        return [float(getattr(p, "id", 0)) for p in ranked]
+        if len(args) < 2:
+            return []
+        x, y = to_num(args[0]), to_num(args[1])
+        players = self._players_on_level(ctx)
+        ranked = []
+        for index, player in enumerate(players):
+            if condition is not None and not self._condition_for(
+                    player, condition, ctx):
+                continue
+            px, py = absolute_position(player)
+            ranked.append((math.hypot(to_num(px) - x, to_num(py) - y), index))
+        ranked.sort(key=lambda pair: pair[0])
+        return [float(index) for _, index in ranked]
+
+    def _condition_for(self, player, condition, ctx):
+        """Evaluate `condition()` with `player` as the current source."""
+        # pushSource(FromPlayer) per candidate (GS1Functions.cpp:597): the
+        # acting player's flags, `client.` scope and vars.player move with it.
+        store = ctx.vars
+        saved = (ctx.player, ctx.this_obj, getattr(store, "player", None),
+                 store.player_flags, store.scopes.get("client"))
+        ctx.player = player
+        if isinstance(ctx.this_obj, _GS1ObjectRef) and ctx.this_obj.kind == "player":
+            ctx.this_obj = self._object_ref_for("player", player, ctx)
+        if hasattr(store, "player"):
+            store.player = player
+        table = flag_table(player)
+        store.player_flags = table
+        store.scopes["client"] = table
+        try:
+            value = to_num(condition())
+        finally:
+            ctx.player, ctx.this_obj = saved[0], saved[1]
+            if hasattr(store, "player"):
+                store.player = saved[2]
+            store.player_flags = saved[3]
+            if saved[4] is None:
+                store.scopes.pop("client", None)
+            else:
+                store.scopes["client"] = saved[4]
+        return abs(value) >= _DBL_EPSILON
 
     def _onmap_pos(self, args, ctx, axis):
         """onmapx(level)/onmapy(level) -> the named level's grid position
@@ -862,10 +977,11 @@ class GS1Host(Host):
         "triggerclient": lambda self, name, args, ctx: self._trigger_client(
             args, ctx),
         "onwall": lambda self, name, args, ctx: self._onwall(args, ctx),
-        "onwall2": lambda self, name, args, ctx: self._onwall(args, ctx),
-        # known stub: real level water-tile detection isn't wired server-side
-        "onwater": lambda self, name, args, ctx: 0.0,
-        "onwater2": lambda self, name, args, ctx: 0.0,
+        "onwall2": lambda self, name, args, ctx: self._onwall(args, ctx, True),
+        "onwater": lambda self, name, args, ctx: self._onwater(args, ctx),
+        "onwater2": lambda self, name, args, ctx: self._onwater(args, ctx, True),
+        "tiletype": lambda self, name, args, ctx: self._tiletype(args, ctx),
+        "getareanpcs": lambda self, name, args, ctx: self._area_npcs(args, ctx),
         "testnpc": lambda self, name, args, ctx: self._test_at(args, ctx, players=False),
         "testplayer": lambda self, name, args, ctx: self._test_at(args, ctx, players=True),
         "playersays": lambda self, name, args, ctx: self._playersays(args, ctx, contains=False),

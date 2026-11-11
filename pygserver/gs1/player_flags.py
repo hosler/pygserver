@@ -6,6 +6,22 @@ from reborn_protocol.gs1.values import to_str
 from ..protocol.packets import build_flag_del, build_flag_set
 
 
+def flag_table(player) -> dict:
+    """The persistent bare/`client.` flag dict of `player` (None -> a scratch dict)."""
+    if player is None:
+        return {}
+    table = getattr(player, "flags", None)
+    if table is None:
+        table = getattr(player, "_gs1_flags", None)
+        if table is None:
+            table = {}
+            try:
+                player._gs1_flags = table
+            except Exception:
+                pass
+    return table
+
+
 class PlayerVarStore(VarStore):
     def __init__(self, player, **kwargs):
         super().__init__(**kwargs)

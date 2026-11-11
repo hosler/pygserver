@@ -9,7 +9,7 @@ from reborn_protocol.gs1.lexer import tokenize
 from reborn_protocol.gs1.parser import Parser, parse
 
 from .interpreter import ServerInterpreter
-from .player_flags import PlayerVarStore
+from .player_flags import PlayerVarStore, flag_table
 
 logger = logging.getLogger(__name__)
 
@@ -119,13 +119,16 @@ def _ensure_gs1_ctx(npc, host):
 
 
 def _bind_fresh_gs1_call(ctx, npc, server, player, event, source,
-                         carryobject_type=None, params=None):
+                         carryobject_type=None, params=None, local_key=None):
     """(Re)configure the NPC's persistent ctx for a brand-new top-level
     firing (as opposed to resuming a pending sleep). Rebuilds `ctx.vars` from
     scratch exactly like the pre-resumable code used to build a whole new
     Context every call: this./thiso. persist on the NPC (npc.gs1_scopes),
-    `local.` is TEMPORARY like `temp.` (GS1Variables.h; gets a fresh dict
-    every call, not npc-owned - upstream d6c78ef3), client./server./level./
+    `local.` persists between runs too (upstream 07932208 dropped the
+    TEMPORARY default; only `temp.` is wiped per run). It lives per NPC - and
+    per joined class, `local_key` - not per source text: the reference caches
+    one wrapper per source hash so identical-source NPCs would share it, which
+    reads as an accident (deliberate divergence). client./server./level./
     global. persist on the player/server/level, bare flags persist on the
     player. `source` records who/what initiated this event ("player"/"baddy"/
     "npc") for flags that expose it (wasshot's shotbyplayer/shotbybaddy/
@@ -133,12 +136,10 @@ def _bind_fresh_gs1_call(ctx, npc, server, player, event, source,
     GS1Host.get_builtin."""
     sc = npc.gs1_scopes
     level = getattr(npc, "level", None)
-    player_flags = getattr(player, "flags", None)
-    if player_flags is None:
-        player_flags = _lazy(player, "_gs1_flags")
+    player_flags = flag_table(player)
     scopes = {
         "this": sc["this"], "thiso": sc["thiso"],
-        "local": {}, "temp": {},
+        "local": _local_scope(sc, local_key), "temp": {},
         "client": player_flags,
         "server": (server.server_flags if hasattr(server, "server_flags")
                    else _lazy(server, "_gs1_server")),
@@ -157,6 +158,14 @@ def _bind_fresh_gs1_call(ctx, npc, server, player, event, source,
     ctx.charprop_source = None
     ctx.steps = 0
     ctx.written_players = {}
+
+
+def _local_scope(scopes, local_key):
+    """The persistent `local.` dict of the NPC's own script (key None) or of
+    one joined class."""
+    if local_key is None:
+        return scopes.setdefault("local", {})
+    return scopes.setdefault("local_classes", {}).setdefault(local_key, {})
 
 
 def run_npc_event(npc, event: str, server=None, player=None, source=None,
@@ -342,7 +351,7 @@ def _run_joined_classes(npc, ctx, event, server, player, source,
                     _flush_event_players(ctx, held.player)
                     continue
                 _bind_fresh_gs1_call(ctx, npc, server, player, event, source,
-                                     carryobject_type, params)
+                                     carryobject_type, params, local_key=name)
                 table = {}
                 merge_joined_functions(npc, server, table)
                 ctx.functions = table

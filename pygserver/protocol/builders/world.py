@@ -3,6 +3,7 @@
 import logging
 
 from ..packet_codec import PacketBuilder
+from reborn_protocol.codec import PacketBuilder as ReferencePacketBuilder
 from ..constants import (
     PLO, NPCPROP, BDPROP
 )
@@ -147,10 +148,66 @@ def build_baddy_hurt(baddy_id: int, hurt_dx: float, hurt_dy: float, damage: int)
 # NPC Packets (Extended)
 # =============================================================================
 
-def build_npc_moved(npc_id: int) -> bytes:
-    """Build PLO_NPCMOVED packet (hides NPC for warping)."""
+def build_npc_moved(npc_id: int, level_name: str = "", x: float = 0.0,
+                    y: float = 0.0) -> bytes:
+    """Build PLO_NPCMOVED: an NPC now belongs to `level_name` at local tile
+    (x, y) (NPC.cpp:210). Layout: gint3 id, gchar x*2, gchar y*2 (local
+    pixels / 8), level name. Each position byte is written the way the
+    reference's writeGChar does (see `_lane`), so a negative or large position
+    never produces a 0x0A byte that would split the packet stream."""
     builder = PacketBuilder().write_gchar(PLO.NPCMOVED)
     builder.write_gint3(npc_id)
+    builder.write_gchar(_lane(int(x * 2))).write_gchar(_lane(int(y * 2)))
+    builder.write_string(level_name)
+    builder.write_newline()
+    return builder.build()
+
+
+def _lane(value: int) -> int:
+    """One gchar value as the reference writes it: CString::writeGChar takes an
+    unsigned char and clamps it to 223 before the +32 (gs2lib CString.cpp:
+    1519-1524), so a negative int8 becomes 223, never a wrapped 0x0A byte."""
+    return min(int(value) & 0xFF, 223)
+
+
+def _move_ticks_field(ticks: int, options: int) -> bytes:
+    # CString::writeGShort takes an unsigned short, clamps it to 28767 and lets
+    # the low lane carry past 127 (CString.cpp:1526-1541). pygserver's own short
+    # writer wraps instead (0x00 / a stray 0x0A), so the shared reference-exact
+    # writer is used for this field only.
+    return (ReferencePacketBuilder().write_gshort(min(int(ticks) & 0xFFFF, 28767))
+            .write_gchar(_lane(options)).build())
+
+
+def build_npc_move2(npc_id: int, moves) -> bytes:
+    """PLO_MOVE2 for clients >= 2.3 (NPC::getMoveQueuePacketData,
+    NPC.cpp:505-548).
+
+    `moves` is an iterable of (x, y, dx, dy, ticks, options): the move's
+    current level-local position and remaining delta in integer pixels, its
+    remaining time in 50 ms ticks, and the option bits. The four coordinates
+    use the NPCPROP X2 pixel encoding."""
+    builder = PacketBuilder().write_gchar(PLO.MOVE2).write_gint3(npc_id)
+    for x, y, dx, dy, ticks, options in moves:
+        for pixels in (x, y, dx, dy):
+            builder.write_bytes(encode_value(NPC_PROPS[NPCPROP.X2], pixels / 16.0))
+        builder.write_bytes(_move_ticks_field(ticks, options))
+    builder.write_newline()
+    return builder.build()
+
+
+def build_npc_move(npc_id: int, moves) -> bytes:
+    """PLO_MOVE for clients before 2.3: positions and deltas in 8 px units
+    (deltas biased by 100), same `moves` tuples as build_npc_move2
+    (NPC.cpp:533-543)."""
+    builder = PacketBuilder().write_gchar(PLO.MOVE).write_gint3(npc_id)
+    for x, y, dx, dy, ticks, options in moves:
+        # C integer division of the int16 pixel values truncates toward zero.
+        # (NPC.cpp:533-537, each byte through the clamping gchar writer.)
+        builder.write_gchar(_lane(int(x / 8))).write_gchar(_lane(int(y / 8)))
+        builder.write_gchar(_lane(int(dx / 8) + 100))
+        builder.write_gchar(_lane(int(dy / 8) + 100))
+        builder.write_bytes(_move_ticks_field(ticks, options))
     builder.write_newline()
     return builder.build()
 

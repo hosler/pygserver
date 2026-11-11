@@ -43,6 +43,7 @@ pygserver/
 ├── player.py             # Player connection handling
 ├── level.py              # Level loading and management
 ├── npc.py                # NPC system with Python scripting
+├── npc_motion.py         # NPC move queue (GS1 `move`, PLO_MOVE/MOVE2)
 ├── weapon.py             # Weapon definitions
 ├── gs2.py                # GS2 clientside bytecode (compile on load, serve)
 ├── world.py              # World/GMAP management
@@ -178,6 +179,7 @@ default, and written back by `ServerConfig.to_file`:
 | `lockplayerz` | `false` | Client Z changes are rejected (`PlayerProps.cpp:495-500`) |
 | `defaultweapons` | `true` | Pickups may add the built-in weapons (`Server.h:165`); off, they are a no-op |
 | `putnpcenabled` | `false` | Allows the client `PLI_PUTNPC` packet |
+| `playerswordganis` | `sword` | Comma list of gani names that make the server fire `washit` on NPCs inside the sword rectangle in front of the player (`PlayerProps.cpp:373`); empty turns it off. One swing fires one `washit` even when the client also reports the hit |
 
 ### RC and NC Access
 

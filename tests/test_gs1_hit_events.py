@@ -99,20 +99,45 @@ def make_server_and_level(level_name="t.nw"):
 
 
 # -- item 1: local. lifetime -------------------------------------------------
-def test_local_scope_resets_between_events():
-    npc = NPC(1, "t")
+# Upstream 07932208 stopped marking default script storage TEMPORARY, so local.
+# now survives between runs (only temp. is wiped). It replaced d6c78ef3's rule.
+def _flow_npc(source, npc_id=1):
+    npc = NPC(npc_id, "t")
     npc.level = Level("t.nw")
-    npc.gs1_program = compile_gs1(
-        "if (created) { local.seen = 1; }"
-        "if (playerchats) {"
-        "  if (local.seen == 1) { message stale; } else { message fresh; }"
-        "}"
+    npc.gs1_program = compile_gs1(source)
+    return npc
+
+
+def test_local_scope_persists_between_events():
+    npc = _flow_npc(
+        "if (created) { local.seen = 5; }"
+        "if (playerchats) { this.seen = local.seen; }"
     )
     run_npc_event(npc, "created", None, None)
     run_npc_event(npc, "playerchats", None, FakePlayer())
-    # Before the fix local. was a dict created once on the NPC and never
-    # cleared, so `created`'s local.seen leaked into the next event.
-    assert npc.message == "fresh"
+    assert npc.gs1_scopes["this"]["seen"] == 5.0
+
+
+def test_temp_scope_still_resets_between_events():
+    npc = _flow_npc(
+        "if (created) { temp.seen = 5; }"
+        "if (playerchats) { this.seen = temp.seen; }"
+    )
+    run_npc_event(npc, "created", None, None)
+    run_npc_event(npc, "playerchats", None, FakePlayer())
+    assert npc.gs1_scopes["this"]["seen"] == 0.0
+
+
+def test_local_scope_is_per_npc_not_per_source():
+    source = ("if (created) { local.n = local.n + 1; }"
+              "if (playerchats) { this.n = local.n; }")
+    first, second = _flow_npc(source, 1), _flow_npc(source, 2)
+    for npc in (first, first, second):
+        run_npc_event(npc, "created", None, None)
+    run_npc_event(first, "playerchats", None, FakePlayer())
+    run_npc_event(second, "playerchats", None, FakePlayer())
+    assert first.gs1_scopes["this"]["n"] == 2.0
+    assert second.gs1_scopes["this"]["n"] == 1.0
 
 
 def test_this_scope_still_persists_across_events():
