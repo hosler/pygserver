@@ -99,6 +99,102 @@ def minify(source: str) -> str:
     return minified.strip()
 
 
+# =============================================================================
+# Engine choice
+# =============================================================================
+#
+# Per script half the reference picks an engine in ScriptSystem.cpp:82-130
+# (client) / 134-172 (server) (origin/beta4): the target's default engine,
+# replaced by the first line of the half when that line is `//#<engine>`.
+# pygserver has no per-target default engines, only two compilers (GS1 text
+# interpreter, GS2 bytecode), so the order here is:
+#   1. a `//#GS1` / `//#GS2` first line (case-insensitive);
+#   2. the `default_scriptengine_client|_server` option, else
+#      `default_scriptengine` (the reference's own fallback order, :60-62),
+#      when it names gs1 or gs2;
+#   3. otherwise None: the caller keeps its source-shape detection.
+# Any other `//#xxx` first line is not an engine header: the reference would
+# drop such a half (ENGINE_NOT_FOUND); we keep the script.
+
+_ENGINE_NAMES = ("gs1", "gs2")
+
+
+def engine_header(half: str) -> Optional[str]:
+    """The `//#GS1` / `//#GS2` engine named by a half's first line, or None.
+
+    Plain comments and blank lines ahead of it do not count, as in the
+    reference where the half is minified first (Script.cpp minify)."""
+    text = minify(half) if half else ""
+    if not text.startswith("//#"):
+        return None
+    name = text.split("\n", 1)[0][3:].strip().lower()
+    return name if name in _ENGINE_NAMES else None
+
+
+def explicit_engine(half: str, target: str, config: Any) -> Optional[str]:
+    """Engine forced for a script half by header or option, else None.
+
+    `target` is 'client' or 'server'."""
+    header = engine_header(half)
+    if header:
+        return header
+    for key in (f"default_scriptengine_{target}", "default_scriptengine"):
+        value = str(getattr(config, key, "") or "").strip().lower()
+        if value in _ENGINE_NAMES:
+            return value
+    return None
+
+
+def server_half_is_gs2(half: str, kind: str, config: Any) -> bool:
+    """True when a server half must not go to the GS1 interpreter.
+
+    With no header or option only script classes are sniffed (an NPC or
+    weapon server half has always been taken as GS1)."""
+    forced = explicit_engine(half, "server", config)
+    if forced:
+        return forced == "gs2"
+    return kind == "class" and looks_like_gs2(half)
+
+
+_warned_server_halves: set = set()
+_MAX_WARNED_SERVER_HALVES = 256
+
+
+def note_gs2_server_half(kind: str, who: str, half: str, config: Any):
+    """Warn once per script that a server half routed to GS2 by a header or
+    option is not executed: pygserver has no GS2 server engine, so such a
+    script silently does nothing."""
+    if explicit_engine(half, "server", config) != "gs2":
+        return
+    # Keyed by script identity, not by NPC: a putnpc loop makes a new NPC per
+    # call, all with the same source, and must not add an entry and a log
+    # line each. Weapons and classes are identified by name.
+    key = (kind, "" if kind == "NPC" else who,
+           zlib.crc32(half.encode("latin-1", errors="replace")), len(half))
+    if key in _warned_server_halves:
+        return
+    if len(_warned_server_halves) >= _MAX_WARNED_SERVER_HALVES:
+        _warned_server_halves.clear()
+    _warned_server_halves.add(key)
+    logger.warning(
+        "%s %s: server half resolves to the GS2 engine (header or "
+        "default_scriptengine option); pygserver has no GS2 server engine, so "
+        "it will not run", kind, who)
+
+
+def warn_gs2_server_default(config: Any):
+    """One prominent startup warning when the options send every server half
+    to GS2, which would switch off all GS1 server scripts."""
+    for key in ("default_scriptengine_server", "default_scriptengine"):
+        if str(getattr(config, key, "") or "").strip().lower() == "gs2":
+            logger.warning(
+                "%s = gs2: pygserver has no GS2 server engine, so every "
+                "server script without a //#GS1 first line will NOT run. Set "
+                "default_scriptengine_server = gs1 (or unset it) to run GS1 "
+                "server scripts.", key)
+            return
+
+
 def split_clientside(source: str) -> Tuple[str, str]:
     """Split a minified source into (serverside, clientside) at the marker.
 
@@ -376,7 +472,11 @@ class GS2ScriptManager:
         script = GS2Script(kind=kind, name=name, image=image,
                            source=script_source, clientside=clientside,
                            source_path=path, mod_time=path.stat().st_mtime)
+        config = self.server.config
         if kind == 'weapon' and serverside:
+            note_gs2_server_half("weapon", name, serverside, config)
+        if (kind == 'weapon' and serverside
+                and not server_half_is_gs2(serverside, kind, config)):
             from .gs1_host import compile_gs1
             from .npc import NPC
             script.server_program = compile_gs1(serverside)
@@ -388,10 +488,13 @@ class GS2ScriptManager:
                 if manager is not None:
                     manager.register_weapon_runtime(script.server_runtime)
         # Script.cpp:480-513 requires an NPC server (Server.cpp:973-986).
-        if getattr(self.server.config, 'serverside', False):
-            script.bytecode = self._bytecode_for(path, clientside, name) or b''
-            if not script.bytecode and looks_like_gs2(clientside):
-                script.clientside = ''
+        if getattr(config, 'serverside', False):
+            engine = explicit_engine(clientside, 'client', config)
+            if engine != 'gs1':     # a forced GS1 half stays text
+                script.bytecode = self._bytecode_for(path, clientside, name) or b''
+                if not script.bytecode and (engine == 'gs2'
+                                            or looks_like_gs2(clientside)):
+                    script.clientside = ''
         script.build_headers(script_source)
 
         target = self.weapons if kind == 'weapon' else self.classes
@@ -417,6 +520,54 @@ class GS2ScriptManager:
 
     def get_weapon(self, name: str) -> Optional[GS2Script]:
         return self.weapons.get(name.lower())
+
+    # -- level NPC client halves ---------------------------------------------
+
+    def npc_bytecode_enabled(self) -> bool:
+        """Whether level NPCs may ship compiled client scripts at all.
+
+        Only `generation = modern` (here also: unset) sends PLO_NPCBYTECODE;
+        classic and newmain never do (Level.cpp:1475, origin/beta4). The
+        compile needs the NPC server, as for weapons (Script.cpp:510-511)."""
+        config = self.server.config
+        generation = str(getattr(config, 'generation', '') or '').strip().lower()
+        return (generation in ('', 'modern')
+                and bool(getattr(config, 'serverside', False)))
+
+    def compile_npc_client(self, client_half: str,
+                           who: str) -> Tuple[bytes, str]:
+        """Compile an NPC's client half to GS2 bytecode: (bytecode, error).
+
+        `(b'', '')` means the half is not GS2 or there is nothing to compile
+        with (the caller keeps today's text SCRIPT); a non-empty error is a
+        compiler rejection of a half that resolved to GS2 (also text SCRIPT,
+        no bytecode packet; the caller reports it). Results are memoised by
+        source in the compiler, so equal scripts compile once."""
+        if not self.npc_bytecode_enabled() or not client_half.strip():
+            return b'', ''
+        source = minify(client_half)
+        if not source:
+            return b'', ''
+        engine = explicit_engine(source, 'client', self.server.config)
+        if engine is None:
+            engine = 'gs2' if looks_like_gs2(source) else 'gs1'
+        if engine != 'gs2':
+            return b'', ''
+        if not self.compiler.available:
+            logger.debug("GS2: no compiler, NPC %s keeps its text script", who)
+            return b'', ''
+        bytecode = self.compiler.compile(source, who)
+        if not bytecode:
+            return b'', self.compiler.last_error or "compile failed"
+        return bytecode, ''
+
+    def script_class_changed(self, name: str):
+        """A script class was added, replaced or removed: every NPC that joined
+        it re-sends its props (CLASS list) and bytecode on the next tick."""
+        manager = getattr(self.server, 'npc_manager', None)
+        mark = getattr(manager, 'mark_class_users_dirty', None)
+        if mark is not None:
+            mark(name)
 
     @staticmethod
     def _atomic_write(path: Path, text: str):
@@ -490,7 +641,8 @@ class GS2ScriptManager:
         weapon = GS2Script(kind="weapon", name=name, image=image,
                            source=source,
                            clientside=clientside)
-        if serverside:
+        if serverside and not server_half_is_gs2(
+                serverside, "weapon", self.server.config):
             from .gs1_host import compile_gs1
             from .npc import NPC
             weapon.server_program = compile_gs1(serverside)
@@ -536,6 +688,7 @@ class GS2ScriptManager:
                 else self.base_path / 'scripts' / f'{encoded}.txt')
         self._atomic_write(path, source)
         self._load_file(path, 'class')
+        self.script_class_changed(name)
         return self.get_class(name)  # type: ignore[return-value]
 
     def delete_class(self, name: str) -> bool:
@@ -545,6 +698,7 @@ class GS2ScriptManager:
         if script.source_path is not None:
             script.source_path.unlink(missing_ok=True)
             script.source_path.with_suffix('.gs2bc').unlink(missing_ok=True)
+        self.script_class_changed(name)
         return True
 
     def get_gani(self, name: str) -> Optional[GS2Gani]:

@@ -6,6 +6,7 @@ import time
 from reborn_protocol import PLSTATUS
 
 from ..attachments import absolute_position, set_attachment
+from ..protocol.colors import normalize_colors
 from ..protocol.constants import PLI, PLO, PLPROP
 from ..protocol.packets import (
     PacketReader,
@@ -178,10 +179,12 @@ class MovementHandlers:
         if PLPROP.BODYIMAGE in props:
             self.body_image = props[PLPROP.BODYIMAGE]
         if PLPROP.COLORS in props:
-            # Body colour slots, parsed and then dropped like the gear below.
-            # The reference server stores them verbatim at this point
-            # (PlayerProps.cpp:380-388); the value clamp lives in the decoder.
-            self.colors = list(props[PLPROP.COLORS])
+            # Body colour slots. The parser read colors_wire_width() values
+            # (5, or 8 under servermode newworld); the reference replaces the
+            # whole stored 8-slot array with the freshly deserialised one, so
+            # the slots the wire did not carry become 0 (PlayerProps.cpp:453-460,
+            # PlayerProps.cpp:1191-1192, PropertySerializers.h:730-806).
+            self.colors = normalize_colors(props[PLPROP.COLORS])
 
         # Gear. SWORDPOWER/SHIELDPOWER carry a power and an image name in one
         # property; both were parsed and then dropped, so a mid-session sword or
@@ -212,9 +215,17 @@ class MovementHandlers:
                 await self.server.combat_manager.handle_player_death(self)
 
         if PLPROP.STATUS in props:
+            old_status = getattr(self, 'client_status', 0)
             self.client_status = props[PLPROP.STATUS]
             if pending_revive and not self.client_status & PLSTATUS.DEAD:
                 await self.server.combat_manager.revive_player(self)
+            # PlayerProps.cpp:553: an unchanged status is ignored. Dying is the
+            # not-DEAD -> DEAD transition of this prop (:574), not hearts at 0.
+            if (self.client_status != old_status
+                    and not old_status & PLSTATUS.DEAD
+                    and self.client_status & PLSTATUS.DEAD
+                    and getattr(self.server, 'combat_manager', None) is not None):
+                await self.server.combat_manager.handle_status_death(self)
 
         # Relay the parts of the update other players can see.
         if self.level:
@@ -319,8 +330,14 @@ class MovementHandlers:
         # Only the board — adjacent segments are for rendering. Their signs/links
         # belong to that segment and are sent when the player actually warps in;
         # sending them here leaks e.g. neighbouring signs into the current level.
+        # The base board without its change list: the reference answers with
+        # sendStaticLevelData (PlayerClientPackets.cpp:994-1014,
+        # PlayerClient.cpp:1432-1508); the changes come with the dynamic data
+        # once the player steps onto the segment (PlayerClient.cpp:1510-1523),
+        # and changes made meanwhile reach this player as live packets
+        # (board_changes.send_near).
         level_name_pkt = build_level_name(level.name)
-        tile_data = level.get_board_packet()
+        tile_data = level.get_base_board_packet()
         board_packet = bytes([PLO.BOARDPACKET + 32]) + tile_data + b'\n'
         announcement = build_raw_data_announcement(len(board_packet))
         await self.send_raw(level_name_pkt + announcement + board_packet

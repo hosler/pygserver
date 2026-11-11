@@ -295,11 +295,16 @@ def class_program(server, name):
     cached = getattr(script, "_gs1_class_program", None)
     if cached is not None:
         return cached or None
-    from reborn_protocol.gs2.detect import looks_like_gs2
+    from ..gs2 import note_gs2_server_half, server_half_is_gs2
     from ..npc import split_gs1_script
     server_half = split_gs1_script(getattr(script, "source", "") or "", True)[0]
     program = None
-    if server_half.strip() and not looks_like_gs2(server_half):
+    config = getattr(server, "config", None)
+    if server_half.strip():
+        note_gs2_server_half("class", getattr(script, "name", name),
+                             server_half, config)
+    if server_half.strip() and not server_half_is_gs2(
+            server_half, "class", config):
         program = compile_gs1(server_half)
     script._gs1_class_program = program if program is not None else False
     return program

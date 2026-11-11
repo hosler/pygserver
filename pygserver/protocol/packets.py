@@ -4,7 +4,7 @@ import logging
 
 from .parsers import *
 from .builders import *
-from .builders.core import _OUTBOUND_COLORS, _SIGN_ALPHABET, _write_npc_prop, _write_player_prop  # noqa: F401  - kept: original import block (star-import consumers rely on it)
+from .builders.core import _SIGN_ALPHABET, _write_npc_prop, _write_player_prop  # noqa: F401  - kept: original import block (star-import consumers rely on it)
 from .builders.world import _write_showimg_prop  # noqa: F401  - kept: original import block (star-import consumers rely on it)
 from .constants import BDMODE, BDPROP, LevelItemType, NPCBLOCKFLAG, NPCPROP, NPCVISFLAG, PLI, PLO, PLPERM, PLPROP, PLSTATUS  # noqa: F401  - kept: original import block (star-import consumers rely on it)
 from .packet_codec import PacketBuilder, PacketReader  # noqa: F401  - kept: original import block (star-import consumers rely on it)

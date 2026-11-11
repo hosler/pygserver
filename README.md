@@ -179,7 +179,40 @@ default, and written back by `ServerConfig.to_file`:
 | `lockplayerz` | `false` | Client Z changes are rejected (`PlayerProps.cpp:495-500`) |
 | `defaultweapons` | `true` | Pickups may add the built-in weapons (`Server.h:165`); off, they are a no-op |
 | `putnpcenabled` | `false` | Allows the client `PLI_PUTNPC` packet |
+| `servermode` | `normal` | `kingdoms` sends PLO 176, `newworld` sends PLO 177, right at the head of every client/RC/NC login (`Player.cpp:746-752`); `normal` sends neither. `newworld` also widens the COLORS prop to 8 bytes. Read once at start-up (`Server.cpp:194-195`): an RC write is saved but takes effect at the next start |
+| `generation` | unset | Unset or `modern`: a level NPC whose client half is GS2 and compiles ships it as PLO_NPCBYTECODE (131) after its props, with the SCRIPT prop zeroed and CLASS listing its joined classes (`Level.cpp:1473-1480`). `classic` / `newmain`: text SCRIPT only, never 131. A GS1 or uncompilable client half always stays text |
+| `default_scriptengine`, `_client`, `_server` | unset | Engine (`gs1` / `gs2`) for a script half with no `//#GS1` / `//#GS2` first line; the first line wins, then the specific option, then the generic one. Unset: pygserver sniffs the source shape |
 | `playerswordganis` | `sword` | Comma list of gani names that make the server fire `washit` on NPCs inside the sword rectangle in front of the player (`PlayerProps.cpp:373`); empty turns it off. One swing fires one `washit` even when the client also reports the hit |
+| `onlystaff` | `false` | Every login whose account is not in `staff` is refused with "This server is currently restricted to staff only." (`Player.cpp:701-706`; RC and NC keep their own staff-and-IP gate), and the list server is told HQ level 0 (`ServerList.cpp:276,479`); an RC edit re-sends it |
+| `dontaddserverflags` | `false` | A client `PLI_FLAGSET` / `PLI_FLAGDEL` on a flag whose name contains `server.` is swallowed (`PlayerClientPackets.cpp:663-668,705-710`); only matters with `serverside = false`, as clients never reach server flags otherwise |
+| `protectedweapons` | empty | Comma list of weapons added at login when missing and refused for client `PLI_NPCWEAPONDEL` (`PlayerClient.cpp:605-610`, `PlayerClientPackets.cpp:883`); names compare case-insensitively with edge whitespace ignored, and an entry naming no known weapon grants nothing |
+| `disableitemdropping` | `false` | A client `PLI_ITEMADD` is answered with `PLO_ITEMDEL` and spawns nothing (`PlayerClientPackets.cpp:352-354`) |
+| `noexplosions` | `false` | A client `PLI_EXPLOSION` is dropped (`PlayerClientPackets.cpp:845`) |
+| `sendplayertriggers` | `true` | Off keeps client triggeractions from being relayed to the level; NPC events still run (`PlayerClientPackets.cpp:1310`) |
+| `baddyrespawntime` | `60` | Seconds a dead baddy waits before respawning (`LevelBaddy.cpp:270,302`) |
+| `respawntime` | `15` | Seconds until a 2x2 board change (a cut bush, a broken vase) is restored and the level is told (`Server.h:134`, `Level.cpp:1668-1672`, `LevelBoardChange.cpp:39-50`); `0` never restores. Other changes stay until the level is reloaded. A player entering the level is sent the base board and then every change in order. Client board changes never reach the level file (`Level.cpp:999-1030` saves the base tiles); on a gmap they, and their respawn, also reach the eight surrounding segments. Not in the reference: a level holds at most 1024 changes / 8192 changed tiles; at the bound respawned changes that no longer differ from the base are dropped first, otherwise the new change is refused (see `board_changes.py`) |
+| `dropitemsdead` | `true` | A player whose STATUS prop goes to dead drops gralats, arrows and bombs where he stands, and the death counter rises (`PlayerClient.cpp:1898-1998`, `PlayerProps.cpp:574-580`); a sparring zone does neither. Gralats, arrows and bombs are deducted first, so with no rupee type allowed the gralats are simply lost |
+| `mindeathgralats`, `maxdeathgralats` | `1`, `50` | Range of gralats dropped (capped by what the player holds); max `0` drops none. A min above max is treated as equal to max, where the reference leaves it undefined |
+| `deathitemtypes` | `greenrupee,bluerupee,redrupee,goldrupee,bombs,darts` | Item names (or numbers) a death may drop; without `darts` / `bombs` no arrows / bombs go (`Server.cpp:624-635`) |
+| `bushitems` | `true` | Cutting bushes, grass or swamp may lay an item (`PlayerClientPackets.cpp:112,154`); clients below 2.1 lay their own |
+| `bushitemtypes` | `greenrupee,bluerupee,heart,bombs` | Items one cut rolls through, in order; rate is `spawnrate<item>`, defaulting to greenrupee 25, bluerupee 2, bombs 5, heart 5, others 0, summed cumulatively over a roll of 1-100 (`Server.cpp:603-621,1438-1453`). The `spawnrate` options are read only when `bushitemtypes` is set, as in the reference |
+| `spawnrate<item>` | see above | Percent chance for that item in the bush roll |
+| `vasesdrop` | `true` | Breaking a vase always lays a heart (`PlayerClientPackets.cpp:159`) |
+| `enableexbodycolors` | `false` | Lets body colour values run past the 20 classic colours up to 170 when `generation` is modern or unset (`PropertySerializers.h:798-804`) |
+
+Item drops go to every client in the level segment the item lands in, including
+the one that caused them. Unlike the reference, a level holds at most 100 ground
+items; that cap is the only bound on how many items a stream of cut packets can
+lay, because the drop roll tests the level's base tile, which board changes
+never rewrite, so every cut rolls again (`PlayerClientPackets.cpp:144-148`).
+Level items expire server-side without a packet (`Level.cpp:711-716`); clients
+run their own timer and answer with `PLI_ITEMDEL`, which is relayed to the
+level's other players and removes the item if it is still there.
+A number in `serveroptions.txt` that is not plain digits reads as 0 for
+`mindeathgralats`, `maxdeathgralats`, `baddyrespawntime`, `respawntime` and
+`spawnrate<item>`, with one warning in the log (`Settings.h:202-221`).
+`itemdropevents`, `itemdropeventsonlyforgralats` and the item-NPC substitution
+that needs an NPC server are not implemented.
 
 ### RC and NC Access
 

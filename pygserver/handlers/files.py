@@ -2,7 +2,7 @@
 
 import logging
 
-from ..protocol.constants import PLI
+from ..protocol.constants import PLI, PLTYPE
 from ..protocol.packets import PacketReader
 from .registry import handles
 
@@ -42,6 +42,18 @@ class FileHandlers:
 
         if hasattr(self.server, 'filesystem'):
             await self.server.filesystem.handle_verify_want_send(self, checksum, filename)
+
+    @handles(PLI.UPDATEPACKAGEREQUESTFILE)
+    async def _handle_update_package_request(self, data: bytes):
+        """Handle PLI_UPDATEPACKAGEREQUESTFILE (159): [gchar len][package]
+        [guchar type][gint5]*, answered with PLO 105, the files, PLO 106.
+        Game clients only (PlayerClient.cpp:107); see update_packages.py."""
+        connection_type = getattr(self, 'connection_type', PLTYPE.ANYCLIENT)
+        if not connection_type & PLTYPE.ANYCLIENT:
+            return
+        filesystem = getattr(self.server, 'filesystem', None)
+        if filesystem is not None:
+            await filesystem.packages.handle_request(self, data)
 
     # The three script requests below all answer with compiled bytecode, so the
     # GS2 manager owns them outright; there is no text fallback to drop back to

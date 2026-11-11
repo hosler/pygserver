@@ -24,11 +24,17 @@ def _c_putbomb(self, a, npc, player, ctx):
     if lvl is None:
         return
     try:
+        from ...combat import wire_tile_ok
         from ...protocol.packets import build_bomb_add
+        x, y, power = to_num(a[1]), to_num(a[2]), to_num(a[0])
+        # One GCHAR carries each field; a bomb the wire cannot place is not
+        # announced (the server keeps no state for script bombs).
+        if not wire_tile_ok(x, y) or not math.isfinite(power):
+            return
         # GServer-v2 Level.cpp:2085: script bombs have owner 0, no player flag.
         # Its default three-second fuse is sent as 60 ticks.
         _schedule(self.server.broadcast_to_level(lvl.name, build_bomb_add(
-            0, to_num(a[1]), to_num(a[2]), int(to_num(a[0])) & 7, 60)))
+            0, x, y, int(power) & 7, 60)))
     except Exception:
         logger.debug("putbomb failed", exc_info=True)
 
@@ -36,44 +42,48 @@ def _explode(self, ctx, radius, power, x, y):
     lvl = self._level_of(ctx)
     if lvl is None or self.server is None:
         return
-    try:
-        from ...protocol.packets import build_explosion
-        _schedule(self.server.broadcast_to_level(
-            lvl.name, build_explosion(0, x, y, radius, power & 7)))
-    except Exception:
-        logger.debug("explosion broadcast failed", exc_info=True)
+    from ...combat import MAX_WIRE_RADIUS, wire_tile_ok
+    if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (radius, power)):
+        return
+    radius = max(0, min(int(radius), MAX_WIRE_RADIUS))
+    power = int(power)
     cm = getattr(self.server, "combat_manager", None)
+    # Decide once whether this blast happens at all: a flood or a runaway
+    # chain of script blasts loses its wire packet and its server effect
+    # together (CombatManager.reserve_script_blast).
+    if hasattr(cm, "reserve_script_blast") and not cm.reserve_script_blast(lvl.name):
+        return
+    # One GCHAR carries each wire field: a position it cannot hold (off-range
+    # or NaN/infinite) is not announced, but the server-side effect still runs.
+    if wire_tile_ok(x, y):
+        try:
+            from ...protocol.packets import build_explosion
+            _schedule(self.server.broadcast_to_level(
+                lvl.name, build_explosion(0, x, y, radius, power & 7)))
+        except Exception:
+            logger.debug("explosion broadcast failed", exc_info=True)
     if cm is not None:
         # GServer-v2 Level.cpp:2211: script explosions inform clients and
         # affect NPCs; TExplosion.cpp:48-96 leaves player damage to clients.
-        _schedule(cm.blast_level_objects(lvl, x, y, radius, power & 7))
+        _schedule(cm.blast_level_objects(
+            lvl, x, y, radius, power & 7, script=True, admitted=True))
 
 def _c_putexplosion(self, a, npc, player, ctx):
     # putexplosion radius,x,y  (power=1)
     if len(a) < 3:
         return
-    _explode(self, ctx, int(to_num(a[0])), 1, to_num(a[1]), to_num(a[2]))
+    _explode(self, ctx, to_num(a[0]), 1, to_num(a[1]), to_num(a[2]))
 
 def _c_putexplosion2(self, a, npc, player, ctx):
     # putexplosion2 power,radius,x,y
     if len(a) < 4:
         return
-    _explode(self, ctx, int(to_num(a[1])), int(to_num(a[0])), to_num(a[2]), to_num(a[3]))
+    _explode(self, ctx, to_num(a[1]), to_num(a[0]), to_num(a[2]), to_num(a[3]))
 
 def _c_shootarrow(self, a, npc, player, ctx):
-    # shootarrow dir — fire an arrow from the NPC in a cardinal direction
-    if npc is None or self.server is None:
-        return
-    lvl = self._level_of(ctx)
-    if lvl is None:
-        return
-    try:
-        from ...protocol.packets import build_arrow_add
-        d = (int(to_num(a[0])) & 3) if a else 2
-        _schedule(self.server.broadcast_to_level(lvl.name, build_arrow_add(
-            0, to_num(getattr(npc, "x", 0)), to_num(getattr(npc, "y", 0)), d)))
-    except Exception:
-        logger.debug("shootarrow failed", exc_info=True)
+    # shootarrow dir: same flight and wire as the shootfire* commands.
+    from .objects import _c_shootarrow as shoot
+    shoot(self, a, npc, player, ctx)
 
 def _c_hitplayer(self, a, npc, player, ctx):
     # hitplayer index,halfhearts,fromx,fromy — damage the level player at index

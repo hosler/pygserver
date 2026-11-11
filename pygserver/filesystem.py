@@ -11,10 +11,11 @@ import os
 import re
 import hashlib
 import time
+import weakref
 import zlib
 from pathlib import Path
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Optional, List, Dict, Tuple, BinaryIO
+from typing import TYPE_CHECKING, Optional, List, Dict, Set, Tuple, BinaryIO
 
 from .protocol.constants import PLO
 from .text_safety import has_control_chars
@@ -27,6 +28,7 @@ from .protocol.packets import (
     build_large_file_start,
     build_large_file_end,
     build_large_file_size,
+    build_update_package_is_updated,
 )
 
 if TYPE_CHECKING:
@@ -116,11 +118,29 @@ class FileSystem:
         # Lowercase name -> files under the public roots (see _find_file).
         self._public_index: Dict[str, List[Path]] = {}
         self._public_index_time = float('-inf')
+        # Bare names (lower case) that missed in the current index, so a
+        # package naming many absent files costs no lookups next time.
+        # Cleared whenever the index is rebuilt or dropped; never used to
+        # serve anything, only to skip a lookup that would miss.
+        self._miss_cache: Set[str] = set()
         # (public roots, {directory: mtime_ns}) recorded by the last scan, and
         # whether any of those mtimes was too fresh to trust (see
         # _public_tree_changed).
         self._public_signature: Optional[tuple] = None
         self._public_signature_racy = True
+        # (nofoldersconfig, sharefolder) the index was built for; a change
+        # (RC_SERVEROPTIONSSET, a config reload) drops the index on the next
+        # lookup, so a removed share stops being served at once.
+        self._folder_options: Optional[tuple] = None
+
+        # Bare names each game client has been sent, for PLO 187
+        # (Player.cpp:547-550 records them, Server.Init.cpp:482-487 reads them).
+        # Weak, so a disconnected player's set goes with it.
+        self._known_files: 'weakref.WeakKeyDictionary' = weakref.WeakKeyDictionary()
+
+        # Update packages (`.gupd`, PLI 159) resolve through this file system.
+        from .update_packages import UpdatePackageManager
+        self.packages = UpdatePackageManager(self)
 
         # Create directories
         self._ensure_directories()
@@ -152,8 +172,20 @@ class FileSystem:
             await player.send_raw(packet)
             return
 
-        # Check file size
-        file_size = file_path.stat().st_size
+        self.remember_sent_file(player, filename)
+        await self.send_resolved_file(player, filename, file_path)
+
+    async def send_resolved_file(self, player: 'Player', filename: str,
+                                 file_path: Path):
+        """Send an already resolved file as PLO_FILE, or chunked between
+        PLO_LARGEFILESTART/END above `large_file_threshold`
+        (Player.cpp:608-651); PLO_FILESENDFAILED when it is gone or above
+        `max_file_size`."""
+        try:
+            file_size = file_path.stat().st_size
+        except OSError:
+            await player.send_raw(build_file_send_failed(filename))
+            return
         if file_size > self.max_file_size:
             logger.warning(f"File too large: {filename} ({file_size} bytes)")
             packet = build_file_send_failed(filename)
@@ -165,6 +197,77 @@ class FileSystem:
             await self._send_large_file(player, filename, file_path)
         else:
             await self._send_file(player, filename, file_path)
+
+    # -- PLO 187 -------------------------------------------------------------
+
+    # Names remembered per player; a client asking for more stops being
+    # tracked past this (only files that exist are recorded at all).
+    MAX_KNOWN_FILES = 4096
+
+    def remember_sent_file(self, player: 'Player', filename: str):
+        """Record the bare name a game client fetched, so a later change to
+        that file can tell it (Player.cpp:547-550)."""
+        if not isinstance(filename, str):
+            return
+        name = filename.replace('\\', '/').rsplit('/', 1)[-1]
+        try:
+            known = self._known_files.setdefault(player, set())
+        except TypeError:
+            return      # not weak-referenceable (a test double)
+        if len(known) < self.MAX_KNOWN_FILES:
+            known.add(name)
+
+    def has_seen_file(self, player: 'Player', name: str) -> bool:
+        try:
+            return name in self._known_files.get(player, ())
+        except TypeError:
+            return False
+
+    async def notify_file_modified(self, file_path: Path):
+        """PLO_UPDATEPACKAGEISUPDATED to every game client that fetched the
+        file before (Server.Init.cpp:468-487): modern generation only, never
+        for a `.gupd` (the package itself is re-read by mtime instead), and
+        only for files a client can fetch at all."""
+        name = Path(file_path).name
+        if name.endswith('.gupd') or not self.is_bare_filename(name):
+            return
+        # Server.Init.cpp:468 sends it only for the modern generation. Unset
+        # counts as modern here, the same rule as GS2ScriptManager.
+        # npc_bytecode_enabled (gs2.py): pygserver serves 6.037 clients only.
+        generation = str(getattr(getattr(self.server, 'config', None),
+                                 'generation', '') or '').strip().lower()
+        if generation not in ('', 'modern'):
+            return
+        if not self._is_public_path(Path(file_path)):
+            return
+        packet = build_update_package_is_updated(name)
+        for player, known in list(self._known_files.items()):
+            if name in known:
+                try:
+                    await player.send_raw(packet)
+                except Exception as error:   # one dead socket must not stop the rest
+                    logger.debug("PLO 187 to %s failed: %s",
+                                 getattr(player, 'id', '?'), error)
+
+    def _is_public_path(self, file_path: Path) -> bool:
+        try:
+            resolved = file_path.resolve()
+        except (OSError, RuntimeError):
+            return False
+        for root in self.public_dirs():
+            try:
+                resolved.relative_to(root.resolve())
+                return True
+            except (OSError, ValueError, RuntimeError):
+                continue
+        return False
+
+    def _schedule_modified(self, file_path: Path):
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        loop.create_task(self.notify_file_modified(file_path))
 
     async def handle_update_file(
             self, player: 'Player', mod_time: int, filename: str):
@@ -185,6 +288,12 @@ class FileSystem:
             filename: Requested filename
         """
         logger.debug(f"Player {player.id} verify file: {filename} (checksum={checksum})")
+
+        # A `.gupd` skips the checksum and is always resent, so the client
+        # answers with a fresh PLI 159 (PlayerClientPackets.cpp:1436-1445).
+        if filename.endswith('.gupd'):
+            await self.handle_want_file(player, filename)
+            return
 
         # Find file
         file_path = self._find_file(filename)
@@ -218,11 +327,12 @@ class FileSystem:
             # asyncio.to_thread since this project targets Python 3.8+, which
             # predates to_thread).
             loop = asyncio.get_event_loop()
+            mod_time = self._mod_time(file_path)
             data = await loop.run_in_executor(None, file_path.read_bytes)
 
             # PLO_FILE carries raw bytes (with newlines), so announce its full
             # length via PLO_RAWDATA first; the codec compresses the stream.
-            file_packet = build_file(filename, data)
+            file_packet = build_file(filename, data, mod_time)
             announcement = build_raw_data_announcement(len(file_packet))
             await player.send_raw(announcement + file_packet)
 
@@ -232,6 +342,15 @@ class FileSystem:
             logger.error(f"Error sending file {filename}: {e}")
             packet = build_file_send_failed(filename)
             await player.send_raw(packet)
+
+    @staticmethod
+    def _mod_time(file_path: Path) -> int:
+        """Whole-second mtime for PLO_FILE's GInt5 field, which every chunk
+        carries (Player.cpp:573, 644); 0 if the file cannot be stat'ed."""
+        try:
+            return max(0, int(file_path.stat().st_mtime))
+        except OSError:
+            return 0
 
     async def _send_large_file(self, player: 'Player', filename: str, file_path: Path):
         """
@@ -244,6 +363,7 @@ class FileSystem:
         """
         try:
             file_size = file_path.stat().st_size
+            mod_time = self._mod_time(file_path)
 
             # Send start packet
             packet = build_large_file_start(filename)
@@ -275,7 +395,7 @@ class FileSystem:
                         break
 
                     # Repeat the complete file header so each raw chunk dispatches as PLO_FILE.
-                    file_packet = build_file(filename, chunk)
+                    file_packet = build_file(filename, chunk, mod_time)
                     announcement = build_raw_data_announcement(len(file_packet))
                     await player.send_raw(announcement + file_packet)
 
@@ -652,8 +772,12 @@ class FileSystem:
         """(category, glob) of every allowed foldersconfig.txt line.
 
         Parsed once per version of the file, keyed on its (mtime_ns, size,
-        inode); `invalidate_folders_config` drops the cached copy.
+        inode); `invalidate_folders_config` drops the cached copy. With
+        `nofoldersconfig = true` the file is not loaded at all (Server.cpp:
+        769-774), so there are no entries.
         """
+        if self._nofoldersconfig():
+            return []
         path = self.folders_config_path()
         try:
             info = os.stat(path)
@@ -689,6 +813,7 @@ class FileSystem:
         self._public_index = {}
         self._public_signature = None
         self._public_index_time = float('-inf')
+        self._miss_cache = set()
 
     def _folders_config_dirs(self) -> List[str]:
         """First folder of each allowed foldersconfig.txt pattern
@@ -703,8 +828,88 @@ class FileSystem:
                 names.append(first)
         return names
 
+    # -- nofoldersconfig / sharefolder ---------------------------------------
+    #
+    # Server.cpp:769-774 picks one of two world file systems. `nofoldersconfig
+    # = false` (the default) loads foldersconfig.txt and binds `world` only;
+    # `sharefolder` is ignored (:482-522). `true` skips foldersconfig.txt and
+    # binds `world` plus every comma-separated `sharefolder` entry (:471-480).
+    # Here the CLIENT_FILE_DIRS stay public either way; `true` swaps the
+    # foldersconfig-derived roots for the share folders. The reference binds
+    # each entry relative to its working directory and creates it if missing
+    # (FileSystem.cpp:76-116); a share folder here is relative to the server
+    # folder and must already exist, and is refused if it is absolute, has a
+    # dot segment, names a PRIVATE_DIRS folder, or resolves (after links)
+    # outside the server folder or to the server folder itself.
+    MAX_SHARE_FOLDERS = 32
+
+    def _server_config(self):
+        return getattr(self.server, 'config', None)
+
+    def _nofoldersconfig(self) -> bool:
+        return getattr(self._server_config(), 'nofoldersconfig', False) is True
+
+    def _sharefolder_option(self) -> Tuple[str, ...]:
+        value = getattr(self._server_config(), 'sharefolder', None) or ()
+        if isinstance(value, str):
+            value = value.split(',')
+        return tuple(str(entry) for entry in value)
+
+    def _check_folder_options(self):
+        """Drop the public index when nofoldersconfig/sharefolder changed
+        since it was built (RC_SERVEROPTIONSSET sets them on the live config,
+        rc.py _apply_server_options)."""
+        current = (self._nofoldersconfig(), self._sharefolder_option())
+        if current != self._folder_options:
+            if self._folder_options is not None:
+                self.invalidate_folders_config()
+            self._folder_options = current
+            self.share_dirs(log=True)
+
+    def share_dir_allowed(self, entry: str) -> Optional[Path]:
+        """The folder a `sharefolder` entry names, or None if refused."""
+        if not isinstance(entry, str):
+            return None
+        entry = entry.strip().replace('\\', '/').rstrip('/')
+        if (not entry or len(entry) > 255 or entry.startswith('/')
+                or ':' in entry or has_control_chars(entry)):
+            return None
+        segments = entry.split('/')
+        if any(not segment or segment.startswith('.') for segment in segments):
+            return None
+        if segments[0].lower() in self.PRIVATE_DIRS:
+            return None
+        root = self.base_path / entry
+        try:
+            base = self.base_path.resolve()
+            resolved = root.resolve(strict=True)
+            relative = resolved.relative_to(base)
+        except (OSError, ValueError, RuntimeError):
+            return None
+        if not relative.parts or relative.parts[0].lower() in self.PRIVATE_DIRS:
+            return None
+        if not resolved.is_dir():
+            return None
+        return root
+
+    def share_dirs(self, log: bool = False) -> List[Path]:
+        """Allowed `sharefolder` folders; empty unless `nofoldersconfig`."""
+        if not self._nofoldersconfig():
+            return []
+        roots: List[Path] = []
+        for entry in self._sharefolder_option()[:self.MAX_SHARE_FOLDERS]:
+            root = self.share_dir_allowed(entry)
+            if root is None:
+                if log and entry.strip():
+                    logger.warning("sharefolder entry refused: %r", entry)
+                continue
+            if root not in roots:
+                roots.append(root)
+        return roots
+
     def public_dirs(self) -> List[Path]:
         """Existing public root folders, in search order (`world/` first)."""
+        self._check_folder_options()
         names = list(self.CLIENT_FILE_DIRS)
         names += [n for n in self._folders_config_dirs() if n not in names]
         roots = []
@@ -714,6 +919,7 @@ class FileSystem:
             root = self.base_path / name
             if root.is_dir():
                 roots.append(root)
+        roots += [root for root in self.share_dirs() if root not in roots]
         return roots
 
     def _rebuild_public_index(self) -> Dict[str, List[Path]]:
@@ -751,6 +957,7 @@ class FileSystem:
         self._public_signature_racy = any(
             scan_start - m < self._MTIME_SETTLE_NS for m in mtimes.values())
         self._public_index_time = time.monotonic()
+        self._miss_cache = set()
         return index
 
     def _public_tree_changed(self) -> bool:
@@ -814,13 +1021,66 @@ class FileSystem:
                 return file_path
             return None
 
+        self._check_folder_options()
         found = self._lookup_public(filename)
-        if found is None and (time.monotonic() - self._public_index_time
-                              >= self.INDEX_RESCAN_SECONDS
-                              and self._public_tree_changed()):
-            self._rebuild_public_index()
+        if found is None and self._maybe_rescan():
             found = self._lookup_public(filename)
         return found
+
+    MAX_MISS_CACHE = 4096
+
+    def _maybe_rescan(self) -> bool:
+        """After a miss: re-scan if a public folder changed, checking at most
+        once per INDEX_RESCAN_SECONDS. True when the index was rebuilt.
+
+        `_public_index_time` is when the index was last known current: a
+        check that finds nothing changed moves it forward too, so a flood of
+        misses costs one tree check per window, not one per miss."""
+        now = time.monotonic()
+        if now - self._public_index_time < self.INDEX_RESCAN_SECONDS:
+            return False
+        if not self._public_tree_changed():
+            self._public_index_time = now
+            return False
+        self._rebuild_public_index()
+        return True
+
+    def public_candidates(self, names) -> Dict[str, List[Path]]:
+        """Index entries for many bare names at once, for the caller to
+        validate off the event loop (exact name, still a regular file).
+
+        At most one tree-change check runs per call (and per
+        INDEX_RESCAN_SECONDS); names that missed in the current index are
+        remembered until it changes. A name that is not bare gets [].
+        """
+        self._check_folder_options()
+        result: Dict[str, List[Path]] = {}
+        pending = []
+        for name in names:
+            if not self.is_bare_filename(name):
+                result[name] = []
+                continue
+            key = name.lower()
+            candidates = (None if key in self._miss_cache
+                          else self._public_index.get(key))
+            if candidates:
+                result[name] = list(candidates)
+            else:
+                pending.append(name)
+        if pending and self._maybe_rescan():
+            still = []
+            for name in pending:
+                candidates = self._public_index.get(name.lower())
+                if candidates:
+                    result[name] = list(candidates)
+                else:
+                    still.append(name)
+            pending = still
+        for name in pending:
+            result[name] = []
+            if len(self._miss_cache) < self.MAX_MISS_CACHE:
+                self._miss_cache.add(name.lower())
+        return result
 
     def _calculate_checksum(self, file_path: Path) -> int:
         """
@@ -888,10 +1148,18 @@ class FileSystem:
         try:
             with open(file_path, 'wb') as f:
                 f.write(data)
-            return True
         except Exception as e:
             logger.error(f"Error writing file {filename}: {e}")
             return False
+        # A new name must be findable at once, not after the next rescan
+        # window: the next miss re-scans (and the stale misses go).
+        self._public_signature = None
+        self._public_index_time = float('-inf')
+        self._miss_cache = set()
+        # The reference learns of the change from its file watcher; RC
+        # uploads are the only writer here (Server.Init.cpp:460-487).
+        self._schedule_modified(file_path)
+        return True
 
     async def send_file(self, player: 'Player', filename: str):
         """

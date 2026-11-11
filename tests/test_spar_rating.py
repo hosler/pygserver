@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from reborn_protocol.props import (
-    COLORS_NEWWORLD, PLAYER_PROPS, StreamPolicy, parse_prop_stream,
+    COLORS_CLASSIC, PLAYER_PROPS, StreamPolicy, parse_prop_stream,
 )
 
 from pygserver.account import Account, AccountManager
@@ -186,7 +186,7 @@ async def test_login_decay_precedes_props_and_runs_once(
         props, clean, _pos = parse_prop_stream(
             reader.remaining()[:-1], 0,
             StreamPolicy(table=PLAYER_PROPS, max_prop_id=100,
-                         colors_len=COLORS_NEWWORLD, require_full_consume=True), {
+                         colors_len=COLORS_CLASSIC, require_full_consume=True), {
                 PLPROP.RATING: lambda props, value: props.__setitem__(PLPROP.RATING, value),
             })
         assert clean

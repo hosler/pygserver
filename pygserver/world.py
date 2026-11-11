@@ -171,6 +171,10 @@ class World:
         """
         return self._level_manager.get_level(name)
 
+    def get_loaded_level(self, name: str) -> Optional[Level]:
+        """A level already in memory; never loads one from disk."""
+        return self._level_manager.get_loaded_level(name)
+
     def add_gmap(self, gmap: GMap):
         """Add a GMAP to the world."""
         self._gmaps[gmap.name] = gmap
@@ -272,6 +276,8 @@ class World:
             self.server.baddy_manager._baddies.pop(level.name, None)
 
         level._tiles = replacement._tiles
+        level._base_tiles = replacement._base_tiles
+        level.clear_board_changes()           # Level.cpp:656
         level._links = replacement._links
         level._signs = replacement._signs
         level._chests = replacement._chests

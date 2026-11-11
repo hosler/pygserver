@@ -3,6 +3,7 @@
 import logging
 
 from ..packet_codec import PacketBuilder
+from .core import build_raw_data_announcement
 from reborn_protocol.codec import PacketBuilder as ReferencePacketBuilder
 from ..constants import (
     PLO, NPCPROP, BDPROP
@@ -14,21 +15,35 @@ from typing import Any, Dict, List, Optional, Tuple  # noqa: F401  - kept: origi
 
 logger = logging.getLogger(__name__)
 
+def _item_coordinate(tiles: float) -> int:
+    """Half-tile GCHAR payload of a level-item coordinate: wrapped to an
+    unsigned byte, then capped at 223 (see build_item_add)."""
+    return min(int(tiles * 2) & 0xFF, 223)
+
+
 def build_item_add(x: float, y: float, item_type: int) -> bytes:
-    """Build PLO_ITEMADD packet."""
+    """Build PLO_ITEMADD packet.
+
+    A negative half-tile coordinate wraps to an unsigned byte and is then capped
+    at 223, as the reference's `>> (char)(localPosition.x() / 8)` is
+    (Level.cpp:2430; gs2lib CString::writeGChar takes an unsigned char and caps
+    it, CString.cpp:1717-1722). This module's GCHAR writer only wraps, and a
+    raw value of 234 would encode to 0x0A, the packet terminator, so the cap
+    is applied here.
+    """
     builder = PacketBuilder().write_gchar(PLO.ITEMADD)
-    builder.write_gchar(int(x * 2))
-    builder.write_gchar(int(y * 2))
+    builder.write_gchar(_item_coordinate(x))
+    builder.write_gchar(_item_coordinate(y))
     builder.write_gchar(item_type)
     builder.write_newline()
     return builder.build()
 
 
 def build_item_del(x: float, y: float) -> bytes:
-    """Build PLO_ITEMDEL packet."""
+    """Build PLO_ITEMDEL packet (same coordinate form as PLO_ITEMADD)."""
     builder = PacketBuilder().write_gchar(PLO.ITEMDEL)
-    builder.write_gchar(int(x * 2))
-    builder.write_gchar(int(y * 2))
+    builder.write_gchar(_item_coordinate(x))
+    builder.write_gchar(_item_coordinate(y))
     builder.write_newline()
     return builder.build()
 
@@ -311,6 +326,19 @@ def build_npc_bytecode(npc_id: int, bytecode: bytes) -> bytes:
     return builder.build()
 
 
+def build_npc_bytecode_raw(npc_id: int, bytecode: bytes) -> bytes:
+    """PLO_NPCBYTECODE as it goes on the wire to a v6.037 client.
+
+    The bytecode is binary and may hold 0x0a, so the packet rides inside a
+    PLO_RAWDATA announcement whose length counts the whole packet including
+    its newline (Level::sendNPCToPlayer -> Player::sendRawPacket, Level.cpp:1477-1478,
+    Player.cpp:524, origin/beta4): `84 20 20 28 0A  A3 20 29 72 DE AD BE 0A`
+    for id 1234 and DE AD BE.
+    """
+    packet = build_npc_bytecode(npc_id, bytecode)
+    return build_raw_data_announcement(len(packet)) + packet
+
+
 def build_hide_npcs(hide: bool) -> bytes:
     """Build PLO_HIDENPCS packet."""
     builder = PacketBuilder().write_gchar(PLO.HIDENPCS)
@@ -524,12 +552,62 @@ def build_set_active_level(level_name: str) -> bytes:
     return builder.build()
 
 
+_REFUSED_MAP_TEXTS: set = set()
+_MAX_REFUSED_MAP_TEXTS = 64
+
+
+def _map_text_ok(text) -> bool:
+    """PLO 171/172 text is raw and newline-terminated, so a byte < 0x20 (a
+    script's `#K(10)`, an option with a tab) would split or corrupt the
+    packet. Refused outright; the reference forwards it unchecked. Each
+    distinct refused value is logged once (at most 64 remembered)."""
+    if isinstance(text, str) and not any(ord(c) < 0x20 for c in text):
+        return True
+    shown = repr(text)[:200]
+    if shown not in _REFUSED_MAP_TEXTS:
+        if len(_REFUSED_MAP_TEXTS) < _MAX_REFUSED_MAP_TEXTS:
+            _REFUSED_MAP_TEXTS.add(shown)
+            logger.warning("Map packet not sent: text has a control byte: %s",
+                           shown)
+    return False
+
+
 def build_minimap(text: str) -> bytes:
-    """Build PLO_MINIMAP packet."""
+    """Build PLO_MINIMAP packet: [gchar 172][raw `a,b,c,d` text]
+    (PlayerClient.cpp:510, origin/beta4). b'' for text with a control byte."""
+    if not _map_text_ok(text):
+        return b''
     builder = PacketBuilder().write_gchar(PLO.MINIMAP)
     builder.write_string(text)
     builder.write_newline()
     return builder.build()
+
+
+def build_bigmap(text: str) -> bytes:
+    """Build PLO_BIGMAP packet: [gchar 171][raw `a,b,c,d` text]
+    (PlayerClient.cpp:500, origin/beta4). b'' for text with a control byte."""
+    if not _map_text_ok(text):
+        return b''
+    builder = PacketBuilder().write_gchar(PLO.BIGMAP)
+    builder.write_string(text)
+    builder.write_newline()
+    return builder.build()
+
+
+def map_option_text(value) -> Optional[str]:
+    """The `bigmap` / `minimap` option as the login sends it, or None.
+
+    PlayerClient.cpp:499,509: the value is tokenized on ',' (CString::tokenize,
+    which drops empty tokens), and only exactly four tokens are sent, each
+    trimmed of bytes <= ' ' and rejoined with ','; anything else is skipped.
+    """
+    if not isinstance(value, str) or not value:
+        return None
+    trim = ''.join(chr(c) for c in range(33))
+    tokens = [token for token in value.split(',') if token]
+    if len(tokens) != 4:
+        return None
+    return ','.join(token.strip(trim) for token in tokens)
 
 
 # =============================================================================

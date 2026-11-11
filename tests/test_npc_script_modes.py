@@ -237,7 +237,8 @@ def test_level_load_spawns_client_only_npc(enabled):
 
 
 @pytest.mark.parametrize("enabled", [True, False])
-def test_nc_save_uses_script_mode_without_firing_created(enabled):
+def test_nc_save_uses_script_mode_and_queues_created(enabled):
+    # PlayerNCPackets.cpp:226-228 (origin/beta4): setScript, then CREATED.
     server = SimpleNamespace(config=ServerConfig(serverside=enabled))
     server.npc_manager = NPCManager(server)
     npc = NPC(7)
@@ -252,5 +253,5 @@ def test_nc_save_uses_script_mode_without_firing_created(enabled):
     assert npc.gs1_source == source
     assert npc.client_script == (source.split("\n", 2)[2] if enabled else source)
     assert (npc.gs1_program is not None) is enabled
-    assert npc.gs1_scopes["this"] == {}
+    assert npc.gs1_scopes["this"] == ({"side": 1.0} if enabled else {})
     assert npc._dirty

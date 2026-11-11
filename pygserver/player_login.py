@@ -27,7 +27,10 @@ from reborn_protocol.constants import PLTYPE
 
 from .protocol.constants import PLPROP
 from .spar_rating import decay_deviation
+from .protocol.builders.world import map_option_text
 from .protocol.packets import (
+    build_bigmap,
+    build_minimap,
     build_clear_weapons,
     build_flag_set,
     build_has_npc_server,
@@ -35,6 +38,7 @@ from .protocol.packets import (
     build_serverlist_connected,
     build_rc_chat,
     build_rc_max_upload_filesize,
+    build_server_mode,
     build_staff_guilds,
     parse_login_packet,
 )
@@ -105,6 +109,19 @@ class LoginService:
             }
             player.connection_type = candidate_type \
                 if candidate_type in valid_types else PLTYPE.CLIENT
+
+            # `onlystaff` needs only the account name, so a refused login must
+            # not load or create an account file first (a flood of random names
+            # would otherwise fill the accounts directory). RC and NC keep the
+            # reference's own refusal text (Player.cpp:685-694 precedes :701).
+            if (getattr(server.config, 'onlystaff', False) is True
+                    and not server.is_staff(player.account_name)):
+                logger.info(f"Refused non-staff login for {player.account_name!r}: staff only")
+                await player.disconnect(
+                    "You do not have RC rights."
+                    if player.connection_type & (PLTYPE.ANYRC | PLTYPE.NC)
+                    else "This server is currently restricted to staff only.")
+                return False
 
             account_manager = getattr(server, 'account_manager', None)
             if account_manager:
@@ -178,6 +195,17 @@ class LoginService:
             await player.disconnect("You do not have RC rights.")
             return
 
+        # Player.cpp:697-706: `onlystaff` turns away every non-staff login.
+        # The reference tests it for client types only, because RC and NC are
+        # staff-gated above already; here it holds for any connection type so
+        # an odd login type cannot slip past it. Staff status is the account
+        # name against the `staff` option (Server.cpp:1774), never the nickname.
+        if (getattr(player.server.config, 'onlystaff', False) is True
+                and not player.server.is_staff(player.account_name)):
+            logger.info(f"Refused non-staff login for {player.account_name}: staff only")
+            await player.disconnect("This server is currently restricted to staff only.")
+            return
+
         # GServer-v2/server/src/player/PlayerClient.cpp:453-471: whole days
         # truncate toward zero, and even capped deviation resets the clock.
         # PlayerClient only, so RC and NC logins leave the rating alone.
@@ -200,10 +228,22 @@ class LoginService:
         serverlist_connected = build_serverlist_connected() if connected else b''
         if connection_type & PLTYPE.ANYCLIENT:
             lead = serverlist_connected + build_clear_weapons()
+            # PlayerClient.cpp:494-512: PLO_BIGMAP then PLO_MINIMAP follow
+            # the reset when the option is exactly four comma tokens.
+            for option, build in (('bigmap', build_bigmap),
+                                  ('minimap', build_minimap)):
+                text = map_option_text(getattr(player.server.config, option, ''))
+                if text is not None:
+                    lead += build(text)
         elif is_rc:
             lead = build_clear_weapons() + serverlist_connected
         else:
             lead = b''
+        # Player.cpp:746-752 (origin/beta4): the PLO_KINGDOMSMODE /
+        # PLO_NEWWORLDMODE announcement leads every login type (client, RC and
+        # NC) where the reference puts PLO_SIGNATURE; `normal` sends neither.
+        lead = build_server_mode(
+            getattr(player.server, 'server_mode', 'normal')) + lead
 
         await self.send_login_response(lead)
 
@@ -232,6 +272,7 @@ class LoginService:
         gs2 = getattr(player.server, 'gs2_manager', None)
         if gs2 is not None:
             await gs2.announce_weapons(player)
+            await self._grant_protected_weapons(player, gs2)
 
         config = player.server.config
         await player.warp(config.start_level, config.start_x, config.start_y)
@@ -239,6 +280,24 @@ class LoginService:
         rc_manager = getattr(player.server, 'rc_manager', None)
         if rc_manager:
             await rc_manager.notify_player_join(player)
+
+    async def _grant_protected_weapons(self, player: 'Player', gs2) -> None:
+        """PlayerClient.cpp:605-610: every `protectedweapons` entry the account
+        lacks is added and sent at login. Player::addWeapon(name) needs a
+        weapon the server knows (Player.cpp:1103-1107), so an entry naming no
+        weapon grants nothing; a built-in item weapon counts as known here
+        because pygserver registers those on first use, not at boot."""
+        from .items import DEFAULT_WEAPON_IDS
+        owned = {name.lower() for name in player.weapons}
+        for entry in getattr(player.server.config, 'protectedweapons', ()):
+            script = gs2.get_weapon(entry)
+            name = script.name if script is not None else (
+                entry.lower() if entry.lower() in DEFAULT_WEAPON_IDS else None)
+            if name is None or name.lower() in owned:
+                continue
+            owned.add(name.lower())
+            player.add_weapon(name)
+            await gs2.announce_weapon(player, name)
 
     async def send_rc_login_sequence(self):
         """Send the control-client welcome and current player roster."""

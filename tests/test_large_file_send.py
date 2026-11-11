@@ -48,7 +48,8 @@ def test_large_file_chunks_have_file_headers_and_named_end(tmp_path, monkeypatch
 
         packet = PacketReader(file_packet)
         assert packet.read_gchar() == PLO.FILE
-        assert packet.read_gint5() == 0
+        # Every chunk carries the file's mtime (Player.cpp:573,644, origin/beta4).
+        assert packet.read_gint5() == int(path.stat().st_mtime)
         name_length = packet.read_gchar()
         assert packet.read_bytes(name_length) == b"map.bin"
         rebuilt.extend(packet.read_bytes(len(packet.remaining()) - 1))

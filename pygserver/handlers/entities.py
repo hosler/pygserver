@@ -228,6 +228,16 @@ class EntityHandlers:
         reader = PacketReader(data)
         weapon_name = reader.remaining().decode('latin-1', errors='replace')
 
+        # PlayerClientPackets.cpp:883: a `protectedweapons` entry is never
+        # deleted by the client. The reference compares exact strings; case and
+        # edge whitespace are folded here so a variant spelling cannot reach a
+        # weapon store that looks names up case-insensitively.
+        protected = {name.strip().lower() for name in
+                     getattr(getattr(self.server, 'config', None),
+                             'protectedweapons', ())}
+        if weapon_name.strip().lower() in protected:
+            return
+
         if weapon_name in self.weapons:
             self.weapons.remove(weapon_name)
 
@@ -297,6 +307,7 @@ class EntityHandlers:
         if npc is None or npc.level is not self.level:
             return
         from reborn_protocol.props import NPC_PROPS, decode_value, payload_len
+        from ..protocol.colors import NPC_COLORS_READ_WIDTH, clamp_colors
         raw = reader.remaining()
         updates = {}
         position = 0
@@ -307,11 +318,17 @@ class EntityHandlers:
             if descriptor is None:
                 await self.disconnect('Corrupted packet received.')
                 return
-            width = payload_len(descriptor, raw, position, colors_len=8)
+            # NPC COLORS is read 5 wide in every mode (PropertyColors<true>,
+            # NPC.h:646; PropertySerializers.h:752), unlike the player prop.
+            width = payload_len(descriptor, raw, position,
+                                colors_len=NPC_COLORS_READ_WIDTH)
             if position + width > len(raw):
                 await self.disconnect('Corrupted packet received.')
                 return
-            value, position = decode_value(descriptor, raw, position, colors_len=8)
+            value, position = decode_value(descriptor, raw, position,
+                                           colors_len=NPC_COLORS_READ_WIDTH)
+            if prop_id == NPCPROP.COLORS:
+                value = clamp_colors(value)   # PropertySerializers.h:758
             # Choke point for client-settable NPC strings (see text_safety).
             updates.update(npc.apply_client_prop(prop_id, sanitize_value(value)))
         if updates:

@@ -6,6 +6,7 @@ server/src/player/PlayerProps.cpp (setPropsFromRCPacket).
 
 import asyncio
 import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -522,10 +523,18 @@ def test_folders_config_is_parsed_once_per_version(rc, monkeypatch):
     fs = rc.server.filesystem
     first = fs.folders_config_entries()
     assert first == [("file", "images/*")]
+    # Only opens of the config file count: the fixture's create_account calls
+    # queue account writes on the AccountManager's "account-save" thread,
+    # which can run while open() is patched and open the account files.
     opened = []
     real_open = open
-    monkeypatch.setattr("builtins.open", lambda *a, **k: (
-        opened.append(a[0]), real_open(*a, **k))[1])
+
+    def counting_open(file, *args, **kwargs):
+        if isinstance(file, (str, os.PathLike)) and Path(file) == path:
+            opened.append(file)
+        return real_open(file, *args, **kwargs)
+
+    monkeypatch.setattr("builtins.open", counting_open)
     assert fs.folders_config_entries() is first
     assert opened == []
     path.write_text("file images/*\nlevel *.nw\n")

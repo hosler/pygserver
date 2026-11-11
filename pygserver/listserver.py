@@ -66,6 +66,9 @@ class ServerListClient:
         self.next_connection_attempt = 0.0
         self.max_backoff = 300  # 5 minutes max
 
+        # HQ level the list server last received (None until registered)
+        self._hq_level_sent: Optional[int] = None
+
         # Keep-alive / dead-connection detection
         self.last_ping_time = 0.0
         self.last_data_time = 0.0
@@ -118,6 +121,8 @@ class ServerListClient:
                 if self.connected:
                     await self._receive_packets()
                     await self._check_keepalive()
+                    if self.connected and self._hq_level_sent is not None:
+                        await self._refresh_server_hq()
 
                 # Small delay to prevent busy loop
                 await asyncio.sleep(0.1)
@@ -283,10 +288,7 @@ class ServerListClient:
         await self._send_packet(packet.build())
 
         # Send HQ level
-        packet = PacketBuilder()
-        packet.write_gchar(SVO.SERVERHQLEVEL)
-        packet.write_gchar(self.config.hq_level)
-        await self._send_packet(packet.build())
+        await self._send_hq_level()
 
         # Send version config (allowed versions) - must match C++ server format
         packet = PacketBuilder()
@@ -298,6 +300,33 @@ class ServerListClient:
 
         # Send player list
         await self.send_players()
+
+    def _effective_hq_level(self) -> int:
+        """ServerList.cpp:276-279: `onlystaff` reports HQ level 0."""
+        if getattr(self.config, 'onlystaff', False) is True:
+            return 0
+        return self.config.hq_level
+
+    async def _send_hq_level(self):
+        """Send SVO_SERVERHQLEVEL and remember what the list server now holds."""
+        level = self._effective_hq_level()
+        packet = PacketBuilder()
+        packet.write_gchar(SVO.SERVERHQLEVEL)
+        packet.write_gchar(level)
+        await self._send_packet(packet.build())
+        self._hq_level_sent = level
+
+    async def _refresh_server_hq(self):
+        """Server.cpp:673-674 re-sends the HQ pair after every settings reload so
+        a changed `onlystaff` reaches the list server. Here the loop compares
+        the level it last sent, which also covers an RC option edit."""
+        if self._effective_hq_level() == self._hq_level_sent:
+            return
+        packet = PacketBuilder()
+        packet.write_gchar(SVO.SERVERHQPASS)
+        packet.write_string(self.config.hq_password)
+        await self._send_packet(packet.build())
+        await self._send_hq_level()
 
     async def _send_packet(self, data: bytes):
         """Send a packet to the list server."""

@@ -15,6 +15,12 @@ from .registry import handles
 logger = logging.getLogger(__name__)
 
 
+def _is_server_flag(name: str) -> bool:
+    """PlayerClientPackets.cpp:663,705: a flag is a server flag when its name
+    contains `server.` anywhere, not only as a prefix."""
+    return 'server.' in name
+
+
 class CommunicationHandlers:
     """Mixin: PLI_TOALL/PRIVATEMESSAGE/SHOWIMG, PLI_FLAG*, PLI_TRIGGERACTION."""
 
@@ -100,17 +106,24 @@ class CommunicationHandlers:
         if (serverside and flag_data.partition('=')[0].strip().startswith(
                 ('clientr.', 'serverr.'))):
             return
+        # PlayerClientPackets.cpp:663-668: with `dontaddserverflags` a server
+        # flag set is swallowed, never falling through to a client flag.
+        dont_add = getattr(getattr(self.server, 'config', None),
+                            'dontaddserverflags', False) is True
         if '=' not in flag_data:
             name = flag_data.strip()
-            if name.startswith('server.') and not serverside:
-                await self.server.set_flag(name, "")
+            if _is_server_flag(name) and not serverside:
+                if not dont_add:
+                    await self.server.set_flag(name, "")
             else:
                 self.flags[name] = True
             return
         name, value = flag_data.split('=', 1)
         name = name.strip()
         value = value.strip()
-        if name.startswith('server.') and not serverside:
+        if _is_server_flag(name) and not serverside:
+            if dont_add:
+                return
             if value:
                 await self.server.set_flag(name, value)
             else:
@@ -131,8 +144,11 @@ class CommunicationHandlers:
         if (flag_name.startswith('clientr.')
                 or (serverside and flag_name.startswith('serverr.'))):
             return
-        if flag_name.startswith('server.') and not serverside:
-            await self.server.del_flag(flag_name)
+        if _is_server_flag(flag_name) and not serverside:
+            # PlayerClientPackets.cpp:707: `dontaddserverflags` blocks deletes too.
+            if getattr(getattr(self.server, 'config', None),
+                       'dontaddserverflags', False) is not True:
+                await self.server.del_flag(flag_name)
         else:
             self.flags.pop(flag_name, None)
 
@@ -165,7 +181,11 @@ class CommunicationHandlers:
         # Relay to other players on the level (GServer-v2 msgPLI_TRIGGERACTION:
         # sendPacketToOneLevelPart(..., { m_id }) when sendplayertriggers=true,
         # the default; excludes the sender).
-        if self.level and not handled:
+        # PlayerClientPackets.cpp:1310: `sendplayertriggers = false` keeps the
+        # relay off; NPC events below still run.
+        relay = getattr(getattr(self.server, 'config', None),
+                        'sendplayertriggers', True) is not False
+        if self.level and not handled and relay:
             packet = build_trigger_action(self.id, npc_id, x, y, action)
             await self.server.broadcast_to_level(self.level.name, packet, exclude={self.id})
 

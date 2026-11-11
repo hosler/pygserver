@@ -11,6 +11,7 @@ Nothing here talks to the network or to Player: these are plain state holders.
 
 from typing import Dict, List
 
+from .protocol.colors import default_colors
 from .protocol.constants import PLTYPE
 
 
@@ -65,7 +66,7 @@ class Character:
         self.body_image = "body.png"
         self.sword_image = "sword1.png"
         self.shield_image = "shield1.png"
-        self.colors = [0, 0, 0, 0, 0]  # Skin, coat, sleeve, shoe, belt
+        self.colors = default_colors()  # Character.h:43; Skin, coat, sleeve, shoe, belt, 3 new-world slots
 
         # MP/AP (PLPROP_MAGICPOINTS=26 / PLPROP_ALIGNMENT=32). Defaults match
         # GServer-v2 (server/include/object/Character.h): mp starts at 0,

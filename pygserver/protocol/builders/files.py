@@ -95,3 +95,35 @@ def build_load_gani(gani_name: str, setbackto: str = "") -> bytes:
     builder.write_newline()
     return builder.build()
 
+
+
+# =============================================================================
+# Update packages (`.gupd`)
+# =============================================================================
+
+def build_update_package_size(package_name: str, total_size: int) -> bytes:
+    """PLO_UPDATEPACKAGESIZE: [gchar len][package name][gint5 bytes needed]
+    (PlayerClientPackets.cpp:1588): `89 29 base.gupd 20 20 20 27 88` for
+    base.gupd and 1000 bytes."""
+    builder = PacketBuilder().write_gchar(PLO.UPDATEPACKAGESIZE)
+    builder.write_gstring(package_name)
+    builder.write_gint5(max(0, min(int(total_size), 0xFFFFFFFF)))
+    builder.write_newline()
+    return builder.build()
+
+
+def build_update_package_done(package_name: str) -> bytes:
+    """PLO_UPDATEPACKAGEDONE: [package name] (PlayerClientPackets.cpp:1593)."""
+    builder = PacketBuilder().write_gchar(PLO.UPDATEPACKAGEDONE)
+    builder.write_string(package_name)
+    builder.write_newline()
+    return builder.build()
+
+
+def build_update_package_is_updated(filename: str) -> bytes:
+    """PLO_UPDATEPACKAGEISUPDATED: [file name] (Server.Init.cpp:483), sent to
+    clients that already fetched a file that has since changed."""
+    builder = PacketBuilder().write_gchar(PLO.UPDATEPACKAGEISUPDATED)
+    builder.write_string(filename)
+    builder.write_newline()
+    return builder.build()

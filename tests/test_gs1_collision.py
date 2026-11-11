@@ -392,19 +392,19 @@ def test_scriptengine_gs1_option_file(tmp_path):
 
 def test_blast_passes_joltbomb_for_power_three():
     calls = []
+    level = flat_level()
+    npc = make_npc("", level, x=10, y=10)
 
     class Manager:
+        # Blast targets are now picked by event-box rectangle from the
+        # manager's own NPC list, not through audience.npcs_near.
         def get_npcs_on_level(self, level):
-            return []
+            return [npc]
 
         async def on_npc_exploded(self, npc, player, carry):
             calls.append((npc, carry))
 
-    level = flat_level()
-    npc = make_npc("", level, x=10, y=10)
-    server = SimpleNamespace(
-        npc_manager=Manager(), get_player=lambda pid: None,
-        audience=SimpleNamespace(npcs_near=lambda *a: [npc]))
+    server = SimpleNamespace(npc_manager=Manager(), get_player=lambda pid: None)
     manager = CombatManager.__new__(CombatManager)
     manager.server = server
 

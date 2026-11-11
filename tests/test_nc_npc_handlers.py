@@ -51,6 +51,7 @@ def make_nc():
         config=SimpleNamespace(serverside=True),
         world=SimpleNamespace(get_level=levels.get),
         broadcast_to_level=AsyncMock(),
+        broadcast_to_all=AsyncMock(),
         get_all_players=lambda: [],
     )
     server.npc_manager = NPCManager(server)
@@ -253,7 +254,8 @@ def test_npc_reset_clears_state_and_rebroadcasts():
     npc = run(go())
     assert npc.flags == {} and npc.gs1_scopes["this"] == {}
     assert npc._dirty
-    server.broadcast_to_level.assert_awaited_once()
+    # Server.cpp:2329-2341: the delete reaches every connection, not the level.
+    server.broadcast_to_all.assert_awaited_once()
     assert sent(session) == [chat("NPC script of Guard reset by editor")]
 
 
@@ -319,3 +321,43 @@ def test_hurt_dxdy_never_puts_a_control_byte_in_the_props_packet():
         npc.hurt_dxdy = stored
         packet = npc.build_props_packet()
         assert b"\n" not in packet[:-1] and min(packet[:-1]) >= 32
+
+
+def test_npc_script_set_queues_created_like_the_reference():
+    # PlayerNCPackets.cpp:226-228 (origin/beta4): setScript, then CREATED.
+    nc, session, server, _ = make_nc()
+
+    async def go():
+        await nc._handle_npc_add(session, b"Guard,10050,Soldier,me,town.nw,1,1")
+        await nc._handle_npc_script_set(
+            session, gint3(10050) + b'if (created) {,"  setimg a.png;",}')
+        return server.npc_manager.get_npc(10050)
+
+    assert run(go()).image == "a.png"
+
+
+def test_npc_reset_restores_every_modelled_character_field():
+    # NPC.cpp:117-162 (`character = m_initialCharacter`) over Character.h.
+    nc, session, server, _ = make_nc()
+
+    async def go():
+        await nc._handle_npc_add(session, b"Guard,10050,Soldier,me,town.nw,1,1")
+        npc = server.npc_manager.get_npc(10050)
+        initial = dict(hearts=5.5, rupees=7, bombs=3, arrows=2, bomb_power=2,
+                       ap=10, sprite=4, glove_power=1, message="hi",
+                       horse_image="horse.png")
+        for field, value in initial.items():
+            setattr(npc, field, value)
+        npc.record_initial_state("town.nw")
+        for field, value in dict(hearts=0.5, rupees=999, bombs=99, arrows=99,
+                                 bomb_power=3, ap=100, sprite=9, glove_power=2,
+                                 message="changed", horse_image="").items():
+            setattr(npc, field, value)
+        npc.nickname = "changed"
+        await nc._handle_npc_reset(session, gint3(10050))
+        return npc, initial
+
+    npc, initial = run(go())
+    for field, value in initial.items():
+        assert getattr(npc, field) == value, field
+    assert npc.nickname == ""

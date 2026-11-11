@@ -17,6 +17,7 @@ from .attachments import absolute_position, clear_attachment
 from .audience import Audience
 from .ap_system import regen_step
 from .config import ServerConfig
+from .protocol.colors import bind_server as bind_colors_server, normalize_server_mode
 from .player import Player
 from .level import Level
 from .world import World
@@ -45,6 +46,12 @@ class GameServer:
 
     def __init__(self, config: Optional[ServerConfig] = None):
         self.config = config or ServerConfig()
+        # `servermode` is read once, here: Server.cpp:194-195 ("This requires a
+        # full server restart to change"). The COLORS prop width and the login
+        # 176/177 announcement follow this copy; an RC write of the option only
+        # reaches the file and the live option store (rc.py).
+        self.server_mode = normalize_server_mode(self.config.servermode)
+        bind_colors_server(self)
         self.running = False
 
         # Player management
@@ -70,6 +77,10 @@ class GameServer:
 
         # Item system (ground items, chests)
         self.item_manager = None
+
+        # Board change respawn (board_changes.py)
+        from .board_changes import BoardChangeManager
+        self.board_changes = BoardChangeManager(self)
 
         # Baddy system (enemies, AI)
         self.baddy_manager = None
@@ -170,6 +181,9 @@ class GameServer:
         self.item_manager = ItemManager(self)
         await self.item_manager.start()
 
+        # Board change respawn
+        await self.board_changes.start()
+
         # Baddy system
         from .baddy import BaddyManager
         self.baddy_manager = BaddyManager(self)
@@ -232,6 +246,8 @@ class GameServer:
 
         if self.item_manager:
             await self.item_manager.stop()
+
+        await self.board_changes.stop()
 
         if self.baddy_manager:
             await self.baddy_manager.stop()
@@ -570,8 +586,13 @@ class GameServer:
 
     def is_staff(self, account_name: str) -> bool:
         """Server.cpp:1773: case-insensitive `staff` membership. Grants no rights."""
+        # A blank name is never staff, whatever the list holds (the reference's
+        # list has no blank entries, Settings.h getList / StringUtils.h:618).
+        if not account_name or not account_name.strip():
+            return False
         if hasattr(self.config, 'staff'):
-            return account_name.lower() in [s.lower() for s in self.config.staff]
+            return account_name.lower() in [s.lower() for s in self.config.staff
+                                            if s and s.strip()]
         return False
 
     def get_flag(self, name: str) -> str:

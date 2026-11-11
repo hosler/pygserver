@@ -175,7 +175,9 @@ def test_repeated_death_and_damage_do_not_stack_tasks_or_handlers():
         manager._invincible.clear()
         await manager.apply_damage(player, 1, 0, 0)
         await manager.handle_player_death(player)
-        assert player.deaths == 1
+        # The death counter follows the STATUS prop's transition to DEAD
+        # (PlayerProps.cpp:573-580), covered in test_item_drops.py, not hearts.
+        assert player.deaths == 0
         assert len(manager._respawn_tasks) == 1
         assert player._handlers[PLI.PLAYERPROPS] == original
         for task in manager._respawn_tasks:

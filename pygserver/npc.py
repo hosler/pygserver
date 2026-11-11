@@ -5,9 +5,11 @@ Handles NPC state, events, and Python-based scripting.
 """
 
 import asyncio
+import copy
 import importlib.util
 import logging
 import math
+import re
 import time
 from typing import TYPE_CHECKING, Optional, Dict, Any, List, Callable, Tuple
 from pathlib import Path
@@ -16,7 +18,9 @@ from . import collision, npc_motion
 from .attachments import absolute_position
 
 from .protocol.packets import (
-    PacketBuilder, build_npc_del, build_npc_moved, build_npc_props)
+    PacketBuilder, build_npc_bytecode_raw, build_npc_del, build_npc_del2,
+    build_npc_moved, build_npc_props)
+from .protocol.colors import COLORS_STORED, normalize_colors
 from .protocol.constants import PLO, NPCPROP
 from .text_safety import strip_control_chars
 
@@ -79,6 +83,164 @@ def split_gs1_script(code: str, npcserver: bool) -> tuple[str, str]:
     return code[:marker].strip(whitespace), client.strip(whitespace)
 
 
+# Joined-class lists. A GS1 server half fills its list at run time, one
+# `join` statement at a time (GS1Commands.cpp:1604); only a GS2 server half has
+# a static list, taken from the compiler (ScriptEngineGS2.cpp:38-42). pygserver
+# never runs GS2 server code and its compiler returns no class list, so for a
+# half routed to GS2 the literal forms `join("name")`, `join ("name")` and
+# `this.join("name")` are read with a single linear pass (no regular
+# expression over the whole text, so no backtracking).
+MAX_JOINED_CLASSES = 64
+MAX_CLASS_NAME = 128
+# One source can name more than MAX_JOINED_CLASSES classes and still add new
+# ones to a list that already holds up to MAX_JOINED_CLASSES - 1 of them from
+# elsewhere, so a per-source list keeps twice as many distinct names.
+MAX_DIRECT_JOINS = 2 * MAX_JOINED_CLASSES
+# Class sources followed below the server half (Script.cpp:226-243).
+MAX_JOIN_DEPTH = 4
+_TOKEN = re.compile(r'//|/\*|"|join')
+_EOL = re.compile(r"[\r\n]")
+_IDENT = frozenset("abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")
+_BAD_CLASS_CHARS = re.compile(r"[\x00-\x1f\x7f\xa7,;\"#(]")
+
+
+def _string_end(code: str, start: int) -> int:
+    """Index just past the string literal opening at `start`. A string ends at
+    its closing quote or at the end of the line (`\\n` or `\\r`); a quote
+    preceded by an odd number of backslashes does not close it."""
+    n = len(code)
+    pos = start + 1
+    while True:
+        quote = code.find('"', pos)
+        stop = quote if quote >= 0 else n
+        eol = _EOL.search(code, pos, stop)
+        if eol is not None:
+            return eol.start()
+        if quote < 0:
+            return n
+        # Backslashes just before the quote: runs are disjoint, so the
+        # backward counts add up to at most the length of the input.
+        run = quote - 1
+        while run > start and code[run] == "\\":
+            run -= 1
+        if (quote - 1 - run) % 2:
+            pos = quote + 1
+            continue
+        return quote + 1
+
+
+def _literal_join_name(code: str, at: int):
+    """The class name in `join("name")` whose `join` starts at `at`, else
+    None. Only a bare call or `this.join` counts."""
+    n = len(code)
+    before = at - 1
+    while before >= 0 and code[before] in " \t":
+        before -= 1
+    if before >= 0 and code[before] == ".":
+        if code[max(0, before - 4):before] != "this" or (
+                before >= 5 and code[before - 5] in _IDENT):
+            return None
+    elif before == at - 1 and before >= 0 and code[before] in _IDENT:
+        return None
+    pos = at + 4
+    if pos < n and code[pos] in _IDENT:
+        return None
+    while pos < n and code[pos] in " \t":
+        pos += 1
+    if pos >= n or code[pos] != "(":
+        return None
+    pos += 1
+    while pos < n and code[pos] in " \t":
+        pos += 1
+    if pos >= n or code[pos] != '"':
+        return None
+    end = code.find('"', pos + 1, pos + 2 + MAX_CLASS_NAME)
+    if end < 0:
+        return None
+    name = code[pos + 1:end]
+    pos = end + 1
+    while pos < n and code[pos] in " \t":
+        pos += 1
+    if pos >= n or code[pos] != ")":
+        return None
+    return name
+
+
+def scan_direct_joins(code: str) -> List[str]:
+    """Class names `code` itself joins by literal `join("name")`, in order and
+    without regard to case; names inside comments and strings do not count.
+    Does not look into the joined classes. One linear pass; at most
+    MAX_DIRECT_JOINS distinct names of at most MAX_CLASS_NAME characters,
+    none with separators, control bytes, `#` or `(`."""
+    found: List[str] = []
+    seen = set()
+    pos = 0
+    while len(found) < MAX_DIRECT_JOINS:
+        match = _TOKEN.search(code, pos)
+        if match is None:
+            break
+        token, start = match.group(), match.start()
+        if token == "//":
+            end = _EOL.search(code, start)
+            pos = len(code) if end is None else end.start()
+        elif token == "/*":
+            end = code.find("*/", start + 2)
+            pos = len(code) if end < 0 else end + 2
+        elif token == '"':
+            pos = _string_end(code, start)
+        else:
+            pos = start + 4
+            name = _literal_join_name(code, start)
+            if (not name or _BAD_CLASS_CHARS.search(name)
+                    or name.lower() in seen):
+                continue
+            seen.add(name.lower())
+            found.append(name)
+    return found
+
+
+def collect_joins(direct, class_joins=None) -> List[str]:
+    """The CLASS list of a GS2 server half whose own joins are `direct`:
+    those names, each followed by the joins of its class (`class_joins(name)`
+    returns that class's own direct joins, or nothing when it is missing or
+    not GS2), down to MAX_JOIN_DEPTH classes. Names are listed once, in
+    first-seen order, at most MAX_JOINED_CLASSES of them.
+
+    Work bound: every listed name is visited once, so at most
+    MAX_JOINED_CLASSES `class_joins` calls and MAX_JOINED_CLASSES *
+    MAX_DIRECT_JOINS list entries are read, whatever the class sizes."""
+    found: List[str] = []
+    seen = set()
+
+    def visit(names, depth: int):
+        for name in names:
+            if len(found) >= MAX_JOINED_CLASSES:
+                return
+            key = name.lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append(name)
+            if class_joins is not None and depth < MAX_JOIN_DEPTH:
+                inner = class_joins(name)
+                if inner:
+                    visit(inner, depth + 1)
+
+    visit(direct, 0)
+    return found
+
+
+def scan_gs2_joins(server_code: str, class_source=None) -> List[str]:
+    """Class names a GS2 server half joins (see scan_direct_joins and
+    collect_joins). `class_source(name)` returns the GS2 source of a joined
+    class so its own joins follow it. Linear in the input."""
+    class_joins = None
+    if class_source is not None:
+        def class_joins(name):
+            return scan_direct_joins(class_source(name) or "")
+    return collect_joins(scan_direct_joins(server_code), class_joins)
+
+
 class NPC:
     """
     Represents a non-player character.
@@ -111,7 +273,7 @@ class NPC:
         self.sword_power = 1
         self.shield_power = 1
         self.horse_image = ""
-        self.colors = [0, 0, 0, 0, 0]
+        self.colors = [0] * COLORS_STORED
 
         # Properties
         self.message = ""
@@ -121,6 +283,11 @@ class NPC:
         self.arrows = 0
         self.bombs = 0
         self.glove_power = 0  # NPC scale: glove1=1, glove2=2.
+        # Character defaults of the reference (Character.h): bomb power,
+        # alignment points, sprite. Held so NC reset can restore them.
+        self.bomb_power = 1
+        self.ap = 50
+        self.sprite = 0
 
         # Visibility
         self.visible = True
@@ -152,6 +319,34 @@ class NPC:
         self.gs1_program: Optional[Any] = None
         self.gs1_source = ""
         self.client_script: str = ""
+        # Compiled GS2 client half (empty: the text SCRIPT prop carries it).
+        # Set by NPCManager.attach_gs1; sent as PLO_NPCBYTECODE after the
+        # props packet, with the SCRIPT prop zeroed (see build_props_packet).
+        self.client_bytecode: bytes = b""
+        # CLASS list sources: a GS1 server half lists the joins that have run
+        # (`_gs1_joined`, filled by `join`); a server half routed to GS2 never
+        # runs, so its literal joins are listed statically (`_static_joins`
+        # from `_gs2_server_code`, rescanned when a joined class changes).
+        self._static_joins: List[str] = []
+        self._gs2_server_code = ""
+        # The server half's own literal joins (scan_direct_joins), taken once
+        # at attach so a class edit never rescans the NPC's source.
+        self._gs2_direct_joins: List[str] = []
+        # Server-wide switch for bytecode delivery, re-read at every send
+        # (generation can change at runtime); None means always allowed.
+        self._bytecode_gate: Optional[Callable[[], bool]] = None
+        # Delivery mode the clients in the level last saw (None: never sent),
+        # moved only when the script update is flushed (NPCManager.tick).
+        self._wire_mode: Optional[bool] = None
+        # State recorded when the NPC is added (NPC::recordInitialState,
+        # NPC.h:551-556) or first warped (NPC.cpp:236-240); NC_NPCRESET
+        # restores it.
+        self.initial_level: Optional[str] = None
+        self.initial_x = 0.0
+        self.initial_y = 0.0
+        self.initial_character: Dict[str, Any] = {}
+        # Set by NC reset: the showimgs layers are replayed after the delete.
+        self._resend_showimgs = False
         self.gs1_scopes: Dict[str, dict] = {"this": {}, "thiso": {}}
 
         # Server-owned GS1 showimg layers. Only indices 0..199 belong here;
@@ -205,6 +400,26 @@ class NPC:
 
         # API wrapper for scripts
         self._api: Optional['NPCApi'] = None
+
+    @property
+    def _static_joins(self) -> List[str]:
+        return self._static_join_list
+
+    @_static_joins.setter
+    def _static_joins(self, names: List[str]):
+        self._static_join_list = names
+        # Lower-cased, for the "does this NPC list class X" test.
+        self._static_join_keys = frozenset(name.lower() for name in names)
+
+    def lists_class(self, name: str) -> bool:
+        """True when `name` is in this NPC's CLASS list (case-insensitive),
+        without building the wire list."""
+        key = name.lower()
+        if key in self._static_join_keys:
+            return True
+        return any(
+            isinstance(joined, str) and joined.lower() == key
+            for joined in self.__dict__.get("_gs1_joined") or ())
 
     def mark_dirty(self):
         """Flag this NPC for a props re-broadcast on the next server tick."""
@@ -279,7 +494,9 @@ class NPC:
             return (value[0],
                     strip_control_chars(image) if isinstance(image, str) else None)
         if wire is Wire.COLORS:
-            return (list(value) if isinstance(value, list) and value
+            # NPC.cpp:1343-1350 replaces the stored 8-slot array with the
+            # zero-filled one the 5-wide read built (protocol/colors.py).
+            return (normalize_colors(value) if isinstance(value, list) and value
                     and all(isinstance(item, int) for item in value) else _REJECT)
         if wire is Wire.IMAGEPART:
             return (value if isinstance(value, tuple) and len(value) == 4
@@ -410,7 +627,18 @@ class NPC:
         if not include_position:
             for prop in (NPCPROP.X, NPCPROP.Y, NPCPROP.X2, NPCPROP.Y2):
                 del props[prop]
-        if include_script and self.client_script:
+        if include_script and self._wire_mode is None:
+            self._wire_mode = self.bytecode_active
+        if include_script and self.bytecode_active:
+            # Modern generation: SCRIPT is an empty GSHORT, the clientside text
+            # is not sent (PropertySerializers.cpp:554-555, origin/beta4), and
+            # CLASS (74) lists the joined classes (NPC.cpp:74-75 canSendProp
+            # lets it through on modern only).
+            props[NPCPROP.SCRIPT] = ""
+            classes = self.joined_class_list()
+            if classes:
+                props[NPCPROP.CLASS] = classes
+        elif include_script and self.client_script:
             script = self.client_script.replace("\n", "\xa7").encode(
                 "latin-1", errors="replace")
             if len(script) > _MAX_CLIENT_SCRIPT_BYTES:
@@ -451,6 +679,76 @@ class NPC:
         for prop_id, val in self.gattribs.items():
             props[prop_id] = val
         return build_npc_props(self.id, props)
+
+    @property
+    def bytecode_active(self) -> bool:
+        """True when this NPC's client half goes out as bytecode right now:
+        it compiled, and the server still allows bytecode delivery."""
+        if not self.client_bytecode:
+            return False
+        return self._bytecode_gate is None or bool(self._bytecode_gate())
+
+    def joined_class_names(self) -> List[str]:
+        """Names for the CLASS prop (NPC.cpp getJoinedClassesList): the
+        static GS2 list, then the GS1 joins that have run."""
+        names: List[str] = []
+        have = set()
+        for name in (*self._static_joins, *(self.__dict__.get("_gs1_joined") or ())):
+            if (name and len(name) <= MAX_CLASS_NAME
+                    and not _BAD_CLASS_CHARS.search(name)
+                    and name.lower() not in have
+                    and len(names) < MAX_JOINED_CLASSES):
+                have.add(name.lower())
+                names.append(name)
+        return names
+
+    def joined_class_list(self) -> str:
+        """Comma list for the CLASS prop."""
+        return ",".join(self.joined_class_names())
+
+    def note_join(self, name: str):
+        """A GS1 `join` just added `name` to the list: a bytecode NPC re-sends
+        its script props so clients learn of the class."""
+        if self.bytecode_active:
+            self._script_dirty = True
+            self.mark_dirty()
+
+    #: Character fields NC_NPCRESET restores (`character = m_initialCharacter`,
+    #: NPC.cpp:131, origin/beta4). Character.h holds: position (restored by
+    #: the warp), ap, mp, gralats, hitpointsInHalves, hurtDeltaInHalves, bombs,
+    #: arrows, bombPower, glovePower, swordPower, shieldPower, bowPower, sprite,
+    #: direction, lastHurtTime, hurtPushDeltaInHalfPixels (hurt_dxdy, cleared
+    #: by reset_to_initial_state), colors, nickName (cleared before the copy,
+    #: NPC.cpp:~126), gani, chatMessage, horseImage and the head, body, sword,
+    #: shield and bow images, plus the 30 gani attributes. Not modelled by
+    #: NPCs: mp, bowPower, bowImage, lastHurtTime. The message and gani
+    #: attributes ride along.
+    _CHARACTER_FIELDS = (
+        "gani", "message", "head_image", "body_image", "sword_image",
+        "sword_power", "shield_image", "shield_power", "horse_image",
+        "direction", "glove_power", "colors", "gattribs",
+        "hearts", "rupees", "bombs", "arrows", "bomb_power", "ap", "sprite")
+
+    def record_initial_state(self, level_name: Optional[str]):
+        """Remember where and how the NPC was added (NPC::recordInitialState,
+        NPC.h:551-556; Server.cpp:1508)."""
+        self.initial_level = level_name
+        self.initial_x, self.initial_y = self.x, self.y
+        self.initial_character = {
+            field: copy.copy(getattr(self, field))
+            for field in self._CHARACTER_FIELDS}
+
+    def restore_initial_character(self):
+        for field, value in self.initial_character.items():
+            setattr(self, field, copy.copy(value))
+
+    def build_bytecode_packet(self) -> bytes:
+        """PLO_NPCBYTECODE for this NPC wrapped for the wire, or b'' when its
+        client half is delivered as text. Send it right after the props
+        packet (Level::sendNPCToPlayer, Level.cpp:1473-1480)."""
+        if not self.bytecode_active:
+            return b""
+        return build_npc_bytecode_raw(self.id, self.client_bytecode)
 
     def build_showimgs_packet(self) -> Optional[bytes]:
         """Build the authoritative reset-and-replay packet for this NPC."""
@@ -758,10 +1056,15 @@ class NPCManager:
 
     def __init__(self, server: 'GameServer'):
         self.server = server
+        from .gs2 import warn_gs2_server_default
+        warn_gs2_server_default(getattr(server, "config", None))
 
         # All NPCs by ID
         self._npcs: Dict[int, NPC] = {}
         self._weapon_runtimes: Dict[int, NPC] = {}
+        # lower-cased class name -> (source, engine options, direct joins);
+        # see _class_direct_joins. Holds only classes the script manager has.
+        self._class_join_cache: Dict[str, tuple] = {}
         self._next_id = 10001  # NPC IDs start at 10001
 
         # Script classes by name
@@ -855,6 +1158,7 @@ class NPCManager:
 
         if level:
             level.add_npc(npc)
+        npc.record_initial_state(level.name if level else None)
 
         if script_name and script_name in self._script_classes:
             npc.set_script(self._script_classes[script_name])
@@ -875,21 +1179,45 @@ class NPCManager:
                    fire_created: bool = True):
         """Attach both script halves, compiling and running only serverside.
 
-        NC saves use strict compilation and retain the old script on errors;
-        they do not fire a new 'created' event.
+        NC saves use strict compilation and retain the old script on errors.
+        `fire_created` runs the `created` event of a GS1 server half
+        straight away; every production caller leaves it on (an NC script
+        set queues CREATED, PlayerNCPackets.cpp:226-228, origin/beta4).
         """
         from .gs1_host import compile_gs1, run_npc_event
+        from .gs2 import server_half_is_gs2
         config = getattr(self.server, "config", None)
         server_code, client_code = split_gs1_script(
             code, getattr(config, "serverside", True))
+        # A server half that resolves to GS2 (header or option) has no
+        # interpreter here and must not reach the GS1 parser.
+        gs2_routed = (bool(server_code.strip())
+                      and server_half_is_gs2(server_code, "npc", config))
         prog = (compile_gs1(server_code, raise_errors=raise_errors)
-                if server_code.strip() else None)
+                if server_code.strip() and not gs2_routed else None)
         npc.gs1_program = prog
         # A new script is a new wrapper in the reference: no old locals.
         npc.gs1_scopes.pop("local", None)
         npc.gs1_scopes.pop("local_classes", None)
+        # Nor joined classes: the new script joins again as it runs
+        # (NPC::setScript, NPC.cpp:~722 clears the list first).
+        npc.__dict__.pop("_gs1_joined", None)
+        npc.__dict__.pop("_gs1_class_pending", None)
         npc.gs1_source = code
         npc.client_script = client_code
+        npc.client_bytecode = self._compile_client_half(npc, client_code)
+        from .gs2 import GS2ScriptManager, note_gs2_server_half
+        gs2 = getattr(self.server, "gs2_manager", None)
+        npc._bytecode_gate = (gs2.npc_bytecode_enabled
+                              if isinstance(gs2, GS2ScriptManager) else None)
+        # The CLASS list follows the new script: a GS1 half lists its joins as
+        # they run, a half routed to GS2 (never run here) lists its literal
+        # `join("name")` calls.
+        npc._gs2_server_code = server_code if gs2_routed else ""
+        self._refresh_static_joins(npc, rescan=True)
+        if gs2_routed:
+            note_gs2_server_half(
+                "NPC", f"{npc.name or 'npc'} (id {npc.id})", server_code, config)
         # Test doubles stand in for Level here, so look the hook up.
         check_zone = getattr(npc.level, 'check_sparring_zone', None)
         if check_zone is not None:
@@ -898,6 +1226,102 @@ class NPCManager:
         npc.mark_dirty()
         if prog is not None and fire_created:
             run_npc_event(npc, 'created', self.server, None)
+
+    def _compile_client_half(self, npc: NPC, client_code: str) -> bytes:
+        """GS2 bytecode for an NPC's client half, or b'' to keep the text
+        SCRIPT prop (GS1 half, no half, option off, no compiler, or a compile
+        failure, which is logged and reported to the NCs)."""
+        from .gs2 import GS2ScriptManager
+        manager = getattr(self.server, "gs2_manager", None)
+        if not isinstance(manager, GS2ScriptManager) or not client_code.strip():
+            return b""
+        who = f"{npc.name or 'npc'} (id {npc.id})"
+        bytecode, error = manager.compile_npc_client(client_code, who)
+        if error:
+            # ScriptEngineGS2.cpp:73-82: errors go to the NCs and the log, the
+            # half is not delivered as bytecode. Unlike the reference (which
+            # drops it, Script.cpp:535-537) the text stays as the fallback.
+            logger.warning("GS2 client script of NPC %s failed to compile: %s",
+                           who, error)
+            nc_manager = getattr(self.server, "nc_manager", None)
+            send = getattr(nc_manager, "_send_to_ncs", None)
+            if send is not None:
+                try:
+                    asyncio.get_running_loop().create_task(
+                        send(f"[NC NPC compile error] {who}: {error}"))
+                except RuntimeError:
+                    pass    # no loop yet (boot-time level load): log only
+        return bytecode
+
+    def _class_direct_joins(self, name: str):
+        """The joins written in the GS2 script class `name` itself, or ()
+        when it is missing or not a GS2 server half. Cached per class by its
+        source text and the engine options, so the engine routing (which
+        minifies the source) and the scan run once per edit of that class,
+        never per NPC or per attach."""
+        from .gs2 import GS2ScriptManager, server_half_is_gs2
+        gs2 = getattr(self.server, "gs2_manager", None)
+        script = gs2.get_class(name) if isinstance(gs2, GS2ScriptManager) else None
+        key = name.lower()
+        if script is None:
+            self._class_join_cache.pop(key, None)
+            return ()
+        source = getattr(script, "source", "") or ""
+        config = getattr(self.server, "config", None)
+        options = (str(getattr(config, "default_scriptengine_server", "") or ""),
+                   str(getattr(config, "default_scriptengine", "") or ""))
+        entry = self._class_join_cache.get(key)
+        if (entry is not None and entry[1] == options
+                and (entry[0] is source or entry[0] == source)):
+            return entry[2]
+        half = split_gs1_script(source, True)[0]
+        joins = (tuple(scan_direct_joins(half))
+                 if server_half_is_gs2(half, "class", config) else ())
+        self._class_join_cache[key] = (source, options, joins)
+        return joins
+
+    def _refresh_static_joins(self, npc: NPC, *, rescan: bool = False,
+                              memo: Optional[dict] = None) -> bool:
+        """Recompute a GS2-routed NPC's CLASS list from its own literal joins
+        (scanned again only with `rescan`) and those of the GS2 classes it
+        joins. True when the list changed. Bounded by collect_joins; `memo`
+        shares the result between NPCs with the same direct joins within one
+        pass over the NPCs (the class data cannot change meanwhile)."""
+        before = npc._static_joins
+        if not npc._gs2_server_code:
+            npc._gs2_direct_joins = []
+            npc._static_joins = []
+        else:
+            if rescan:
+                npc._gs2_direct_joins = scan_direct_joins(npc._gs2_server_code)
+            key = tuple(npc._gs2_direct_joins) if memo is not None else None
+            names = memo.get(key) if memo is not None else None
+            if names is None:
+                names = collect_joins(
+                    npc._gs2_direct_joins, self._class_direct_joins)
+                if memo is not None:
+                    memo[key] = names
+            npc._static_joins = list(names)
+        return npc._static_joins != before
+
+    def mark_class_users_dirty(self, class_name: str):
+        """A script class changed: re-send the props and bytecode of every
+        bytecode NPC that lists it (NPC::updateScriptClass sends a script
+        update to the level, NPC.cpp:944-961). Only those NPCs are looked at:
+        an NPC that does not list the class cannot be affected by its edit,
+        because a name is listed whether or not its class exists."""
+        self._class_join_cache.pop(class_name.lower(), None)
+        memo: dict = {}
+        for npc in self._npcs.values():
+            if not npc.lists_class(class_name):
+                continue
+            # The edit can add or drop joins of the class's own, which a
+            # static list follows.
+            if npc._gs2_server_code:
+                self._refresh_static_joins(npc, memo=memo)
+            if npc.bytecode_active:
+                npc._script_dirty = True
+                npc.mark_dirty()
 
     def _fire_gs1(self, npc: NPC, event: str, player: Optional['Player'] = None,
                   source: Optional[str] = None, carryobject_type=None, params=None):
@@ -1111,6 +1535,8 @@ class NPCManager:
                 for player in self.server.audience.players_on_level(old_level.name):
                     npc._seam_players[player.id] = (player, old_level.name)
         new_level.add_npc(npc)
+        if npc.initial_level is None:   # first warp (NPC.cpp:236-240)
+            npc.record_initial_state(new_level.name)
         npc._dirty = False
         npc._last_relocate = time.monotonic()
         # The new level has heard of none of the moves yet; the tick sends the
@@ -1119,6 +1545,10 @@ class NPCManager:
             move.sent = False
         props = npc.build_props_packet()
         await self.server.broadcast_to_level(new_level.name, props)
+        # NPC.cpp:227 sendNPCToNearbyPlayers: the bytecode follows the props.
+        bytecode = npc.build_bytecode_packet()
+        if bytecode:
+            await self.server.broadcast_to_level(new_level.name, bytecode)
         showimgs = npc.build_showimgs_packet()
         if showimgs is not None:
             await self.server.broadcast_to_level(new_level.name, showimgs)
@@ -1128,6 +1558,48 @@ class NPCManager:
         # nothing may be dirty afterwards to trigger that.
         for holder in await self._seam_holders(npc):
             await holder.send_raw(props)
+            if bytecode:
+                await holder.send_raw(bytecode)
+
+    async def reset_to_initial_state(self, npc: NPC):
+        """NPC::resetToInitialState (NPC.cpp:117-162): drop everything a
+        script or player changed and warp back to where the NPC was added.
+
+        Clears image, shape, image part, visibility and block flags, hurt
+        push, timeout, nickname, saves, script variables, flags and the move
+        queue; marks the script props for re-sending. The script source stays.
+        """
+        npc.restore_initial_character()
+        npc.image = ""
+        npc.imagepart = None
+        npc.shape = None
+        npc.vis_flags = 1
+        npc.visible = True
+        npc.block_flags = 0
+        npc.hurt_dxdy = None
+        npc.no_player_on_wall = False
+        npc._timer_end = 0.0
+        npc._move_target = None
+        npc.nickname = ""
+        npc.saves = [0] * 10
+        npc.flags.clear()
+        npc.gs1_scopes = {"this": {}, "thiso": {}}
+        npc._gs1_ctx = None
+        npc._gs1_pending = None
+        npc.__dict__.pop("_gs1_class_pending", None)
+        npc.move_queue.clear()
+        npc._move_events = 0
+        npc._seam_players.clear()
+        npc.x, npc.y = npc.initial_x, npc.initial_y
+        target = (self.server.world.get_level(npc.initial_level)
+                  if npc.initial_level else None)
+        if target is not None and target is not npc.level:
+            await self.relocate_npc(npc, target)
+        # The delete wiped the clients' copy of the showimgs layers, which
+        # the server keeps (NPC.cpp:117-162 does not touch showImgList).
+        npc._resend_showimgs = True
+        npc._script_dirty = True
+        npc.mark_dirty()
 
     def forget_player(self, player: 'Player') -> None:
         """A player left the server: no NPC may keep it as a holder (its id
@@ -1302,16 +1774,50 @@ class NPCManager:
         # Push props for any NPC whose visible state changed this tick so
         # players see movement, animation, chat, and appearance updates live.
         for npc in list(self._npcs.values()):
+            # Bytecode delivery switched under clients that already hold the
+            # NPC (the `generation` option changed at runtime): that is a
+            # script update too.
+            if npc._wire_mode is not None and npc._wire_mode != npc.bytecode_active:
+                npc._script_dirty = True
+                npc._dirty = True
             if npc._dirty:
                 npc._dirty = False
                 if npc.level:
+                    script_update = npc._script_dirty
+                    # A client keeps the VM it built from the old script, and
+                    # ignores a new SCRIPT prop on an NPC it already has, so
+                    # a change between bytecode and text deletes the NPC
+                    # first and re-sends all of it (sendScriptUpdatesToLevel,
+                    # NPC.cpp:944-961: PLO_NPCDEL2 then PLO_NPCPROPS).
+                    switched = (script_update and npc._wire_mode is not None
+                                and npc._wire_mode != npc.bytecode_active)
+                    if switched:
+                        await self._broadcast_to_npc(
+                            npc, build_npc_del2(npc.level.name, npc.id))
+                        for move in npc.move_queue:
+                            move.sent = False
+                    if script_update:
+                        npc._wire_mode = npc.bytecode_active
                     # Movement/appearance updates only carry the script after
                     # an attachment or NC edit; level-entry sends remain full.
                     packet = npc.build_props_packet(
-                        include_script=npc._script_dirty,
-                        include_position=not npc.move_queue)
+                        include_script=script_update,
+                        include_position=switched or not npc.move_queue)
+                    # A script update also re-sends the bytecode, which the
+                    # reference leaves out (NPC.cpp:944-961): deliberate, so
+                    # clients already in the level do not keep the old
+                    # compiled script.
+                    bytecode = (npc.build_bytecode_packet()
+                                if script_update else b"")
                     npc._script_dirty = False
                     await self._broadcast_to_npc(npc, packet)
+                    if bytecode:
+                        await self._broadcast_to_npc(npc, bytecode)
+                    if switched or npc._resend_showimgs:
+                        npc._resend_showimgs = False
+                        showimgs = npc.build_showimgs_packet()
+                        if showimgs is not None:
+                            await self._broadcast_to_npc(npc, showimgs)
 
         # PLO_MOVE(2) for the moves queued since the last tick, after the props
         # (NPCServer.cpp:231).

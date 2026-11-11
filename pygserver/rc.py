@@ -21,6 +21,7 @@ from dataclasses import dataclass, field
 from .account import RCRight, mask_rc_rights
 from .attachments import absolute_position
 
+from .protocol.colors import colors_wire_width, normalize_colors
 from .protocol.constants import PLI, PLO, PLPROP, PLTYPE
 from .protocol.packets import (
     PacketBuilder,
@@ -563,7 +564,23 @@ class RCManager:
                 continue
             config = self.server.config
             for name, converted in fields.items():
+                if name == 'spawn_rates':
+                    # The probe only knows the one line; keep the other rates.
+                    converted = {**config.spawn_rates, **converted}
                 setattr(config, name, converted)
+            if 'servermode' in fields:
+                # Server.cpp:194-195: read once at start-up. The new value is
+                # persisted with the other options; GameServer.server_mode (the
+                # COLORS width and the login 176/177 announcement) keeps the
+                # mode this process started with.
+                logger.info("servermode set to %r: takes effect at the next "
+                            "server start (running mode stays %r)",
+                            fields['servermode'],
+                            getattr(self.server, 'server_mode', 'normal'))
+            if 'bushitemtypes' in fields:
+                # The reference rebuilds its roll table only when this option
+                # is parsed (Server.cpp:603-621), reading the rates then.
+                config.rebuild_bush_drops(rates_from_options=True)
             for index, converted in aptime.items():
                 config.aptime[index] = converted
             if accepted is not None:
@@ -852,8 +869,12 @@ class RCManager:
                     weapons.append(text(length))
         except (ValueError, IndexError):
             return None
+        # PLPROP_COLORS is colors_wire_width() bytes here too: the RC set goes
+        # through the same PropertyColors<> deserialiser (PlayerProps.cpp:1183-1198,
+        # Player::setPropsFromRCPacket PlayerProps.cpp:1243-1255).
         props, _clean, _end = parse_prop_stream(
-            props_blob, 0, _INBOUND_STREAM, _RC_PROP_HANDLERS)
+            props_blob, 0, _INBOUND_STREAM.with_colors_len(colors_wire_width()),
+            _RC_PROP_HANDLERS)
         props = {key: sanitize_value(value) for key, value in props.items()}
         return props, flags, chests, weapons
 
@@ -911,7 +932,7 @@ class RCManager:
         if PLPROP.BODYIMAGE in props:
             changes['body_image'] = props[PLPROP.BODYIMAGE][:223]
         if PLPROP.COLORS in props:
-            changes['colors'] = list(props[PLPROP.COLORS])
+            changes['colors'] = normalize_colors(props[PLPROP.COLORS])
         if PLPROP.STATUS in props:
             changes['client_status'] = int(props[PLPROP.STATUS])
         if PLPROP.RATING in props:

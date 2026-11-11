@@ -106,7 +106,8 @@ def item_arena(monkeypatch):
     level = Level('items.nw')
     server = SimpleNamespace(broadcast_to_level=AsyncMock())
     manager = ItemManager(server)
-    player = SimpleNamespace(id=2, level=level, x=10, y=10, layer=0)
+    player = SimpleNamespace(id=2, level=level, x=10, y=10, layer=0,
+                             send_raw=AsyncMock())
     manager.give_item_to_player = AsyncMock()
     async def spawn():
         item = await manager.spawn_item(level, 10, 10, LevelItemType.GREENRUPEE)
@@ -159,7 +160,8 @@ def test_item_expires_at_server_8200ms_boundary(monkeypatch):
     now[0] = 108.2
     asyncio.run(manager._tick())
     assert not manager._items[level.name]
-    server.broadcast_to_level.assert_awaited_once()
+    # Level.cpp:711-716: expiry is silent; clients run their own timer.
+    server.broadcast_to_level.assert_not_awaited()
 
 
 def test_overlapping_item_takes_only_grant_once(monkeypatch):

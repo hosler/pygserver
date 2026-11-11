@@ -7,6 +7,7 @@ tiles, NPCs, items, signs, and links.
 
 import logging
 import os
+import struct
 import tempfile
 import time
 from typing import TYPE_CHECKING, Optional, List, Dict, Tuple
@@ -15,6 +16,7 @@ from pathlib import Path
 from reborn_protocol.coords import LEVEL_SIZE, in_level_bounds, level_index
 
 from . import tiletypes
+from .board_changes import BoardChange, BoardChangeList
 
 if TYPE_CHECKING:
     from .player import Player
@@ -67,6 +69,12 @@ class Level:
 
         # Tile data (64x64 = 4096 tiles, 2 bytes each)
         self._tiles = bytearray(self.BOARD_SIZE)
+        # The tiles as loaded (plus server-side set_tile writes). Board changes
+        # never rewrite them (Level.cpp:1743): joiners are sent this board and
+        # then the change list, a respawn restores from it, the bush/vase drop
+        # roll reads it and a save writes it. See board_changes.py.
+        self._base_tiles = bytearray(self.BOARD_SIZE)
+        self._board_changes = BoardChangeList()
         self.board_layers: Dict[int, bytearray] = {}
 
         # Players on this level, insertion-ordered (dict[id, None] as an
@@ -158,11 +166,14 @@ class Level:
             i += 2
         return tiles
 
-    def _encode_board_row(self, y: int) -> str:
+    def _encode_board_row(self, y: int, tiles=None) -> str:
         """Encode one complete tile row for a GLEVNW01 BOARD record."""
+        if tiles is None:
+            tiles = self._tiles
         encoded = []
         for x in range(self.WIDTH):
-            tile_id = self.get_tile(x, y)
+            index = level_index(x, y) * 2
+            tile_id = tiles[index] | (tiles[index + 1] << 8)
             if not 0 <= tile_id < 4096:
                 raise ValueError(f"tile ({x}, {y}) id {tile_id} is not representable")
             encoded.append(self.BASE64_CHARS[tile_id // 64])
@@ -183,8 +194,10 @@ class Level:
                 "unsupported level feature: " + self._unsupported_features[0]
             )
         lines = ["GLEVNW01"]
+        # The base tiles only: client board changes never reach a level file
+        # (Level::saveLevel writes subLevel->getTiles(), Level.cpp:999-1030).
         for y in range(self.HEIGHT):
-            lines.append(f"BOARD 0 {y} 64 0 {self._encode_board_row(y)}")
+            lines.append(f"BOARD 0 {y} 64 0 {self._encode_board_row(y, self._base_tiles)}")
 
         for layer, board in sorted(self.board_layers.items()):
             for y in range(self.HEIGHT):
@@ -338,6 +351,8 @@ class Level:
             for offset, tile_id in enumerate(self._decode_board_string(parts[5])[:width]):
                 index = level_index(x + offset, y) * 2
                 board[index:index + 2] = tile_id.to_bytes(2, 'little')
+        self._base_tiles = bytearray(self._tiles)
+        self._board_changes.clear()
 
         # Parse line-based features (GLEVNW01 text format): LINK, SIGN/SIGNEND,
         # CHEST, BADDY/BADDYEND. Mirrors GServer-v2 LevelLoader.
@@ -444,12 +459,124 @@ class Level:
             return self._tiles[idx] | (self._tiles[idx + 1] << 8)
         return 0
 
-    def set_tile(self, x: int, y: int, tile_id: int):
-        """Set tile ID at position."""
+    def get_base_tile(self, x: int, y: int) -> int:
+        """Tile ID in the base array (the level as loaded; board changes never
+        touch it). The bush/vase drop roll reads this
+        (PlayerClientPackets.cpp:144-148)."""
         if in_level_bounds(x, y):
             idx = level_index(x, y) * 2
-            self._tiles[idx] = tile_id & 0xFF
-            self._tiles[idx + 1] = (tile_id >> 8) & 0xFF
+            return self._base_tiles[idx] | (self._base_tiles[idx + 1] << 8)
+        return 0
+
+    def set_tile(self, x: int, y: int, tile_id: int):
+        """Set tile ID at position, permanently: the base array follows, and so
+        does every board change over the cell, pending or respawned, so neither
+        a respawn nor a joiner's replay brings the client's tile back. Client
+        board edits go through alter_board instead.
+
+        The reference routes script tile writes through its own board-change
+        path (Level::applyBoardChangeFromScriptTiles -> alterBoard,
+        Level.cpp:1751-1799, on `updateboard`); pygserver's script writes are
+        immediate, so the entries over the cell are patched instead."""
+        if in_level_bounds(x, y):
+            idx = level_index(x, y) * 2
+            for board in (self._tiles, self._base_tiles):
+                board[idx] = tile_id & 0xFF
+                board[idx + 1] = (tile_id >> 8) & 0xFF
+            self._board_changes.patch_cell(level_index(x, y), tile_id & 0xFFFF)
+
+    # -- board changes (board_changes.py) --------------------------------------
+
+    @staticmethod
+    def _write_rect(board: bytearray, x: int, y: int, width: int, height: int,
+                    tiles: List[int]) -> None:
+        """Write a rectangle of tile ids (row by row) into one board array."""
+        if (width > 0 and height > 0 and len(tiles) >= width * height
+                and in_level_bounds(x, y)
+                and in_level_bounds(x + width - 1, y + height - 1)):
+            # Whole rows at once: a 64x64 change is on the board-change path.
+            row_format = '<%dH' % width
+            for dy in range(height):
+                start = level_index(x, y + dy) * 2
+                row = tiles[dy * width:(dy + 1) * width]
+                board[start:start + 2 * width] = struct.pack(
+                    row_format, *[tile & 0xFFFF for tile in row])
+            return
+        index = 0
+        for dy in range(height):
+            for dx in range(width):
+                if index >= len(tiles):
+                    return
+                tx, ty = x + dx, y + dy
+                if in_level_bounds(tx, ty):
+                    idx = level_index(tx, ty) * 2
+                    board[idx] = tiles[index] & 0xFF
+                    board[idx + 1] = (tiles[index] >> 8) & 0xFF
+                index += 1
+
+    def alter_board(self, x: int, y: int, width: int, height: int,
+                    tiles: List[int], now: float, respawn_seconds: int,
+                    allow_respawn: bool = True,
+                    force_respawn: bool = False,
+                    corrections: Optional[List[BoardChange]] = None
+                    ) -> Optional[BoardChange]:
+        """Level::alterBoard (Level.cpp:1668-1749) for one level part: record
+        the change, apply it to the live board, replace older changes it
+        covers. None, and nothing changed, only for a rectangle outside the
+        level or too few tiles (the handler checks both first).
+
+        When the change list is full its oldest entries are evicted
+        (board_changes.py): their rectangles, rebuilt from the entries left,
+        are written to the live board and appended to `corrections` for the
+        caller to send to the level like a board change."""
+        if not (width > 0 and height > 0 and in_level_bounds(x, y)
+                and in_level_bounds(x + width - 1, y + height - 1)
+                and len(tiles) >= width * height):
+            return None
+        do_respawn = allow_respawn and (force_respawn or (width == 2 and height == 2))
+        old_tiles = None
+        if do_respawn:
+            old_tiles = [self.get_base_tile(x + dx, y + dy)
+                         for dy in range(height) for dx in range(width)]
+        change = BoardChange(
+            x=x, y=y, width=width, height=height, tiles=list(tiles[:width * height]),
+            old_tiles=old_tiles,
+            expires_at=now + respawn_seconds if do_respawn and respawn_seconds > 0 else None,
+            mod_time=now)
+        evicted = self._board_changes.add(change, self._base_tiles)
+        self._apply_change_tiles(change)
+        for fix in evicted:
+            self._apply_change_tiles(fix)
+        if corrections is not None:
+            corrections.extend(evicted)
+        return change
+
+    @property
+    def board_changes(self) -> List[BoardChange]:
+        """The change list in order (what a late joiner is replayed)."""
+        return list(self._board_changes)
+
+    def next_board_expiry(self) -> Optional[float]:
+        """When the earliest running board-change timer is due, if any."""
+        return self._board_changes.next_expiry()
+
+    def _apply_change_tiles(self, change: BoardChange) -> None:
+        """Show `change.tiles` on the live board (the base array is untouched)."""
+        self._write_rect(self._tiles, change.x, change.y, change.width,
+                         change.height, change.tiles)
+
+    def expire_board_changes(self, now: float) -> List[BoardChange]:
+        """LevelBoardChange::update (LevelBoardChange.cpp:39-50) for every
+        change that is due: swap it, show its old tiles on the live board and
+        return it so the caller can tell the level."""
+        done = self._board_changes.expire(now)
+        for change in done:
+            self._apply_change_tiles(change)
+        return done
+
+    def clear_board_changes(self) -> None:
+        """Level reload drops the list (Level.cpp:656)."""
+        self._board_changes.clear()
 
     def tile_type_at(self, x: int, y: int,
                      tileset: int = tiletypes.TILESET_CLASSIC) -> int:
@@ -471,8 +598,13 @@ class Level:
     is_blocking = is_on_wall
 
     def get_board_packet(self) -> bytes:
-        """Get tile data as board packet (8192 bytes)."""
+        """Get the live tile data as board packet (8192 bytes)."""
         return bytes(self._tiles)
+
+    def get_base_board_packet(self) -> bytes:
+        """The base tiles, what a player entering the level is sent before the
+        board change list (BoardChangeManager.join_packets)."""
+        return bytes(self._base_tiles)
 
     def add_player(self, player: 'Player'):
         """Add a player to this level."""
@@ -649,6 +781,10 @@ class LevelManager:
             return None
         self._levels[name] = level
         return level
+
+    def get_loaded_level(self, name: str) -> Optional[Level]:
+        """A level already in the cache; never loads one."""
+        return self._levels.get(name)
 
     def add_level(self, level: Level):
         """Add a level to the cache."""

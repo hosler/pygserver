@@ -3,13 +3,13 @@
 import logging
 from typing import List
 from reborn_protocol.props import (
-    COLORS_NEWWORLD,
     NPC_PROPS,
     PLAYER_PROPS,
     encode_value,
 )
 
 from ..packet_codec import PacketBuilder
+from ..colors import clamp_colors, colors_wire_width
 from ..constants import (
     PLO, PLPROP
 )
@@ -73,8 +73,10 @@ def build_player_props(props: dict) -> bytes:
     return builder.build()
 
 
-# Outbound props are for v6.037 (new-world) clients, so PLPROP_COLORS is 8 wide.
-_OUTBOUND_COLORS = COLORS_NEWWORLD
+# PLPROP_COLORS / NPCPROP_COLORS are 8 wide only under `servermode = newworld`,
+# otherwise 5, whatever the client version (PropertySerializers.h:793-796). The
+# mode is the one the server started with (Server.cpp:194-195), so every write
+# and read in a process agrees.
 
 
 def _write_player_prop(builder: 'PacketBuilder', prop_id: int, value) -> None:
@@ -94,8 +96,12 @@ def _write_player_prop(builder: 'PacketBuilder', prop_id: int, value) -> None:
         logger.warning("build_player_props: unhandled prop %s (skipped)", prop_id)
         return
     try:
-        payload = (bytes([(int(value) + 32) & 0xff]) if prop_id == PLPROP.CARRYSPRITE
-                   else encode_value(desc, value, _OUTBOUND_COLORS))
+        if prop_id == PLPROP.CARRYSPRITE:
+            payload = bytes([(int(value) + 32) & 0xff])
+        else:
+            if prop_id == PLPROP.COLORS:
+                value = clamp_colors(value)   # PropertySerializers.h:744
+            payload = encode_value(desc, value, colors_wire_width())
     except (TypeError, ValueError, OverflowError) as exc:
         logger.warning("build_player_props: prop %s (%s) value %r not encodable: %s",
                        prop_id, desc.name, value, exc)
@@ -162,7 +168,9 @@ def _write_npc_prop(builder: 'PacketBuilder', prop_id: int, value) -> None:
         logger.warning("build_npc_props: unhandled prop %s (skipped)", prop_id)
         return
     try:
-        payload = encode_value(desc, value, _OUTBOUND_COLORS)
+        if prop_id == NPCPROP.COLORS:
+            value = clamp_colors(value)   # PropertySerializers.h:744 (<true> form too)
+        payload = encode_value(desc, value, colors_wire_width())
     except (TypeError, ValueError, OverflowError) as exc:
         logger.warning("build_npc_props: prop %s (%s) value %r not encodable: %s",
                        prop_id, desc.name, value, exc)
@@ -412,11 +420,36 @@ def build_ghost_icon(enabled: bool) -> bytes:
     return builder.build()
 
 
-def build_fullstop() -> bytes:
-    """Build PLO_FULLSTOP packet (hides HUD, stops input)."""
-    builder = PacketBuilder().write_gchar(PLO.FULLSTOP)
+def build_kingdoms_mode() -> bytes:
+    """Build the bare PLO_KINGDOMSMODE (176) packet: `D0 0A`.
+
+    Sent for `servermode = kingdoms` (GServer-v2 Player.cpp:748-749, origin/beta4).
+    """
+    builder = PacketBuilder().write_gchar(PLO.KINGDOMSMODE)
     builder.write_newline()
     return builder.build()
+
+
+def build_new_world_mode() -> bytes:
+    """Build the bare PLO_NEWWORLDMODE (177) packet: `D1 0A`.
+
+    Sent for `servermode = newworld` (GServer-v2 Player.cpp:750-751, origin/beta4).
+    """
+    builder = PacketBuilder().write_gchar(PLO.NEWWORLDMODE)
+    builder.write_newline()
+    return builder.build()
+
+
+def build_server_mode(servermode: str) -> bytes:
+    """The mode announcement for a `servermode` option value, or b'' for any
+    other value (normal): the two modes are exclusive and `normal` sends
+    nothing (Player.cpp:748-752 `if kingdoms ... else if newworld`)."""
+    mode = (servermode or "").strip().lower()
+    if mode == "kingdoms":
+        return build_kingdoms_mode()
+    if mode == "newworld":
+        return build_new_world_mode()
+    return b""
 
 
 def build_is_leader() -> bytes:

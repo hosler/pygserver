@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, List, Dict, Tuple, Set
 
 from .attachments import absolute_position
+from .config import ServerConfig
 
 from .protocol.constants import PLO, PLPROP, LevelItemType
 from .protocol.packets import (
@@ -105,24 +106,31 @@ ITEM_EFFECTS = {
     LevelItemType.SPINATTACK: ('spin_attack', True),
 }
 
-# Drop tables for various sources
-# Note: DARTS = arrows in the protocol
-BUSH_DROPS = [
-    (LevelItemType.GREENRUPEE, 0.4),
-    (LevelItemType.BLUERUPEE, 0.1),
-    (LevelItemType.HEART, 0.2),
-    (LevelItemType.DARTS, 0.1),  # DARTS = arrows
-    (LevelItemType.BOMBS, 0.1),
-    (None, 0.1),  # Nothing
-]
+# Tiles whose cut drops an item, and the vase tile (GServer-v2
+# PlayerClientPackets.cpp:112 dropTiles; :159 0x2ac): bushes, grass, swamp,
+# snow grass, desert grass.
+BUSH_TILES = frozenset({0x002, 0x1a4, 0x1ff, 0x7ff, 0x3ff, 0x5d9, 0x34f})
+VASE_TILE = 0x2ac
 
-POT_DROPS = [
-    (LevelItemType.GREENRUPEE, 0.3),
-    (LevelItemType.BLUERUPEE, 0.15),
-    (LevelItemType.HEART, 0.25),
-    (LevelItemType.DARTS, 0.15),  # DARTS = arrows
-    (LevelItemType.BOMBS, 0.15),
-]
+# What a stock server rolls and may drop (config.py defaults).
+DEFAULT_BUSH_DROPS = ServerConfig().bush_drops
+DEFAULT_DEATH_DROPS = ServerConfig().death_drop_items()
+
+# Level-segment size in pixels, and one half tile (Extents.h toPixelPosition).
+SEGMENT_PIXELS = 1024
+HALF_TILE_PIXELS = 8
+
+
+def _option(config, name: str, default):
+    """A typed server option, or `default` when the config does not carry it."""
+    value = getattr(config, name, default)
+    return value if isinstance(value, type(default)) else default
+
+
+def _truncate_div(numerator: int, denominator: int) -> int:
+    """C++ integer division (rounds toward zero)."""
+    quotient = abs(numerator) // denominator
+    return -quotient if numerator < 0 else quotient
 
 
 class ItemManager:
@@ -151,6 +159,9 @@ class ItemManager:
         # Tick task
         self._tick_task: Optional[asyncio.Task] = None
         self._running = False
+
+        # Drop rolls. Tests replace this with a seeded random.Random.
+        self.rng = random.Random()
 
         # Settings
         self.item_despawn_time = ITEM_LIFETIME
@@ -193,10 +204,10 @@ class ItemManager:
             expired = [item_id for item_id, item in items.items() if item.expired]
 
             for item_id in expired:
-                item = items.pop(item_id)
-                # Broadcast item removal
-                packet = build_item_del(item.x, item.y)
-                await self.server.broadcast_to_level(level_name, packet)
+                # The reference expires level items silently (Level.cpp:711-716,
+                # no PLO_ITEMDEL): clients run their own timer for the item and
+                # answer the expiry with PLI_ITEMDEL (see remove_item_silently).
+                items.pop(item_id)
 
     async def spawn_item(self, level: 'Level', x: float, y: float,
                          item_type: LevelItemType,
@@ -219,10 +230,9 @@ class ItemManager:
         level_name = level.name
 
         # Check item limit
-        if level_name in self._items:
-            if len(self._items[level_name]) >= self.max_items_per_level:
-                logger.warning(f"Item limit reached on {level_name}")
-                return None
+        if not self.has_room(level_name):
+            logger.warning(f"Item limit reached on {level_name}")
+            return None
 
         # Create item
         item_id = self._next_item_id
@@ -278,6 +288,68 @@ class ItemManager:
 
         return False
 
+    def _item_near(self, level_name: str, x: float, y: float, tolerance: float):
+        """(id, item) at a position: the item exactly there, else the nearest
+        one closer than `tolerance` on both axes, else None."""
+        best = None
+        best_distance = None
+        for item_id, item in self._items.get(level_name, {}).items():
+            dx, dy = abs(item.x - x), abs(item.y - y)
+            if dx >= tolerance or dy >= tolerance:
+                continue
+            distance = dx * dx + dy * dy
+            if best_distance is None or distance < best_distance:
+                best, best_distance = (item_id, item), distance
+                if distance == 0:
+                    break
+        return best
+
+    def remove_item_silently(self, level_name: str, x: float, y: float) -> bool:
+        """Drop the ground item at a position without telling anyone
+        (Level::removeItem(position), Level.cpp:2495-2508). False, and no
+        change, when no item is there (it already expired or was taken)."""
+        target = self._item_near(level_name, x, y, 0.5)
+        if target is None:
+            return False
+        del self._items[level_name][target[0]]
+        return True
+
+    def _take_target(self, level_name: str, x: float, y: float):
+        """(id, item) a take at (x, y) refers to: the item exactly there, else
+        the nearest within a tile of it, or None."""
+        return self._item_near(level_name, x, y, 1.0)
+
+    @staticmethod
+    def _within_reach(player: 'Player', item: LevelItem) -> bool:
+        """TServerLevel.cpp:1419: player and item centres, not the packet xy."""
+        px, py = absolute_position(player)
+        return (abs(px + 1.5 - (item.x + 1.0)) < 2.0
+                and abs(py + 2.0 - (item.y + 1.0)) < 2.0)
+
+    def _take_allowed(self, player: 'Player', item: LevelItem) -> bool:
+        """Whether `player` may take a live `item` now: same layer, old enough
+        (remaining time <160, TServerLevel.cpp:1416) and within reach (:1419)."""
+        ticks = int((time.time() - item.created_at) / .05 + 1e-9)
+        return (164 - ticks < 160
+                and item.layer == getattr(player, 'layer', 0)
+                and self._within_reach(player, item))
+
+    def take_relay_position(self, player: 'Player', x: float, y: float):
+        """What the PLI_ITEMTAKE handler does before relaying: None when the
+        take is ignored outright (a live item that the age, layer or reach
+        test refuses: no relay, no removal, no credit), else the (x, y) the
+        other players are told to drop. That is the chosen item's own position
+        or, when no item is there any more, the packet's."""
+        if not player.level:
+            return None
+        target = self._take_target(player.level.name, x, y)
+        if target is None:
+            return x, y
+        item = target[1]
+        if not item.expired and not self._take_allowed(player, item):
+            return None
+        return item.x, item.y
+
     async def handle_item_take(self, player: 'Player', x: float, y: float) -> bool:
         """
         Handle player picking up an item.
@@ -294,36 +366,23 @@ class ItemManager:
             return False
 
         level_name = player.level.name
-        if level_name not in self._items:
+        target = self._take_target(level_name, x, y)
+        if target is None:
             return False
-
-        # Find item at position
-        for item_id, item in list(self._items[level_name].items()):
-            if abs(item.x - x) < 1.0 and abs(item.y - y) < 1.0:
-                if item.expired:
-                    await self.remove_item(level_name, item.x, item.y)
-                    return False
-                # TServerLevel.cpp:1416: same layer and remaining time <160.
-                ticks = int((time.time() - item.created_at) / .05 + 1e-9)
-                if 164 - ticks >= 160 or item.layer != getattr(player, 'layer', 0):
-                    return False
-                # TServerLevel.cpp:1419: use player/item centres, not packet xy.
-                if not (abs(absolute_position(player)[0] + 1.5 - (item.x + 1.0)) < 2.0
-                        and abs(absolute_position(player)[1] + 2.0 - (item.y + 1.0)) < 2.0):
-                    return False
-                # Claim before awaiting the grant so concurrent takes grant once.
-                del self._items[level_name][item_id]
-                # Apply item effect
-                await self.give_item_to_player(player, item.item_type)
-
-                # Broadcast removal
-                packet = build_item_del(item.x, item.y)
-                await self.server.broadcast_to_level(level_name, packet)
-
-                logger.debug(f"Player {player.id} picked up {item.item_type.name}")
-                return True
-
-        return False
+        item_id, item = target
+        if item.expired:
+            self.remove_item_silently(level_name, item.x, item.y)
+            return False
+        if not self._take_allowed(player, item):
+            return False
+        # Claim before awaiting the grant so concurrent takes grant once.
+        del self._items[level_name][item_id]
+        # The other players were told by the PLI_ITEMTAKE handler before this
+        # lookup (PlayerClientPackets.cpp:389); the taker is sent nothing, its
+        # client removed the item when it sent the take.
+        await self.give_item_to_player(player, item.item_type)
+        logger.debug(f"Player {player.id} picked up {item.item_type.name}")
+        return True
 
     async def give_item_to_player(self, player: 'Player', item_type: LevelItemType):
         """
@@ -503,40 +562,179 @@ class ItemManager:
         logger.info(f"Player {player.id} opened chest at ({x}, {y}), got {chest.item_type.name}")
         return True
 
-    async def spawn_random_drop(self, level: 'Level', x: float, y: float,
-                                 drop_table: List[Tuple[Optional[LevelItemType], float]]
-                                 ) -> Optional[LevelItem]:
+    # -- reference item drops ---------------------------------------------------
+
+    def has_room(self, level_name: str) -> bool:
+        """False once the per-level item cap is reached (flood guard; the
+        reference has no cap)."""
+        return len(self._items.get(level_name, ())) < self.max_items_per_level
+
+    async def drop_item_at(self, level: 'Level', half_x: int, half_y: int,
+                           item_type: LevelItemType) -> bool:
+        """Level::addItem(inform_client) at a half-tile offset from this level
+        segment's origin (Level.cpp:2424-2433, Extents.h:389-395).
+
+        The reference places by world pixel and tells only the clients in the
+        segment the pixel falls in (Server.cpp:2361-2375), so a drop that
+        lands past the edge goes to the neighbouring segment, or to nobody
+        when there is none. Segment numbers truncate toward zero and local
+        coordinates keep the sign (Extents.h:451, :562).
+
+        Returns False only when the item cap stopped the drop.
         """
-        Spawn a random item from a drop table.
+        gmap_info = self.server.world.get_gmap_for_level(level.name)
+        if gmap_info:
+            gmap, grid_x, grid_y = gmap_info
+        else:
+            gmap, grid_x, grid_y = None, 0, 0
+        world_x = grid_x * SEGMENT_PIXELS + half_x * HALF_TILE_PIXELS
+        world_y = grid_y * SEGMENT_PIXELS + half_y * HALF_TILE_PIXELS
+        cell_x = _truncate_div(world_x, SEGMENT_PIXELS)
+        cell_y = _truncate_div(world_y, SEGMENT_PIXELS)
+        if not (0 <= cell_x <= 255 and 0 <= cell_y <= 255):
+            return True
+        if gmap is None:
+            if (cell_x, cell_y) != (0, 0):
+                return True
+            target = level
+        elif (cell_x, cell_y) == (grid_x, grid_y):
+            target = level
+        else:
+            name = gmap.get_level_at(cell_x, cell_y)
+            target = self.server.world.get_level(name) if name else None
+            if target is None:
+                return True
+        local_x = world_x - cell_x * SEGMENT_PIXELS
+        local_y = world_y - cell_y * SEGMENT_PIXELS
+        item = await self.spawn_item(
+            target, local_x / 16.0, local_y / 16.0, item_type)
+        return item is not None
 
-        Args:
-            level: Level to spawn on
-            x: X position
-            y: Y position
-            drop_table: List of (item_type, probability) tuples
+    def roll_bush_drop(self, config) -> int:
+        """Server::rollBushItemDrop (Server.cpp:1438-1453): one uniform
+        [1, 100] roll walked through the cumulative rates. -1 for nothing."""
+        roll = self.rng.randint(1, 100)
+        table = (config.bush_drops if isinstance(config, ServerConfig)
+                 else DEFAULT_BUSH_DROPS)
+        for item, rate in table:
+            if roll <= rate:
+                return item
+            roll -= rate
+        return -1
 
-        Returns:
-            Spawned item, or None
-        """
-        roll = random.random()
-        cumulative = 0.0
+    async def drop_board_item(self, player: 'Player', loc_x: int, loc_y: int,
+                              old_tile: int) -> None:
+        """Items laid by cutting a bush or breaking a vase
+        (PlayerClientPackets.cpp:143-166). `old_tile` is the tile as it stood
+        before the cut."""
+        level = player.level
+        if level is None:
+            return
+        config = getattr(self.server, 'config', None)
+        dropped = -1
+        if old_tile in BUSH_TILES and _option(config, 'bushitems', True):
+            dropped = self.roll_bush_drop(config)
+        elif old_tile == VASE_TILE and _option(config, 'vasesdrop', True):
+            dropped = int(LevelItemType.HEART)
+        if dropped >= 0:
+            await self.drop_item_at(level, loc_x * 2, loc_y * 2,
+                                    LevelItemType(dropped))
 
-        for item_type, probability in drop_table:
-            cumulative += probability
-            if roll < cumulative:
-                if item_type is not None:
-                    return await self.spawn_item(level, x, y, item_type)
-                return None
+    def _death_half_tile(self, tile_x: float, tile_y: float):
+        """One drop position: the player's tile + (1.5, 2.0) + a uniform
+        [-4, 4] tile displacement per axis, x drawn first
+        (PlayerClient.cpp:1977-1978), truncated to a half tile
+        (Extents.h:392-393)."""
+        pos_x = tile_x + 1.5 + self.rng.randint(-4, 4)
+        pos_y = tile_y + 2.0 + self.rng.randint(-4, 4)
+        return int(pos_x * 2), int(pos_y * 2)
 
-        return None
+    async def drop_items_on_death(self, player: 'Player') -> None:
+        """PlayerClient::dropItemsOnDeath (PlayerClient.cpp:1898-1998)."""
+        config = getattr(self.server, 'config', None)
+        if not _option(config, 'dropitemsdead', True):
+            return
+        level = player.level
+        if level is None:
+            return
+        minimum = _option(config, 'mindeathgralats', 1)
+        maximum = _option(config, 'maxdeathgralats', 50)
+        # min > max is undefined behaviour in the reference's uniform
+        # distribution (:1913); treat min as equal to max.
+        minimum = min(minimum, maximum)
+        allowed = (config.death_drop_items() if isinstance(config, ServerConfig)
+                   else DEFAULT_DEATH_DROPS)
 
-    async def spawn_bush_drop(self, level: 'Level', x: float, y: float) -> Optional[LevelItem]:
-        """Spawn a random drop from a bush."""
-        return await self.spawn_random_drop(level, x, y, BUSH_DROPS)
+        gralats = max(0, int(player.rupees))
+        drop_gralats = 0
+        if maximum > 0:
+            drop_gralats = min(self.rng.randint(minimum, maximum), gralats)
+        drop_arrows = self.rng.randint(0, 3)
+        drop_bombs = self.rng.randint(0, 3)
+        if drop_arrows * 5 > player.arrows:
+            drop_arrows = player.arrows // 5
+        if drop_bombs * 5 > player.bombs:
+            drop_bombs = player.bombs // 5
+        if int(LevelItemType.DARTS) not in allowed:
+            drop_arrows = 0
+        if int(LevelItemType.BOMBS) not in allowed:
+            drop_bombs = 0
 
-    async def spawn_pot_drop(self, level: 'Level', x: float, y: float) -> Optional[LevelItem]:
-        """Spawn a random drop from a pot."""
-        return await self.spawn_random_drop(level, x, y, POT_DROPS)
+        # Deducted before the type check below, so with no rupee type allowed
+        # the gralats are simply lost (:1935-1946). Only the dying player hears
+        # about the new counts (:1938).
+        player.rupees = gralats - drop_gralats
+        player.arrows -= drop_arrows * 5
+        player.bombs -= drop_bombs * 5
+        await player.send_props({
+            PLPROP.RUPEESCOUNT: player.rupees,
+            PLPROP.ARROWSCOUNT: player.arrows,
+            PLPROP.BOMBSCOUNT: player.bombs,
+        })
+        gold, red, blue, green = (int(LevelItemType.GOLDRUPEE) in allowed,
+                                  int(LevelItemType.REDRUPEE) in allowed,
+                                  int(LevelItemType.BLUERUPEE) in allowed,
+                                  int(LevelItemType.GREENRUPEE) in allowed)
+        if not (gold or red or blue or green):
+            drop_gralats = 0
+
+        try:
+            local_x, local_y = absolute_position(player)
+            tile_x = int(float(local_x) * 16) / 16.0   # whole pixels (Character.h:55)
+            tile_y = int(float(local_y) * 16) / 16.0
+        except (TypeError, ValueError, OverflowError):
+            tile_x = tile_y = 0.0
+
+        # Greedy 100/30/5/1 split (:1950-1981). The reference loop runs once
+        # per item; here it also stops after `max_items_per_level` attempts, so
+        # an absurd maxdeathgralats cannot hold the event loop (the cap alone
+        # would not stop drops that land outside any level segment).
+        attempts = 0
+        while drop_gralats != 0 and attempts < self.max_items_per_level:
+            if gold and drop_gralats >= 100:
+                drop_gralats -= 100
+                item = LevelItemType.GOLDRUPEE
+            elif red and drop_gralats >= 30:
+                drop_gralats -= 30
+                item = LevelItemType.REDRUPEE
+            elif blue and drop_gralats >= 5:
+                drop_gralats -= 5
+                item = LevelItemType.BLUERUPEE
+            else:
+                if not green:
+                    break
+                drop_gralats -= 1
+                item = LevelItemType.GREENRUPEE
+            attempts += 1
+            if not await self.drop_item_at(level, *self._death_half_tile(tile_x, tile_y), item):
+                return
+
+        for count, item in ((drop_arrows, LevelItemType.DARTS),
+                            (drop_bombs, LevelItemType.BOMBS)):
+            for _ in range(count):
+                if not await self.drop_item_at(
+                        level, *self._death_half_tile(tile_x, tile_y), item):
+                    return
 
     def get_items_on_level(self, level_name: str) -> List[LevelItem]:
         """Get all items on a level."""

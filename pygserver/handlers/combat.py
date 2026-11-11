@@ -119,6 +119,10 @@ class CombatHandlers:
         GServer-v2 msgPLI_EXPLOSION prefixes the sender id on relay;
         FourPlay TClient.cpp:5461-5473 reads that id before radius/x/y/flags.
         """
+        # PlayerClientPackets.cpp:845: `noexplosions` drops the packet before
+        # any relay or board effect.
+        if getattr(getattr(self.server, 'config', None), 'noexplosions', False) is True:
+            return
         if not self.level:
             return
         reader = PacketReader(data)

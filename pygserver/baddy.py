@@ -122,8 +122,8 @@ class Baddy:
     # initial props broadcast (spawn / a joining player's first sighting).
     verses: List[str] = field(default_factory=list)
 
-    # Respawn settings
-    respawn_time: float = 60.0
+    # Respawn settings (the delay is the `baddyrespawntime` option; see
+    # BaddyManager.respawn_seconds)
     respawn_enabled: bool = True
     dead: bool = False
     death_time: float = 0.0
@@ -194,6 +194,20 @@ class BaddyManager:
         # Settings
         self.default_respawn_time = 60.0
         self.baddy_respawn_enabled = True
+        self._tick_error_logged: Dict[int, float] = {}
+
+    def respawn_seconds(self) -> float:
+        """LevelBaddy.cpp:270,302: the `baddyrespawntime` option (default 60),
+        which the reference reads once as a baddy enters the dead mode. Here it
+        is read on every tick a dead baddy waits, so an RC edit also applies to
+        baddies already waiting. A config without the field keeps 60."""
+        value = getattr(getattr(self.server, 'config', None),
+                        'baddyrespawntime', None)
+        if (isinstance(value, (int, float)) and not isinstance(value, bool)
+                and (isinstance(value, int) or math.isfinite(value))):
+            # Unsigned 32-bit in the reference; never feed float() a huge int.
+            return float(max(0, min(int(value), 0xFFFFFFFF)))
+        return self.default_respawn_time
 
     async def start(self):
         """Start the baddy tick loop."""
@@ -236,23 +250,40 @@ class BaddyManager:
                 continue
 
             for baddy_id, baddy in list(baddies.items()):
-                # Handle dead baddies
-                if baddy.dead:
-                    # GServer-v2 LevelBaddy.cpp:281: DIE lasts two seconds;
-                    # the respawn timeout starts only after entering DEAD.
-                    if baddy.mode == BDMODE.DIE:
-                        if current_time - baddy.death_time >= 2.0:
-                            baddy.mode = BDMODE.DEAD
-                            baddy.death_time = current_time
-                            await self._broadcast_baddy_props(baddy)
-                        continue
-                    if self.baddy_respawn_enabled and baddy.respawn_enabled:
-                        if current_time - baddy.death_time >= baddy.respawn_time:
-                            await self._respawn_baddy(baddy)
-                    continue
+                # One baddy raising must not stop the others (or the loop).
+                try:
+                    await self._tick_baddy(baddy, level, current_time, delta_time)
+                except Exception as error:
+                    self._report_tick_error(baddy, error)
 
-                # Update AI
-                await self._update_baddy_ai(baddy, level, delta_time)
+    async def _tick_baddy(self, baddy: Baddy, level: 'Level',
+                          current_time: float, delta_time: float):
+        """One baddy's share of a tick."""
+        # Handle dead baddies
+        if baddy.dead:
+            # GServer-v2 LevelBaddy.cpp:281: DIE lasts two seconds;
+            # the respawn timeout starts only after entering DEAD.
+            if baddy.mode == BDMODE.DIE:
+                if current_time - baddy.death_time >= 2.0:
+                    baddy.mode = BDMODE.DEAD
+                    baddy.death_time = current_time
+                    await self._broadcast_baddy_props(baddy)
+                return
+            if self.baddy_respawn_enabled and baddy.respawn_enabled:
+                if current_time - baddy.death_time >= self.respawn_seconds():
+                    await self._respawn_baddy(baddy)
+            return
+
+        # Update AI
+        await self._update_baddy_ai(baddy, level, delta_time)
+
+    def _report_tick_error(self, baddy: Baddy, error: Exception):
+        """Log a per-baddy tick failure at most once per 30 s per baddy."""
+        now = time.time()
+        last = self._tick_error_logged.get(baddy.id, 0.0)
+        if now - last >= 30.0:
+            self._tick_error_logged[baddy.id] = now
+            logger.error(f"Baddy {baddy.id} tick error: {error!r}")
 
     async def _update_baddy_ai(self, baddy: Baddy, level: 'Level', delta_time: float):
         """
@@ -441,7 +472,6 @@ class BaddyManager:
             baddy_type=baddy_type,
             x=x,
             y=y,
-            respawn_time=self.default_respawn_time,
             respawn_enabled=respawn_enabled,
             verses=list(verses) if verses else [],
             image=image,

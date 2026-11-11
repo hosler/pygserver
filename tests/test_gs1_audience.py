@@ -240,7 +240,7 @@ def test_script_explosion_runs_level_object_effects():
         run_npc_event(npc, "created", server, None)
         await asyncio.sleep(0)
         server.combat_manager.blast_level_objects.assert_awaited_once_with(
-            level, 30, 30, 3, 1)
+            level, 30, 30, 3, 1, script=True, admitted=True)
         assert len(server.broadcasts) == 1
     asyncio.run(main())
 

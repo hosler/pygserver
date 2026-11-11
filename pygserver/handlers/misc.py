@@ -2,9 +2,14 @@
 
 import logging
 
+from ..board_changes import respawn_context, send_near
 from ..protocol.constants import PLI
 from ..protocol.packets import PacketReader
 from .registry import handles
+from .versions import client_version
+
+# CLVER_2_1: clients before this lay their own bush and vase drops.
+CLIENT_DROPS_ITEMS_SINCE = 2.1
 
 logger = logging.getLogger(__name__)
 
@@ -41,25 +46,50 @@ class MiscHandlers:
         if len(tile_data) < expected_size:
             return
 
-        for ty in range(y, y + h):
-            for tx in range(x, x + w):
-                self.level.set_tile(tx, ty, reader.read_gshort())
+        # Level::alterBoard (PlayerClientPackets.cpp:125, Level.cpp:1610-1749):
+        # the change is recorded beside the level's tile array, a 2x2 one
+        # respawns after `respawntime` seconds (board_changes.py).
+        tiles = [reader.read_gshort() for _ in range(w * h)]
+        now, respawn_seconds = respawn_context(self.server)
+        corrections = []
+        accepted = self.level.alter_board(x, y, w, h, tiles, now, respawn_seconds,
+                                          corrections=corrections)
 
-        # Broadcast modification to other players on level
-        from ..protocol.packets import build_board_modify, build_board_modify2
-        gmap_info = self.server.world.get_gmap_for_level(self.level.name)
-        if gmap_info:
-            _, map_x, map_y = gmap_info
-            packet = build_board_modify2(
-                map_x, map_y, x, y, w, h, tile_data[:expected_size]
-            )
-        else:
-            packet = build_board_modify(
-                x, y, w, h, tile_data[:expected_size]
-            )
-        await self.server.broadcast_to_level(
-            self.level.name, packet, exclude={self.id}
-        )
+        # Relayed to everyone else (PlayerClientPackets.cpp:125-134): the
+        # level's players, and on a grid map the players of the segments
+        # around this one (Server::sendPacketToNearby, Server.cpp:2390-2413).
+        if accepted is not None:
+            from ..protocol.packets import build_board_modify, build_board_modify2
+            gmap_info = self.server.world.get_gmap_for_level(self.level.name)
+            if gmap_info:
+                _, map_x, map_y = gmap_info
+                packet = build_board_modify2(
+                    map_x, map_y, x, y, w, h, tile_data[:expected_size]
+                )
+            else:
+                packet = build_board_modify(
+                    x, y, w, h, tile_data[:expected_size]
+                )
+            await send_near(self.server, self.level.name, packet,
+                            gmap_info=gmap_info, exclude={self.id})
+        # Entries evicted at the list bound (board_changes.py): their
+        # rebuilt rectangles go to the same players, the sender included.
+        # Each already shows this change, so the order does not matter.
+        for fix in corrections:
+            await self.server.board_changes.send_to_level(self.level, fix)
+
+        # Items laid by cutting a bush or breaking a vase
+        # (PlayerClientPackets.cpp:139-166). Older clients drop them
+        # themselves (:140); the cut is relayed either way (:125-133). The
+        # tile tested is the level's base tile (:144-148), which board changes
+        # never rewrite, so every cut rolls again, including a repeat of the
+        # same packet before the tile respawns; only the level's item cap
+        # (ItemManager.max_items_per_level) bounds how many items that makes.
+        if client_version(self) >= CLIENT_DROPS_ITEMS_SINCE:
+            item_manager = getattr(self.server, 'item_manager', None)
+            if item_manager is not None:
+                await item_manager.drop_board_item(
+                    self, x, y, self.level.get_base_tile(x, y))
 
     @handles(PLI.REQUESTUPDATEBOARD)
     async def _handle_request_update_board(self, data: bytes):

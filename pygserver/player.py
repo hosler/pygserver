@@ -421,7 +421,9 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
         level_name_pkt = build_level_name(level.name)
 
         # Board data format: [packet_id + 32] + [8192 tile bytes] + [\n]
-        tile_data = level.get_board_packet()  # 8192 bytes
+        # The base board; pending board changes follow below
+        # (Level.cpp:483-530, sent by BoardChangeManager.join_packets).
+        tile_data = level.get_base_board_packet()  # 8192 bytes
         board_packet = bytes([PLO.BOARDPACKET + 32]) + tile_data + b'\n'
 
         # Announce raw data size (1 + 8192 + 1 = 8194)
@@ -466,6 +468,9 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
         # Send NPCs on level
         for npc in level.get_npcs():
             await self.send_raw(npc.build_props_packet())
+            bytecode = npc.build_bytecode_packet()  # Level.cpp:1475-1480
+            if bytecode:
+                await self.send_raw(bytecode)
             showimgs = npc.build_showimgs_packet()
             if showimgs is not None:
                 await self.send_raw(showimgs)
@@ -476,6 +481,15 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
         # Send items on level
         if hasattr(self.server, 'item_manager'):
             await self.server.item_manager.send_level_items(self, level)
+
+        # Board changes before horses and baddies
+        # (PlayerClient.cpp:1523-1528, SubLevel::sendBoardChangesToPlayer).
+        board_changes = getattr(self.server, 'board_changes', None)
+        if board_changes is not None:
+            from .handlers.versions import client_version
+            packets = board_changes.join_packets(level, client_version(self))
+            if packets:
+                await self.send_raw(b"".join(packets))
 
         # Send baddies on level
         if hasattr(self.server, 'baddy_manager'):

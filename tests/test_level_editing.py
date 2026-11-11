@@ -346,7 +346,10 @@ def test_save_after_sign_add_writes_sign(tmp_path):
         tmp_path / 'room.nw').read_text(encoding='latin-1')
 
 
-def test_board_modify_savelevel_round_trip(tmp_path):
+def test_board_modify_is_not_written_by_savelevel(tmp_path):
+    """A client PLI_BOARDMODIFY only appends a board change (Level.cpp:1743);
+    Level::saveLevel writes the tile array (Level.cpp:999-1030), so the edit
+    shows live but never reaches the file. A server-side tile write does."""
     level = Level('room.nw')
     level.file_path = str(tmp_path / 'room.nw')
     manager, session, server = _editor_manager(level)
@@ -365,10 +368,13 @@ def test_board_modify_savelevel_round_trip(tmp_path):
                      (tile_id >> 7) + 32, (tile_id & 0x7f) + 32))
 
     asyncio.run(player._handle_board_modify(payload))
+    level.set_tile(20, 20, 271)
     asyncio.run(manager.process_chat('/savelevel room.nw', session))
     reloaded = Level.load(str(tmp_path / 'room.nw'))
 
-    assert reloaded.get_tile(12, 12) == tile_id
+    assert level.get_tile(12, 12) == tile_id
+    assert reloaded.get_tile(12, 12) == 0
+    assert reloaded.get_tile(20, 20) == 271
 
 
 def test_eval_scratch_is_reused_hidden_and_never_serialized():

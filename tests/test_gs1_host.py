@@ -934,7 +934,8 @@ def test_putexplosion_leaves_player_damage_to_clients():
         await asyncio.sleep(0)
         # FourPlay TExplosion.cpp:48-96: the victim client owns damage.
         assert cm.damaged == []
-        cm.blast_level_objects.assert_awaited_once_with(level, 30, 30, 3, 1)
+        cm.blast_level_objects.assert_awaited_once_with(
+            level, 30, 30, 3, 1, script=True, admitted=True)
 
     asyncio.run(main())
 

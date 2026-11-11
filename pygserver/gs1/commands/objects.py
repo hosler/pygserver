@@ -1,5 +1,6 @@
 """Level-object and cross-NPC commands: join, callnpc, removebomb,
-takeplayerhorse, timershow, shootfireball/shootfireblast/shootnuke.
+takeplayerhorse, timershow, shootarrow/shootfireball/shootfireblast/shootnuke,
+spyfire.
 
 Each handler cites the GServer-v2 fn_* it mirrors (GS1Commands.cpp)."""
 from __future__ import annotations
@@ -68,6 +69,9 @@ def _c_join(self, a, npc, player, ctx):
                        getattr(target, "name", ""), name)
         return
     joined.append(name)
+    note_join = getattr(target, "note_join", None)
+    if note_join is not None:    # CLASS list grew: re-send a bytecode NPC
+        note_join(name)
     # The functions are callable straight away, even later in this run.
     if target is _running_npc(ctx):
         merge_joined_functions(target, self.server, ctx.functions)
@@ -226,9 +230,9 @@ def _c_timershow(self, a, npc, player, ctx):
         level.name, build_npc_props(target.id, {NPCPROP.VISFLAGS: wire})))
 
 
-# -- shootfireball / shootfireblast / shootnuke ---------------------------------
+# -- shootarrow / shootfireball / shootfireblast / shootnuke ---------------------
 
-_ARROW_FIREBALL, _ARROW_FIREBLAST, _ARROW_NUKE = 2, 3, 4  # LevelArrow.h:41-45
+_ARROW_NORMAL, _ARROW_FIREBALL, _ARROW_FIREBLAST, _ARROW_NUKE = 1, 2, 3, 4  # LevelArrow.h:41-45
 _ARROW_SPRITE = 107  # arrowSpriteIndex (LevelArrow.h:39)
 
 
@@ -236,26 +240,48 @@ def _shoot_arrow(self, a, ctx, arrow_type):
     # fn_shootfireball/fireblast/nuke (GS1Commands.cpp:3058-3125): addArrow
     # (inform_client) from the running NPC, PLO_ARROWADD with owner 0,
     # flags = dir, sprite = arrowSpriteIndex + dir, trailing byte = type
-    # (Level.cpp:1866-1885). Only the broadcast is modelled; pygserver keeps
-    # no server-side flight for script arrows, same as shootarrow.
+    # (Level.cpp:1866-1885). The arrow then flies server-side
+    # (CombatManager.spawn_script_arrow): it hits NPCs with `wasshot` and the
+    # fireblast / nuke shots explode on impact (Level.cpp:2750-2819). Both the
+    # broadcast and the flight need the NPC server (Level.cpp:1881, 1904).
     if len(a) != 1:
         return
     npc = _running_npc(ctx)
     level = self._level_of(ctx)
     if npc is None or level is None or self.server is None:
         return
-    direction = math.floor(to_num(a[0])) & 0xFF
+    if not getattr(getattr(self.server, "config", None), "serverside", True):
+        return
+    direction = to_num(a[0])
     x, y = to_num(getattr(npc, "x", 0)), to_num(getattr(npc, "y", 0))
+    if not all(math.isfinite(v) for v in (direction, x, y)):
+        return
+    direction = math.floor(direction) & 0xFF
     # getPositionForArrow (GS1Commands.cpp:621): character NPCs (image
     # "#c#", NPC::isCharacter) fire from (1 + dX, 1.5 + dY) tiles past their
     # origin.
     if getattr(npc, "image", "") in ("#c#", "#c"):
         x += 1.0 + (-1.5 if direction == 1 else 1.5 if direction == 3 else 0.0)
         y += 1.5 + (-1.5 if direction == 0 else 1.5 if direction == 2 else 0.0)
+    from ...combat import wire_tile_ok
+    ax, ay = math.floor(x * 2) / 2, math.floor(y * 2) / 2
+    # A position one GCHAR cannot carry would wrap (or split the packet on
+    # 0x0A), so such an arrow is neither sent nor flown.
+    if not wire_tile_ok(ax, ay):
+        return
+    manager = getattr(self.server, "combat_manager", None)
+    if manager is not None and hasattr(manager, "spawn_script_arrow"):
+        # A refused arrow (cap) must not reach clients either.
+        if manager.spawn_script_arrow(level, npc, direction & 3, arrow_type,
+                                      ax, ay) is None:
+            return
     from ...protocol.packets import build_arrow_add
     _schedule(self.server.broadcast_to_level(level.name, build_arrow_add(
-        0, math.floor(x * 2) / 2, math.floor(y * 2) / 2, direction & 3,
-        _ARROW_SPRITE + (direction & 3), arrow_type)))
+        0, ax, ay, direction & 3, _ARROW_SPRITE + (direction & 3), arrow_type)))
+
+
+def _c_shootarrow(self, a, npc, player, ctx):
+    _shoot_arrow(self, a, ctx, _ARROW_NORMAL)
 
 
 def _c_shootfireball(self, a, npc, player, ctx):
@@ -270,13 +296,46 @@ def _c_shootnuke(self, a, npc, player, ctx):
     _shoot_arrow(self, a, ctx, _ARROW_NUKE)
 
 
+# -- spyfire ---------------------------------------------------------------------
+
+def _c_spyfire(self, a, npc, player, ctx):
+    # fn_spyfire (GS1Commands.cpp:3365-3383): needs a player on the script
+    # stack; length is 5 bits, power 3. PLO_FIRESPY goes to everyone nearby,
+    # the shooter included, then Level::addSpyFire raises `exploded` on NPCs.
+    if len(a) != 2:
+        return
+    source = _source_player(ctx)
+    level = getattr(source, "level", None)
+    if source is None or level is None or self.server is None:
+        return
+    length, power = to_num(a[0]), to_num(a[1])
+    if not (math.isfinite(length) and math.isfinite(power)):
+        return
+    # One GCHAR carries (length << 3) | power, at most 223: keep the power and
+    # shorten the length so the packed byte cannot wrap onto 0x0A.
+    power = math.floor(power) & 0x7
+    length = min(math.floor(length) & 0x1f, 223 >> 3)
+    manager = getattr(self.server, "combat_manager", None)
+    if manager is not None and hasattr(manager, "reserve_script_blast"):
+        # Admit or drop the broadcast and the NPC effect together.
+        if not manager.reserve_script_blast(level.name):
+            return
+    from ...protocol.packets import build_fire_spy
+    _schedule(self.server.broadcast_to_level(
+        level.name, build_fire_spy(source.id, (length << 3) | power)))
+    if manager is not None and hasattr(manager, "add_spy_fire"):
+        _schedule(manager.add_spy_fire(level, source, length, power))
+
+
 _COMMANDS = {
     "join": _c_join,
     "callnpc": _c_callnpc,
     "removebomb": _c_removebomb,
     "takeplayerhorse": _c_takeplayerhorse,
     "timershow": _c_timershow,
+    "shootarrow": _c_shootarrow,
     "shootfireball": _c_shootfireball,
     "shootfireblast": _c_shootfireblast,
     "shootnuke": _c_shootnuke,
+    "spyfire": _c_spyfire,
 }

@@ -3,7 +3,7 @@
 import logging
 
 from ..protocol.constants import PLI
-from ..protocol.packets import PacketReader
+from ..protocol.packets import PacketReader, build_item_del
 from .registry import handles
 
 logger = logging.getLogger(__name__)
@@ -22,6 +22,16 @@ class ItemHandlers:
         y = reader.read_gchar() / 2.0
         item_type = reader.read_gchar() if reader.remaining() else 0
 
+        # PlayerClientPackets.cpp:352-354: with `disableitemdropping` the
+        # sender's own item is taken back and nothing is spawned or relayed.
+        # (Its NPC-server refund, :355-356, is not copied: the reference
+        # re-adds an item it never removed there, and pygserver never deducts
+        # the dropped item either.)
+        if getattr(getattr(self.server, 'config', None),
+                   'disableitemdropping', False) is True:
+            await self.send_raw(build_item_del(x, y))
+            return
+
         if hasattr(self.server, 'item_manager'):
             from ..protocol.constants import LevelItemType
             await self.server.item_manager.spawn_item(
@@ -32,27 +42,56 @@ class ItemHandlers:
 
     @handles(PLI.ITEMDEL)
     async def _handle_item_del(self, data: bytes):
-        """Handle PLI_ITEMDEL packet."""
+        """Handle PLI_ITEMDEL packet (PlayerClientPackets.cpp:385-403).
+
+        The reference relays PLO_ITEMDEL to the other players of the level
+        first (:389, sender excluded, whether or not the item is still on the
+        ground), then removes the item at that position (:394) and stops when
+        none is there (:395). A client sends this when its own timer for a
+        level item runs out, so it is routinely late: the removal is silent
+        and a missing item changes nothing.
+        """
         if not self.level:
             return
         reader = PacketReader(data)
         x = reader.read_gchar() / 2.0
         y = reader.read_gchar() / 2.0
 
+        await self.server.broadcast_to_level(
+            self.level.name, build_item_del(x, y), exclude={self.id})
         if hasattr(self.server, 'item_manager'):
-            await self.server.item_manager.remove_item(self.level.name, x, y)
+            self.server.item_manager.remove_item_silently(self.level.name, x, y)
 
     @handles(PLI.ITEMTAKE)
     async def _handle_item_take(self, data: bytes):
-        """Handle PLI_ITEMTAKE packet."""
+        """Handle PLI_ITEMTAKE packet. The reference runs it through the
+        PLI_ITEMDEL handler (PlayerClient.cpp:91): PLO_ITEMDEL goes to the
+        level's other players first, sender excluded, whether or not the take
+        then succeeds (PlayerClientPackets.cpp:385-403); only a take that
+        finds the item grants it (:394-399). The taker is sent nothing: its
+        client removed the item when it sent the take.
+
+        Not in the reference: a take of an item that is still on the ground
+        but that the age, layer or reach test refuses
+        (ItemManager.take_relay_position) is ignored outright, with no relay,
+        so a client cannot hide an item from everyone else while the server
+        keeps it. The relay names the item the take resolved to."""
         if not self.level:
             return
         reader = PacketReader(data)
         x = reader.read_gchar() / 2.0
         y = reader.read_gchar() / 2.0
 
-        if hasattr(self.server, 'item_manager'):
-            await self.server.item_manager.handle_item_take(self, x, y)
+        item_manager = getattr(self.server, 'item_manager', None)
+        if item_manager is not None:
+            position = item_manager.take_relay_position(self, x, y)
+            if position is None:
+                return
+            x, y = position
+        await self.server.broadcast_to_level(
+            self.level.name, build_item_del(x, y), exclude={self.id})
+        if item_manager is not None:
+            await item_manager.handle_item_take(self, x, y)
 
     @handles(PLI.OPENCHEST)
     async def _handle_open_chest(self, data: bytes):

@@ -4,12 +4,17 @@ pygserver.config - Server configuration
 Defines server settings and paths.
 """
 
+import logging
 import os
 import secrets
 import stat
 from dataclasses import dataclass, field
-from typing import List, Dict, Optional
+from typing import List, Dict, Optional, Tuple
 from pathlib import Path
+
+from .protocol.constants import LevelItemType
+
+logger = logging.getLogger(__name__)
 
 
 # serveroptions.txt and foldersconfig.txt travel as raw bytes on the wire
@@ -71,6 +76,63 @@ def atomic_write_text(path, text: str,
         pass
     finally:
         os.close(directory)
+
+
+# Item names as the reference's LevelItem::ItemNames spells them
+# (GServer-v2 LevelItem.h:56-63); an item can also be named by its number
+# (LevelItem.cpp getItemId(string)).
+ITEM_IDS_BY_NAME = {item.name.lower(): int(item)
+                    for item in LevelItemType if item >= 0}
+
+# Server.h:514-515.
+DEFAULT_BUSH_ITEM_TYPES = ("greenrupee", "bluerupee", "heart", "bombs")
+DEFAULT_DEATH_ITEM_TYPES = ("greenrupee", "bluerupee", "redrupee",
+                            "goldrupee", "bombs", "darts")
+# Server.cpp:605-606: greenrupee 25, bluerupee 2, bombs 5, heart 5, rest 0.
+DEFAULT_SPAWN_RATES = {
+    int(LevelItemType.GREENRUPEE): 25, int(LevelItemType.BLUERUPEE): 2,
+    int(LevelItemType.BOMBS): 5, int(LevelItemType.HEART): 5,
+}
+UINT32_MAX = 0xFFFFFFFF
+
+
+def item_id_for_name(name: str) -> int:
+    """Item id for a name or number, -1 when unknown (LevelItem.cpp getItemId)."""
+    name = name.strip().lower()
+    if name in ITEM_IDS_BY_NAME:
+        return ITEM_IDS_BY_NAME[name]
+    if name.isascii() and name.isdigit() and int(name) < len(ITEM_IDS_BY_NAME):
+        return int(name)
+    return -1
+
+
+def _split_item_list(value: str) -> List[str]:
+    """Settings::getList: comma split, empty entries dropped (Settings.h:230-240)."""
+    return [part.strip().lower() for part in value.split(',') if part.strip()]
+
+
+def _uint_setting(key: str, text: str, bits: int = 32) -> int:
+    """Settings::get<uintN_t> (Settings.h:202-221, StringUtils.h:1320-1346).
+
+    A value that is not plain digits reads as 0 and the server carries on: the
+    option is present, so the caller's `value_or(default)` never applies. (The
+    default only comes back when the option is absent.) One warning is logged
+    per bad line. Digits past the type's range clamp to its maximum, as the
+    loader always did for these keys; a leading minus reads as 0.
+    """
+    text = text.strip()
+    if text.isascii() and text.isdigit():
+        return min(int(text), (1 << bits) - 1)
+    if text and not (text[0] == '-' and text[1:].isascii() and text[1:].isdigit()):
+        logger.warning("serveroptions.txt: %s = %r is not a number; reading it as 0",
+                       key, text)
+    return 0
+
+
+def _true_false_or_default(value: str, default: bool) -> bool:
+    """Settings.h:208-216: only the words true/false count; else the default."""
+    word = value.strip().lower()
+    return word == 'true' if word in ('true', 'false') else default
 
 
 @dataclass
@@ -136,14 +198,54 @@ class ServerConfig:
     # get<bool>(...).value_or(false).
     putnpc_enabled: bool = False
 
+    # World file system (Server.cpp:769-786): `nofoldersconfig = true` skips
+    # foldersconfig.txt and makes the `sharefolder` folders public; with the
+    # default `false`, sharefolder is ignored (filesystem.py share_dirs).
+    nofoldersconfig: bool = False
+    sharefolder: List[str] = field(default_factory=list)
+    # PLO_BIGMAP / PLO_MINIMAP text sent at login when it splits into four
+    # comma tokens (PlayerClient.cpp:494-512), kept verbatim here.
+    bigmap: str = ""
+    minimap: str = ""
+    # Classic map text files (Server.cpp:954-970). Parsed only; no adjacency.
+    maps: List[str] = field(default_factory=list)
+
     # Script mode: GServer-v2/server/src/scripting/Script.cpp:430-434;
     # option name from GServer-v2/bin/servers/default/config/serveroptions.txt:305.
     serverside: bool = True
     baddyitems: bool = False
+    # Item drops (Server.h:123-124,514-515; PlayerClient.cpp:1898-1998).
+    # `deathitemtypes` / `bushitemtypes` stay None while the option is absent,
+    # which means the reference default list.
+    dropitemsdead: bool = True
+    mindeathgralats: int = 1
+    maxdeathgralats: int = 50
+    deathitemtypes: Optional[List[str]] = None
+    bushitems: bool = True
+    vasesdrop: bool = True
+    bushitemtypes: Optional[List[str]] = None
+    # `spawnrate<item>` values by the text after `spawnrate`; see
+    # rebuild_bush_drops for when they are read.
+    spawn_rates: Dict[str, int] = field(default_factory=dict)
+    # Server.h:171 enableexbodycolors: widens the colour clamp (protocol/colors.py).
+    enableexbodycolors: bool = False
     # Server.h:172: rejects client Z changes (PlayerProps.cpp:495-500).
     lockplayerz: bool = False
     # Server.h:165: Player::addWeapon(LevelItemType) is a no-op when off.
     defaultweapons: bool = True
+
+    # `servermode` (Server.cpp:196-200): normal, kingdoms or newworld; the last
+    # two announce themselves with PLO 176 / 177 at login (Player.cpp:748-752).
+    servermode: str = "normal"
+    # `generation` (Server.h:509): unset or `modern` sends compiled GS2 client
+    # scripts for level NPCs (PLO_NPCBYTECODE); `classic`/`newmain` never do.
+    generation: str = ""
+    # `default_scriptengine[_client|_server]` (NPCServer.cpp:60-62): the engine
+    # for a script half with no `//#GS1` / `//#GS2` first line. Unset keeps
+    # pygserver's own source-shape detection.
+    default_scriptengine: str = ""
+    default_scriptengine_client: str = ""
+    default_scriptengine_server: str = ""
 
     # Level tileset selection (Server.h:510-511, Server.cpp:1384-1405): which
     # tile-type table collision reads. `newtilesets` flips every level to the
@@ -179,10 +281,72 @@ class ServerConfig:
     # player's gralats (PlayerProps.cpp:1205-1210).
     normaladminscanchangegralats: bool = True
 
+    # Player.cpp:701: `onlystaff` refuses every non-staff login and makes the
+    # list server report HQ level 0 (ServerList.cpp:276,479).
+    onlystaff: bool = False
+    # Server.h:139: client-sent `server.` flag sets and deletes are dropped
+    # (PlayerClientPackets.cpp:665,707).
+    dontaddserverflags: bool = False
+    # Server.h:163: weapons granted at login and kept from client deletion
+    # (PlayerClient.cpp:606, PlayerClientPackets.cpp:883).
+    protectedweapons: List[str] = field(default_factory=list)
+
+    # Server.h:125 / PlayerClientPackets.cpp:352: a client item drop is refused.
+    disableitemdropping: bool = False
+    # Server.h:132 / PlayerClientPackets.cpp:845: client explosions are ignored.
+    noexplosions: bool = False
+    # Server.h:131 / PlayerClientPackets.cpp:1310: relay of client triggeractions
+    # to the rest of the level.
+    sendplayertriggers: bool = True
+    # LevelBaddy.cpp:270,302: seconds a dead baddy stays dead.
+    baddyrespawntime: int = 60
+    # Server.h:134: seconds until a 2x2 board change (a cut bush) is restored
+    # (board_changes.py).
+    respawntime: int = 15
+
     # The serveroptions.txt this config was loaded from; RC option edits are
     # written back here. Empty for an in-memory config, which then persists
     # nothing.
     options_path: str = ""
+
+    def __post_init__(self):
+        self.rebuild_bush_drops(rates_from_options=False)
+
+    # -- item drop tables ------------------------------------------------------
+
+    def rebuild_bush_drops(self, rates_from_options: bool) -> None:
+        """Snapshot the (item id, rate) roll table (Server.cpp:603-621).
+
+        The reference rebuilds it only when `bushitemtypes` is (re)parsed, so a
+        `spawnrate<item>` option changes nothing until then. With the option
+        absent at the first load the table is built from the defaults alone
+        (the callback ran before the options file was read, Settings.h trackOne):
+        callers pass rates_from_options=False for that case.
+        """
+        names = (self.bushitemtypes if self.bushitemtypes is not None
+                 else DEFAULT_BUSH_ITEM_TYPES)
+        table: List[Tuple[int, int]] = []
+        for name in names:
+            name = name.strip().lower()
+            item = item_id_for_name(name)
+            if item < 0:
+                continue
+            rate = DEFAULT_SPAWN_RATES.get(item, 0)
+            if rates_from_options and name in self.spawn_rates:
+                rate = self.spawn_rates[name]
+            table.append((item, rate))
+        self._bush_drops = table
+
+    @property
+    def bush_drops(self) -> List[Tuple[int, int]]:
+        """The bush roll table, in configured order."""
+        return list(self._bush_drops)
+
+    def death_drop_items(self) -> frozenset:
+        """Item ids a dying player may drop (Server.cpp:624-635)."""
+        names = (self.deathitemtypes if self.deathitemtypes is not None
+                 else DEFAULT_DEATH_ITEM_TYPES)
+        return frozenset(i for i in map(item_id_for_name, names) if i >= 0)
 
     @classmethod
     def from_server_dir(cls, server_dir: str) -> 'ServerConfig':
@@ -282,7 +446,10 @@ class ServerConfig:
                         elif key == 'listport':
                             config.listport = int(scalar)
                         elif key == 'staff':
-                            config.staff = [s.strip() for s in value.split(',')]
+                            # Settings.h getList splits with ignoreEmpty = true
+                            # (StringUtils.h:618-650): blank entries never exist.
+                            config.staff = [
+                                s.strip() for s in value.split(',') if s.strip()]
                         elif key == 'noverifylogin':
                             # noverifylogin=true means verify_login=False (don't verify)
                             config.verify_login = scalar.lower() != 'true'
@@ -320,12 +487,53 @@ class ServerConfig:
                                 g.strip() for g in value.split(',') if g.strip()]
                         elif key == 'putnpcenabled':
                             config.putnpc_enabled = scalar.lower() == 'true'
+                        elif key == 'sendplayertriggers':
+                            # Settings.h:208-216: only the words true/false
+                            # count; anything else keeps the default (true).
+                            if scalar.lower() in ('true', 'false'):
+                                config.sendplayertriggers = scalar.lower() == 'true'
+                        elif key == 'baddyrespawntime':
+                            # LevelBaddy.cpp:270,302 reads an unsigned 32-bit value.
+                            config.baddyrespawntime = _uint_setting(key, scalar)
+                        elif key == 'respawntime':
+                            # Server.h:134: board-change respawn, uint16_t.
+                            config.respawntime = _uint_setting(key, scalar, 16)
+                        elif key == 'protectedweapons':
+                            config.protectedweapons = [
+                                w.strip() for w in value.split(',') if w.strip()]
+                        elif key == 'nofoldersconfig':
+                            config.nofoldersconfig = scalar.lower() == 'true'
+                        elif key in ('sharefolder', 'maps'):
+                            setattr(config, key, [
+                                s.strip() for s in value.split(',') if s.strip()])
+                        elif key in ('bigmap', 'minimap'):
+                            setattr(config, key, value)
+                        elif key in ('servermode', 'generation',
+                                     'default_scriptengine',
+                                     'default_scriptengine_client',
+                                     'default_scriptengine_server'):
+                            setattr(config, key, scalar.lower())
+                        elif key in ('dropitemsdead', 'bushitems', 'vasesdrop'):
+                            setattr(config, key, _true_false_or_default(scalar, True))
+                        elif key in ('mindeathgralats', 'maxdeathgralats'):
+                            # uint32_t in the reference (PlayerClient.cpp:1907-8).
+                            setattr(config, key, _uint_setting(key, scalar))
+                        elif key in ('deathitemtypes', 'bushitemtypes'):
+                            setattr(config, key, _split_item_list(scalar))
+                        elif key.startswith('spawnrate') and len(key) > 9:
+                            # A new dict, so a caller that records assignments
+                            # (rc.py) sees the key; read at rebuild_bush_drops.
+                            config.spawn_rates = {
+                                **config.spawn_rates,
+                                key[9:]: _uint_setting(key, scalar)}
                         elif key in (
                             'serverside',
                             'baddyitems',
                             'lockplayerz',
-                            'defaultweapons',
+                            'defaultweapons', 'enableexbodycolors',
                             'normaladminscanchangegralats',
+                            'onlystaff', 'dontaddserverflags',
+                            'disableitemdropping', 'noexplosions',
                             'triggerhack_weapons', 'triggerhack_groups',
                             'triggerhack_guilds', 'triggerhack_rc',
                             'triggerhack_levels', 'triggerhack_props',
@@ -335,6 +543,8 @@ class ServerConfig:
         except FileNotFoundError:
             pass  # Use defaults
 
+        config.rebuild_bush_drops(
+            rates_from_options=config.bushitemtypes is not None)
         return config
 
     # -- gear limits ----------------------------------------------------------
@@ -385,16 +595,37 @@ class ServerConfig:
         ]
         lines += [f"aptime{band} = {seconds}"
                   for band, seconds in enumerate(self.aptime)]
+        if self.servermode and self.servermode != "normal":
+            lines.append(f"servermode = {self.servermode}")
+        for key in ('generation', 'default_scriptengine',
+                    'default_scriptengine_client',
+                    'default_scriptengine_server'):
+            if getattr(self, key):
+                lines.append(f"{key} = {getattr(self, key)}")
         for key in (
             'serverside',
-            'baddyitems',
+            'baddyitems', 'dropitemsdead', 'bushitems', 'vasesdrop',
+            'enableexbodycolors',
             'lockplayerz',
             'defaultweapons',
+            'onlystaff', 'dontaddserverflags',
+            'disableitemdropping', 'noexplosions', 'sendplayertriggers',
             'triggerhack_weapons', 'triggerhack_groups',
             'triggerhack_guilds', 'triggerhack_rc', 'triggerhack_levels',
             'triggerhack_props', 'triggerhack_execscript', 'triggerhack_files',
         ):
             lines.append(f"{key} = {str(getattr(self, key)).lower()}")
+        lines.append(f"baddyrespawntime = {self.baddyrespawntime}")
+        lines.append(f"respawntime = {self.respawntime}")
+        lines.append(f"mindeathgralats = {self.mindeathgralats}")
+        lines.append(f"maxdeathgralats = {self.maxdeathgralats}")
+        for key in ('deathitemtypes', 'bushitemtypes'):
+            if getattr(self, key) is not None:
+                lines.append(f"{key} = {','.join(getattr(self, key))}")
+        lines += [f"spawnrate{name} = {rate}"
+                  for name, rate in self.spawn_rates.items()]
+        if self.protectedweapons:
+            lines.append(f"protectedweapons = {','.join(self.protectedweapons)}")
         return lines
 
     def to_file(self, path: str):

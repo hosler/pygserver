@@ -17,8 +17,12 @@ from reborn_protocol.props import (
     parse_prop_stream,
 )
 
+from types import SimpleNamespace
+
+from pygserver.config import ServerConfig
 from pygserver.level import Level
 from pygserver.npc import NPC
+from pygserver.protocol.colors import bind_server
 from pygserver.protocol.constants import NPCPROP, PLO
 from pygserver.protocol.packets import build_npc_props
 
@@ -31,7 +35,7 @@ _HANDLERS = {pid: (lambda props, value, pid=pid: props.__setitem__(pid, value))
              for pid in NPC_PROPS}
 
 
-def parse_as_client(packet: bytes, colors_len: int = COLORS_NEWWORLD):
+def parse_as_client(packet: bytes, colors_len: int = COLORS_CLASSIC):
     """Decode a PLO_NPCPROPS packet -> (npc_id, props, clean)."""
     assert packet[0] == PLO.NPCPROPS + 32
     assert packet[-1:] == b"\n"
@@ -51,7 +55,7 @@ def prop_id_sequence(packet: bytes):
         prop_id = body[pos] - 32
         ids.append(prop_id)
         _value, pos = decode_value(NPC_PROPS[prop_id], body, pos + 1,
-                                   COLORS_NEWWORLD)
+                                   COLORS_CLASSIC)
     return ids
 
 
@@ -107,7 +111,7 @@ def test_props_are_emitted_in_ascending_id_order():
     assert prop_id_sequence(packet) == sorted(prop_id_sequence(packet))
     assert clean is True
     assert props[NPCPROP.SPRITE] == 2
-    assert props[NPCPROP.COLORS] == [1, 2, 3, 4, 5, 0, 0, 0]
+    assert props[NPCPROP.COLORS] == [1, 2, 3, 4, 5]
 
 
 def test_gattribs_survive_the_stream():
@@ -133,16 +137,21 @@ def test_unknown_prop_id_is_skipped_without_writing_its_id():
     assert props[NPCPROP.GANI] == "idle"
 
 
-def test_colors_are_written_at_the_new_world_width():
-    """Outbound COLORS is 8 wide (see build_player_props' _OUTBOUND_COLORS).
-
-    Recorded rather than asserted as correct: reading the same stream at the
-    classic width of 5 desyncs it, which is the open PLPROP/NPCPROP COLORS
-    width question, not something this test settles.
-    """
+def test_colors_are_written_at_the_servermode_width():
+    """Outbound COLORS is 5 wide unless `servermode = newworld`, then 8
+    (reference PropertySerializers.h:793-796), whatever the client version.
+    Reading a stream at the wrong width desyncs it."""
     npc = make_npc()
-    npc.colors = [1, 2, 3, 4, 5]
+    npc.colors = [1, 2, 3, 4, 5, 6, 7, 8]
     packet = npc.build_props_packet()
 
+    assert parse_as_client(packet, COLORS_CLASSIC)[2] is True
+    assert parse_as_client(packet, COLORS_NEWWORLD)[2] is False
+    assert parse_as_client(packet, COLORS_CLASSIC)[1][NPCPROP.COLORS] == [1, 2, 3, 4, 5]
+
+    server = SimpleNamespace(config=ServerConfig(), server_mode="newworld")
+    bind_server(server)
+    packet = npc.build_props_packet()
     assert parse_as_client(packet, COLORS_NEWWORLD)[2] is True
+    assert parse_as_client(packet, COLORS_NEWWORLD)[1][NPCPROP.COLORS] == [1, 2, 3, 4, 5, 6, 7, 8]
     assert parse_as_client(packet, COLORS_CLASSIC)[2] is False

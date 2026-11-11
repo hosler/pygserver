@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING, Optional, List, Dict, Any
 
 from .attachments import absolute_position
 
+from .protocol.colors import default_colors, overlay_colors
 from .protocol.constants import PLPERM, PLTYPE
 
 if TYPE_CHECKING:
@@ -78,8 +79,10 @@ class Account:
     sword_image: str = "sword1.png"
     shield_image: str = "shield1.png"
 
-    # Colors (skin, coat, sleeve, shoe, belt)
-    colors: List[int] = field(default_factory=lambda: [0, 0, 0, 0, 0])
+    # Colors (skin, coat, sleeve, shoe, belt, then the three new-world slots).
+    # All 8 are stored whatever `servermode` is (Character.h:43); the wire
+    # carries only the first 5 outside newworld (protocol/colors.py).
+    colors: List[int] = field(default_factory=default_colors)
 
     # Stats
     max_hearts: float = 3.0
@@ -239,7 +242,7 @@ class Account:
         account.body_image = data.get('body_image', 'body.png')
         account.sword_image = data.get('sword_image', 'sword1.png')
         account.shield_image = data.get('shield_image', 'shield1.png')
-        account.colors = data.get('colors', [0, 0, 0, 0, 0])
+        account.colors = overlay_colors(data.get('colors', ()))
         account.max_hearts = data.get('max_hearts', 3.0)
         account.hearts = data.get('hearts', 3.0)
         account.rupees = data.get('rupees', 0)
@@ -519,7 +522,7 @@ class AccountManager:
 
     def is_staff(self, account_name: str) -> bool:
         """Check if an account is staff."""
-        return account_name in self._staff
+        return bool(account_name and account_name.strip()) and account_name in self._staff
 
     # =========================================================================
     # Player Integration

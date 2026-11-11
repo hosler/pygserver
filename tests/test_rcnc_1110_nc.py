@@ -180,7 +180,8 @@ def make_npc_nc(levels=None, gmap=None):
     world = SimpleNamespace(get_level=levels.get,
                             get_gmap=lambda name: gmap if gmap and name == gmap.name else None)
     server = SimpleNamespace(config=SimpleNamespace(serverside=True), world=world,
-                             broadcast_to_level=AsyncMock(), get_all_players=lambda: [])
+                             broadcast_to_level=AsyncMock(), broadcast_to_all=AsyncMock(),
+                             get_all_players=lambda: [])
     server.npc_manager = NPCManager(server)
     nc = NCManager(server)
     player = SimpleNamespace(id=7, account_name="editor", send_raw=AsyncMock())
@@ -202,6 +203,7 @@ def test_delete_and_reset_leave_non_database_npcs_alone():
     assert npc.flags == {"seen": "1"}
     session.player.send_raw.assert_not_awaited()
     server.broadcast_to_level.assert_not_awaited()
+    server.broadcast_to_all.assert_not_awaited()
 
 
 def test_nc_added_npc_is_a_database_npc():

@@ -7,7 +7,7 @@ import asyncio
 from unittest.mock import AsyncMock, MagicMock
 
 from reborn_protocol.props import (
-    COLORS_CLASSIC, PLAYER_PROPS, StreamPolicy, parse_prop_stream)
+    COLORS_NEWWORLD, PLAYER_PROPS, StreamPolicy, parse_prop_stream)
 
 from pygserver.protocol.constants import PLO, PLPROP
 from pygserver.protocol.packets import (
@@ -69,7 +69,7 @@ def test_build_player_props_round_trips_through_the_reader():
         PLPROP.TEXTCODEPAGE: 1252,
     }
     body = _body(build_player_props(written), PLO.PLAYERPROPS)
-    # The reader defaults to the classic COLORS width; nothing here writes COLORS.
+    # The reader defaults to the servermode COLORS width; nothing here writes COLORS.
     read = parse_player_props(body)
     assert read[PLPROP.NICKNAME] == "bob"
     assert read[PLPROP.MAXPOWER] == 6
@@ -82,10 +82,12 @@ def test_build_player_props_round_trips_through_the_reader():
     assert read[PLPROP.TEXTCODEPAGE] == 1252
 
 
-def test_build_player_props_writes_colors_at_the_newworld_width():
+def test_build_player_props_writes_colors_at_the_default_mode_width():
+    """Normal mode: 5 bytes (reference PropertySerializers.h:793-796); the
+    8-byte newworld form is covered in test_colors_width.py."""
     body = _body(build_player_props({PLPROP.COLORS: [1, 2, 3]}), PLO.PLAYERPROPS)
-    assert len(body) == 1 + 8
-    assert list(body[1:]) == [1 + 32, 2 + 32, 3 + 32] + [32] * 5
+    assert len(body) == 1 + 5
+    assert list(body[1:]) == [1 + 32, 2 + 32, 3 + 32] + [32] * 2
 
 
 def test_unencodable_prop_does_not_leave_a_bare_id_behind():
@@ -154,22 +156,26 @@ def test_x_and_y_stay_in_half_tiles_for_callers():
     assert (props[PLPROP.X] / 2.0, props[PLPROP.Y] / 2.0) == (30.5, 10.0)
 
 
-def test_colors_width_is_a_reader_argument():
-    """The default is the 8-wide new-world form, matching what this server
-    writes. GServer picks the width from a server-wide new-world mode rather
-    than the client version (PropertyColors::getColorCount), so it cannot be
-    derived from the handshake -- hence a reader argument, not a constant."""
-    data = (_gchar(PLPROP.COLORS) + b"".join(_gchar(i) for i in range(8))
-            + _gchar(PLPROP.CURLEVEL) + _gstring("start.nw"))
+def test_colors_width_defaults_to_the_servermode_and_can_be_pinned():
+    """The default reader width is the server's mode width (5 outside newworld;
+    PropertyColors::getColorCount picks it from the server mode, not the client
+    version). A caller can still pin the other width explicitly."""
+    data5 = (_gchar(PLPROP.COLORS) + b"".join(_gchar(i) for i in range(5))
+             + _gchar(PLPROP.CURLEVEL) + _gstring("start.nw"))
+    data8 = (_gchar(PLPROP.COLORS) + b"".join(_gchar(i) for i in range(8))
+             + _gchar(PLPROP.CURLEVEL) + _gstring("start.nw"))
 
-    props = parse_player_props(data)
-    assert props[PLPROP.COLORS] == list(range(8))
+    props = parse_player_props(data5)
+    assert props[PLPROP.COLORS] == list(range(5))
     assert props[PLPROP.CURLEVEL] == "start.nw"
 
-    # The classic 5-wide reading is still reachable, and misreads this stream's
-    # tail -- which is exactly why the width has to be chosen, not guessed.
+    # The newworld 8-wide reading is reachable by argument, and misreads a
+    # 5-wide stream's tail -- which is why the width has to be chosen.
     assert parse_player_props(
-        data, colors_len=COLORS_CLASSIC).get(PLPROP.CURLEVEL) != "start.nw"
+        data5, colors_len=COLORS_NEWWORLD).get(PLPROP.CURLEVEL) != "start.nw"
+    pinned = parse_player_props(data8, colors_len=COLORS_NEWWORLD)
+    assert pinned[PLPROP.COLORS] == list(range(8))
+    assert pinned[PLPROP.CURLEVEL] == "start.nw"
 
 
 # =============================================================================

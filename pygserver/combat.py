@@ -6,21 +6,21 @@ Based on GServer-v2 combat implementation.
 """
 
 import asyncio
+import contextvars
 import logging
 import math
 import time
+from collections import deque
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Optional, List, Dict, Tuple, Set
 from enum import IntEnum
 
+from . import collision
 from .attachments import absolute_position
 
-from .audience import (
-    BOMB_BLAST_NPCS,
-)
 from .ap_system import kill_penalty
 from .spar_rating import glicko_update
-from .tiletypes import get_tile_type
+from .tiletypes import WALL_TYPES, get_tile_type
 from .protocol.constants import PLO, PLPROP
 from reborn_protocol import PLSTATUS
 from .protocol.packets import (
@@ -158,6 +158,74 @@ class Arrow:
         return self.distance >= self.max_distance
 
 
+# Reference arrow kinds (GServer-v2 LevelArrow.h:41-45). Script arrows that can
+# only come from an NPC (shootarrow, shootfireball, shootfireblast, shootnuke).
+ARROW_NORMAL, ARROW_FIREBALL, ARROW_FIREBLAST, ARROW_NUKE = 1, 2, 3, 4
+# Level::moveArrow (Level.cpp:2750-2819): one 16 px step per 50 ms tick, the
+# arrow is dropped after 2 * 1024 px, and its probe box depends on the facing
+# (up, left, down, right).
+_SCRIPT_ARROW_STEP = 16
+_SCRIPT_ARROW_MAX_PIXELS = 2048
+_SCRIPT_ARROW_BOX = ((3, 0), (32, 0), (3, 32), (32, 0))
+_SCRIPT_ARROW_VECTORS = ((0, -1), (-1, 0), (0, 1), (1, 0))
+# Bounds for what a script or a packet can make the server loop over.
+MAX_SCRIPT_ARROWS_PER_LEVEL = 64   # live script arrows kept per level
+MAX_SCRIPT_ARROWS_TOTAL = 256      # ... and across every level
+MAX_EVENT_NPC_PROBES = 1024        # candidate NPC boxes tested per explosion / arrow step
+MAX_WIRE_RADIUS = 223              # largest value one GCHAR carries without wrapping
+MAX_EXPLOSION_RADIUS = 64          # NPC-side reach: 64 * 2 tiles covers a whole gmap row
+MAX_BLAST_DEPTH = 8                # generations of blast -> `exploded` handler -> blast
+MAX_BLASTS_PER_LEVEL_TICK = 32     # blasts / spy fires a level takes per 50 ms
+BLAST_WINDOW_SECONDS = 0.05
+MAX_FIRESPY_PER_SECOND = 10        # PLI_FIRESPY packets honoured per player
+MAX_WIRE_TILE = 111.5              # largest tile coordinate x*2 fits in one GCHAR
+
+# Blast generation of the code currently running. Tasks inherit it when they are
+# created, so a blast a script schedules from an `exploded` handler is one
+# generation deeper than the blast that raised the event.
+_blast_depth = contextvars.ContextVar("pygserver_blast_depth", default=0)
+
+
+def wire_tile_ok(*values) -> bool:
+    """True when every tile coordinate survives a one-byte x*2 encoding."""
+    return all(isinstance(v, (int, float)) and math.isfinite(v)
+               and 0 <= math.floor(v * 2) <= MAX_WIRE_TILE * 2 for v in values)
+
+
+@dataclass
+class ScriptArrow:
+    """An arrow an NPC script fired, flown server-side like LevelArrow."""
+    id: int
+    level_name: str
+    npc_id: int
+    kind: int
+    x: int  # level-local pixels, the arrow's top-left
+    y: int
+    start_x: int
+    start_y: int
+    direction: int
+
+
+def explosion_event_rects(x: float, y: float, radius: int):
+    """The two arm tests of Level::addExplosion (Level.cpp:2228-2245) in
+    level-local pixels: a 32 px wide column and a 32 px tall row reaching
+    `radius * 32` px either side of the explosion's pixel position."""
+    px, py = collision.tiles_to_pixels(x), collision.tiles_to_pixels(y)
+    reach, span = radius * 32, (1 + 2 * radius) * 32
+    return [(px, py - reach, 32, span), (px - reach, py, span, 32)]
+
+
+def spyfire_event_rect(px: int, py: int, direction: int, length: int):
+    """Level::addSpyFire's NPC test (Level.cpp:2294-2312) for a player whose
+    top-left is at pixel (px, py)."""
+    d = int(direction) & 3
+    sx = px + (8 if d in (0, 2) else (-32 if d == 1 else 48))
+    sy = py + (3 if d in (1, 3) else (-24 if d == 0 else 35))
+    span = (int(length) + 1) * 32
+    return (sx - (span if d == 1 else 0), sy - (span if d == 0 else 0),
+            32 if d in (0, 2) else span, 32 if d in (1, 3) else span)
+
+
 @dataclass
 class Explosion:
     """Represents an explosion effect."""
@@ -193,6 +261,9 @@ class CombatManager:
     - Fire/ice effects
     """
 
+    _clock = staticmethod(time.monotonic)
+    _drop_logged_at = 0.0
+
     def __init__(self, server: 'GameServer'):
         self.server = server
 
@@ -201,6 +272,8 @@ class CombatManager:
         self._held_bombs: Dict[int, Bomb] = {}
         self._arrows: Dict[str, Dict[int, Arrow]] = {}  # level_name -> {arrow_id: Arrow}
         self._throws: List[ThrownObject] = []
+        self._script_arrows: Dict[str, Dict[int, ScriptArrow]] = {}  # NPC-fired
+        self._blast_windows: Dict[str, Tuple[float, int]] = {}
 
         # ID counters
         self._next_bomb_id = 1
@@ -288,6 +361,23 @@ class CombatManager:
                 else:
                     # Move arrow and check collision
                     await self._update_arrow(arrow, level)
+
+        # Arrows fired by NPC scripts; a bad one must not stall the tick.
+        for level_name, arrows in list(self._script_arrows.items()):
+            level = self.server.world.get_level(level_name)
+            # One NPC lookup per level per tick, however many arrows fly there.
+            grid = self._collision_grid(level) if level is not None and arrows else None
+            for arrow in list(arrows.values()):
+                try:
+                    keep = level is not None and await self._update_script_arrow(
+                        arrow, level, grid)
+                except Exception:
+                    logger.exception("script arrow update failed")
+                    keep = False
+                if not keep:
+                    arrows.pop(arrow.id, None)
+            if not arrows:
+                self._script_arrows.pop(level_name, None)
 
         for thrown in list(self._throws):
             if await self._update_throw(thrown):
@@ -480,22 +570,90 @@ class CombatManager:
         # (TClient.cpp:1386). GServer-v2 Level.cpp:682-702 runs NPC effects
         # without sending PLO_BOMBDEL/PLO_EXPLOSION or hurting players.
         crosses = [(bomb.x, bomb.y, 2)]
+        # Level.cpp:688-699: NPCs see one radius-1 blast, or for power 2 one
+        # radius-4 blast at the bomb and at its four diagonal neighbours.
+        event_crosses = [(bomb.x, bomb.y, 1)]
         if bomb.power == 2:
             crosses = [(bomb.x + dx, bomb.y + dy, 2)
                        for dx in (-2, 2) for dy in (-2, 2)]
             crosses.append((bomb.x, bomb.y, 4))
+            event_crosses = [(bomb.x + dx, bomb.y + dy, 4)
+                             for dx in (-2, 2) for dy in (-2, 2)]
+            event_crosses.append((bomb.x, bomb.y, 4))
         await self.blast_level_objects(
             level, bomb.x, bomb.y, crosses[-1][2], bomb.power,
-            bomb.player_id, crosses=crosses)
+            bomb.player_id, crosses=crosses, event_crosses=event_crosses)
+
+    def reserve_script_blast(self, level_name: str) -> bool:
+        """Admit one SCRIPT-originated blast or spy fire (putexplosion, a
+        script arrow's impact, spyfire, or any of these chained from an
+        `exploded` handler). False when its chain is already MAX_BLAST_DEPTH
+        generations deep or the level used up MAX_BLASTS_PER_LEVEL_TICK in the
+        current 50 ms window; the caller then drops BOTH the wire packet and
+        the server-side effect. Player-originated blasts (bomb and explosion
+        packets, timed bombs, client fire-spy) never come through here, so a
+        script flood cannot make a player's blast do nothing."""
+        depth = _blast_depth.get()
+        windows = self.__dict__.setdefault('_blast_windows', {})
+        now = self._clock()
+        start, count = windows.get(level_name, (now, 0))
+        if now - start >= BLAST_WINDOW_SECONDS:
+            start, count = now, 0
+        if depth >= MAX_BLAST_DEPTH or count >= MAX_BLASTS_PER_LEVEL_TICK:
+            windows[level_name] = (start, count)
+            if now - self._drop_logged_at >= 1.0:
+                self._drop_logged_at = now
+                logger.warning("script blast on %s dropped (depth %d, %d this tick)",
+                               level_name, depth, count)
+            return False
+        windows[level_name] = (start, count + 1)
+        return True
+
+    @staticmethod
+    def _enter_blast():
+        """Mark everything run from here as one generation deeper."""
+        return _blast_depth.set(_blast_depth.get() + 1)
+
+    @staticmethod
+    def _exit_blast(token):
+        _blast_depth.reset(token)
 
     async def blast_level_objects(self, level: 'Level', x: float, y: float,
                                   radius: int, power: int, player_id: int = 0,
-                                  *, crosses=None):
-        """Update the board, NPCs and baddies; clients own player damage."""
+                                  *, crosses=None, event_crosses=None,
+                                  script: bool = False, admitted: bool = False):
+        """Update the board, NPCs and baddies; clients own player damage.
+
+        `crosses` are the (x, y, arm radius) cells that break blocks;
+        `event_crosses` are the explosions whose arm rectangles raise
+        `exploded` on NPCs (default: the same list). Non-finite positions
+        are ignored. A `script` blast is first admitted by
+        `reserve_script_blast`, unless the caller already did (`admitted`)
+        so it could drop the wire packet with it; a player's blast is never
+        dropped but still counts as a generation for chains it starts."""
+        if not (isinstance(x, (int, float)) and isinstance(y, (int, float))
+                and math.isfinite(x) and math.isfinite(y)):
+            return
+        if script and not admitted and not self.reserve_script_blast(level.name):
+            return
+        token = self._enter_blast()
+        try:
+            await self._blast_level_objects(
+                level, x, y, radius, power, player_id, crosses, event_crosses)
+        finally:
+            self._exit_blast(token)
+
+    async def _blast_level_objects(self, level, x, y, radius, power, player_id,
+                                   crosses, event_crosses):
         power &= 7
+        # putexplosion's radius is a uint8 (GS1Commands.cpp:1744); this also
+        # bounds the cell loop below.
+        radius = max(0, min(int(radius), MAX_EXPLOSION_RADIUS))
         damage = 2 if power == 3 else 1
         if crosses is None:
             crosses = [(x, y, radius)]
+        if event_crosses is None:
+            event_crosses = crosses
         # FourPlay TServerLevel.cpp:1624: cells step two tiles along each arm.
         # putExplosion (1494) has no wall test; even cells beyond walls exist.
         cells = set()
@@ -510,24 +668,246 @@ class CombatManager:
             await self.server.baddy_manager.handle_explosion(
                 level.name, x, y, radius, damage)
 
-        # GServer-v2 Level.cpp addExplosion: NPC hurtAndPush fires EXPLODED;
-        # keep both NPC damage and the event when the server timer expires.
+        # GServer-v2 Level.cpp:2228-2264 addExplosion: every visible NPC whose
+        # EVENT box meets the vertical or horizontal arm rectangle gets
+        # hurtAndPush(..., EXPLODED, ...) (no player damage, no `washit`);
+        # NPC server only (Level.cpp:2230). The reference queues the event once
+        # per arm hit and once per explosion, so an NPC in the centre cell, or
+        # in two overlapping blasts of one bomb, runs `exploded` twice. Here
+        # it runs once per blast call (deliberate deviation).
+        if not getattr(getattr(self.server, 'config', None), 'serverside', True):
+            return
+        attacker = None
+        if hasattr(self.server, 'get_player'):
+            attacker = self.server.get_player(player_id)
+        rects = []
+        for cx, cy, arm_radius in event_crosses:
+            rects.extend(explosion_event_rects(cx, cy, arm_radius))
+        # Level.cpp:2255-2262: a power-3 blast is a joltbomb.
+        await self._explode_npcs(
+            level, rects, damage,
+            CarryObjectType.JOLTBOMB if power == 3 else CarryObjectType.BOMB,
+            attacker)
+
+    @staticmethod
+    def _coarse_reach(npc):
+        """(left, top, right, bottom) pixel extents the NPC's event or
+        collision box can occupy, from its position and shape alone. Cheap and
+        conservative: a box the exact test accepts is always inside it."""
+        try:
+            px, py = float(npc.x) * 16, float(npc.y) * 16
+        except (TypeError, ValueError, AttributeError, OverflowError):
+            return None
+        shape = getattr(npc, 'shape', None)
+        w = h = 48
+        if shape and len(shape) >= 2:
+            w, h = max(w, int(shape[0])), max(h, int(shape[1]))
+        return px - 1, py - 1, px + w + 1, py + h + 1
+
+    def npcs_in_rects(self, level: 'Level', rects, *, collide: bool = False):
+        """NPCs whose event box (`collide`: collision box, which an invisible
+        or NOBLOCK NPC lacks) meets any of `rects`, level-local pixels,
+        inclusive edges. Searches the level and its gmap neighbours like
+        Level::findIntersectingNPCsForEvent (Level.cpp:3546-3562). A coarse
+        bounding test discards distant NPCs first; only NPCs that pass it count
+        towards MAX_EVENT_NPC_PROBES, so crowds elsewhere on the level never
+        starve the ones near the blast."""
         npc_mgr = getattr(self.server, 'npc_manager', None)
-        if npc_mgr is not None and hasattr(npc_mgr, 'get_npcs_on_level'):
-            attacker = None
-            if hasattr(self.server, 'get_player'):
-                attacker = self.server.get_player(player_id)
-            for npc in self.server.audience.npcs_near(
-                    level, x, y, radius, BOMB_BLAST_NPCS):
+        if npc_mgr is None or not hasattr(npc_mgr, 'get_npcs_on_level'):
+            return []
+        nearby = (npc_mgr.nearby_levels(level)
+                  if hasattr(npc_mgr, 'nearby_levels') else [(level, (0, 0))])
+        box_of = collision.npc_collision_rect if collide else collision.npc_event_rect
+        left = min(r[0] for r in rects)
+        top = min(r[1] for r in rects)
+        right = max(r[0] + r[2] for r in rects)
+        bottom = max(r[1] + r[3] for r in rects)
+        found, probes = [], 0
+        for near, (shift_x, shift_y) in nearby:
+            for npc in npc_mgr.get_npcs_on_level(near):
+                reach = self._coarse_reach(npc)
+                if (reach is None or reach[2] + shift_x < left
+                        or reach[0] + shift_x > right
+                        or reach[3] + shift_y < top or reach[1] + shift_y > bottom):
+                    continue
+                probes += 1
+                if probes > MAX_EVENT_NPC_PROBES:
+                    return found
+                box = box_of(npc)
+                if box is None:
+                    continue
+                box = (box[0] + shift_x, box[1] + shift_y, box[2], box[3])
+                if any(collision.rects_intersect(rect, box) for rect in rects):
+                    found.append(npc)
+        return found
+
+    def _collision_grid(self, level: 'Level'):
+        """Collision boxes of the NPCs around `level` bucketed into 64 px
+        cells, built once per tick for the script arrows flying there. NPCs
+        whose box spans more than 16 cells go to a shared overflow list."""
+        npc_mgr = getattr(self.server, 'npc_manager', None)
+        cells, big = {}, []
+        if npc_mgr is None or not hasattr(npc_mgr, 'get_npcs_on_level'):
+            return cells, big
+        nearby = (npc_mgr.nearby_levels(level)
+                  if hasattr(npc_mgr, 'nearby_levels') else [(level, (0, 0))])
+        for near, (shift_x, shift_y) in nearby:
+            for npc in npc_mgr.get_npcs_on_level(near):
+                box = collision.npc_collision_rect(npc)
+                if box is None:
+                    continue
+                box = (box[0] + shift_x, box[1] + shift_y, box[2], box[3])
+                entry = (npc, box, (shift_x, shift_y), near)
+                x0, x1 = box[0] >> 6, (box[0] + box[2]) >> 6
+                y0, y1 = box[1] >> 6, (box[1] + box[3]) >> 6
+                if (x1 - x0 + 1) * (y1 - y0 + 1) > 16:
+                    big.append(entry)
+                    continue
+                for cx in range(x0, x1 + 1):
+                    for cy in range(y0, y1 + 1):
+                        cells.setdefault((cx, cy), []).append(entry)
+        return cells, big
+
+    def _grid_hits(self, grid, rect):
+        """NPCs in `grid` whose box meets `rect` (at most MAX_EVENT_NPC_PROBES
+        candidates examined). The grid is a snapshot from the start of the
+        tick, and an event handler may have moved, hidden, removed or warped an
+        NPC since, so every candidate is checked again against its LIVE box and
+        level before it counts."""
+        cells, big = grid
+        npc_mgr = getattr(self.server, 'npc_manager', None)
+        lookup = getattr(npc_mgr, 'get_npc', None)
+        x, y, w, h = rect
+        found, seen, probes = [], set(), 0
+        candidates = list(big)
+        for cx in range(x >> 6, ((x + w) >> 6) + 1):
+            for cy in range(y >> 6, ((y + h) >> 6) + 1):
+                candidates.extend(cells.get((cx, cy), ()))
+        for npc, box, (shift_x, shift_y), near in candidates:
+            probes += 1
+            if probes > MAX_EVENT_NPC_PROBES:
+                break
+            if id(npc) in seen or not collision.rects_intersect(rect, box):
+                continue
+            if getattr(npc, 'level', near) is not near:
+                continue
+            if lookup is not None and lookup(getattr(npc, 'id', None)) is not npc:
+                continue
+            live = collision.npc_collision_rect(npc)
+            if live is None or not collision.rects_intersect(
+                    rect, (live[0] + shift_x, live[1] + shift_y, live[2], live[3])):
+                continue
+            seen.add(id(npc))
+            found.append(npc)
+        return found
+
+    async def _explode_npcs(self, level: 'Level', rects, damage: int,
+                            carry_type, attacker):
+        """NPC::hurtAndPush(..., EXPLODED) for every NPC in `rects`; a damage
+        of 0 leaves the NPC's hearts alone and only raises the event."""
+        npc_mgr = getattr(self.server, 'npc_manager', None)
+        for npc in self.npcs_in_rects(level, rects):
+            if damage > 0:
                 npc.hearts = max(0.0, npc.hearts - damage / 2.0)
                 if hasattr(npc, 'mark_dirty'):
                     npc.mark_dirty()
-                if hasattr(npc_mgr, 'on_npc_exploded'):
-                    # Level.cpp:2255-2262: a power-3 blast is a joltbomb.
-                    await npc_mgr.on_npc_exploded(
-                        npc, attacker,
-                        CarryObjectType.JOLTBOMB if power == 3
-                        else CarryObjectType.BOMB)
+            if hasattr(npc_mgr, 'on_npc_exploded'):
+                await npc_mgr.on_npc_exploded(npc, attacker, carry_type)
+
+    async def add_spy_fire(self, level: 'Level', player: 'Player',
+                           length: int, power: int):
+        """The NPC half of Level::addSpyFire (Level.cpp:2268-2320): `exploded`
+        on every visible NPC whose event box meets the strip in front of the
+        player. hurtAndPush only takes hearts from a character NPC that ran
+        enabledamagereactions (NPC.cpp:647,661; NPC.h:454 defaults it off, and
+        pygserver has no such switch), so hearts are left alone here."""
+        if not getattr(getattr(self.server, 'config', None), 'serverside', True):
+            return
+        token = self._enter_blast()
+        try:
+            x, y = absolute_position(player)
+            rect = spyfire_event_rect(
+                collision.tiles_to_pixels(x), collision.tiles_to_pixels(y),
+                getattr(player, 'direction', 2), length)
+            await self._explode_npcs(
+                level, [rect], 0,
+                CarryObjectType.JOLTBOMB if power == 3 else CarryObjectType.BOMB,
+                player)
+        finally:
+            self._exit_blast(token)
+
+    # -- arrows fired by NPC scripts ---------------------------------------
+
+    def spawn_script_arrow(self, level: 'Level', npc, direction: int, kind: int,
+                           x: float, y: float) -> Optional[ScriptArrow]:
+        """Level::addArrow (Level.cpp:1902-1910): register an arrow an NPC
+        script fired from tile position (x, y) so it flies and hits server-side.
+        NPC server only; at most MAX_SCRIPT_ARROWS_PER_LEVEL per level and
+        MAX_SCRIPT_ARROWS_TOTAL overall stay alive. Returns None when the
+        arrow is refused (cap, or a position one byte cannot encode)."""
+        if not getattr(getattr(self.server, 'config', None), 'serverside', True):
+            return None
+        if not wire_tile_ok(x, y):
+            return None
+        arrows = self._script_arrows.setdefault(level.name, {})
+        if (len(arrows) >= MAX_SCRIPT_ARROWS_PER_LEVEL
+                or sum(map(len, self._script_arrows.values()))
+                >= MAX_SCRIPT_ARROWS_TOTAL):
+            return None
+        px, py = collision.tiles_to_pixels(x), collision.tiles_to_pixels(y)
+        arrow = ScriptArrow(
+            id=self._next_arrow_id, level_name=level.name,
+            npc_id=getattr(npc, 'id', 0), kind=kind, x=px, y=py,
+            start_x=px, start_y=py, direction=int(direction) & 3)
+        self._next_arrow_id += 1
+        arrows[arrow.id] = arrow
+        return arrow
+
+    async def _update_script_arrow(self, arrow: ScriptArrow, level: 'Level',
+                                   grid=None) -> bool:
+        """One Level::moveArrow iteration (Level.cpp:2750-2819); False once
+        the arrow is spent. Players are not tested: clients hit themselves
+        from the PLO_ARROWADD the script command broadcast."""
+        step_x, step_y = _SCRIPT_ARROW_VECTORS[arrow.direction]
+        arrow.x += step_x * _SCRIPT_ARROW_STEP
+        arrow.y += step_y * _SCRIPT_ARROW_STEP
+        if (abs(arrow.x - arrow.start_x) > _SCRIPT_ARROW_MAX_PIXELS
+                or abs(arrow.y - arrow.start_y) > _SCRIPT_ARROW_MAX_PIXELS):
+            return False
+
+        width, height = _SCRIPT_ARROW_BOX[arrow.direction]
+        box = (arrow.x, arrow.y, width, height)
+        power = 2 if arrow.kind == ARROW_FIREBALL else 1
+        npc_mgr = getattr(self.server, 'npc_manager', None)
+        hit = False
+        # The firing NPC is skipped (Level.cpp:2796); each other NPC in the box
+        # takes the hit and the arrow is spent (hitWall = true, :2800).
+        if grid is None:
+            grid = self._collision_grid(level)
+        for npc in self._grid_hits(grid, box):
+            if getattr(npc, 'id', None) == arrow.npc_id:
+                continue
+            npc.hearts = max(0.0, npc.hearts - power / 2.0)
+            if hasattr(npc, 'mark_dirty'):
+                npc.mark_dirty()
+            if hasattr(npc_mgr, 'on_npc_wasshot'):
+                await npc_mgr.on_npc_wasshot(npc, 'npc', None)
+            hit = True
+
+        explosive = arrow.kind in (ARROW_FIREBLAST, ARROW_NUKE)
+        if not hit and explosive:
+            # The wall test is the tile one column right of the arrow's own
+            # (Level.cpp:2806-2809, toWholeTilePosition(...).translate(1, 0)).
+            probe = collision.TileProbe(self.server, level)
+            tile_x = collision.pixel_to_tile(arrow.x, probe.origin_px[0]) + 1
+            tile_y = collision.pixel_to_tile(arrow.y, probe.origin_px[1])
+            hit = probe.tile_type(tile_x, tile_y) in WALL_TYPES
+        if hit and explosive:
+            # addExplosion(position, from, radius 1, power 1): Level.cpp:2815-2818.
+            await self.blast_level_objects(
+                level, arrow.x / collision.PIXELS_PER_TILE,
+                arrow.y / collision.PIXELS_PER_TILE, 1, 1, script=True)
+        return not hit
 
     async def _destroy_blast_blocks(self, level: 'Level', cells):
         # FourPlay TServerLevel.cpp:1542: replace only complete matching blocks.
@@ -885,6 +1265,24 @@ class CombatManager:
                 await killer.send_props({PLPROP.ALIGNMENT: killer.ap})
         logger.info(f"  Killed by {killer.nickname}")
 
+    async def handle_status_death(self, player: 'Player'):
+        """The STATUS prop went from not-DEAD to DEAD (PlayerProps.cpp:573-580).
+
+        Counts the death and drops items, unless the player has no id or no
+        level, or stands in a sparring zone. The remaining reference steps
+        (leader handoff, lastDeadTime, PLAYERDIES) are handled by
+        handle_player_death.
+        """
+        level = player.level
+        if not player.id or level is None or level.is_sparring_zone:
+            return
+        # Only counted: the reference queues no DEATHS prop here
+        # (PlayerProps.cpp:578; the case at :573-598 adds none to the result).
+        player.deaths += 1
+        item_manager = getattr(self.server, 'item_manager', None)
+        if item_manager is not None:
+            await item_manager.drop_items_on_death(player)
+
     async def handle_player_death(self, player: 'Player',
                                    killer_id: Optional[int] = None,
                                    damage_type: DamageType = DamageType.OTHER):
@@ -904,9 +1302,8 @@ class CombatManager:
         player.kill_credited = False
         logger.info(f"Player {player.id} ({player.nickname}) died")
 
-        # Update stats
-        player.deaths += 1
-        await player.send_props({PLPROP.DEATHSCOUNT: player.deaths})
+        # The death counter and the item drop belong to the STATUS prop's
+        # transition to DEAD (handle_status_death), not to hearts reaching 0.
 
         if killer_id is not None:
             killer = self.server.get_player(killer_id)
@@ -973,9 +1370,22 @@ class CombatManager:
         """
         if not player.level:
             return
+        # Throttle: each packet probes NPCs along a strip, so a client may not
+        # flood them. Excess packets are dropped without a reply.
+        now = self._clock()
+        recent = getattr(player, '_firespy_times', None)
+        if recent is None:
+            recent = player._firespy_times = deque(maxlen=MAX_FIRESPY_PER_SECOND)
+        if len(recent) == recent.maxlen and now - recent[0] < 1.0:
+            return
+        recent.append(now)
         await self.server.broadcast_to_level(
             player.level.name, build_fire_spy(player.id, length_power),
             exclude={player.id})
+        # Level::addSpyFire (PlayerClientPackets.cpp:322-326): packed byte is
+        # length << 3 | power.
+        await self.add_spy_fire(
+            player.level, player, (length_power >> 3) & 0x1f, length_power & 7)
 
     async def handle_throw_carried(self, player: 'Player', direction: int,
                                     carrysprite: int):
@@ -1301,5 +1711,7 @@ class CombatManager:
         """Clear all combat objects from a level."""
         self._bombs.pop(level_name, None)
         self._arrows.pop(level_name, None)
+        self._script_arrows.pop(level_name, None)
+        self.__dict__.get('_blast_windows', {}).pop(level_name, None)
         self._held_bombs = {pid: bomb for pid, bomb in self._held_bombs.items()
                             if bomb.level_name != level_name}

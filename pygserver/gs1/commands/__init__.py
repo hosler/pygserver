@@ -22,6 +22,37 @@ def _c_savelog2(self, args, npc, player, ctx):
 
 
 _COMMANDS["savelog2"] = _c_savelog2
+
+
+def _map_command(build):
+    """setmap / setminimap imgfile,levelsfile,x,y: PLO_BIGMAP / PLO_MINIMAP to
+    the calling player only, x and y printed with "%f" (GS1Commands.cpp:
+    2614-2652, origin/beta4). The reference rejects any other argument count."""
+    def command(self, args, npc, player, ctx):
+        if len(args) != 4 or player is None or not hasattr(player, "send_raw"):
+            return
+        from reborn_protocol.gs1.values import to_num, to_str
+        from ..execution import _schedule
+        text = ",".join((to_str(args[0]), to_str(args[1]),
+                         f"{float(to_num(args[2])):f}", f"{float(to_num(args[3])):f}"))
+        packet = build(text)
+        if packet:      # empty: refused for a control byte (builders/world.py)
+            _schedule(player.send_raw(packet))
+    return command
+
+
+def _build_bigmap(text):
+    from ...protocol.packets import build_bigmap
+    return build_bigmap(text)
+
+
+def _build_minimap(text):
+    from ...protocol.packets import build_minimap
+    return build_minimap(text)
+
+
+_COMMANDS["setmap"] = _map_command(_build_bigmap)
+_COMMANDS["setminimap"] = _map_command(_build_minimap)
 # Client-side visual / sound / timing commands. pygserver runs GS1 server-side
 # and ships only NPC props (not the script) to clients, so these have no
 # server-authoritative effect and are intentionally ignored. `sleep` is NOT
@@ -37,7 +68,7 @@ _NOOP_COMMANDS = (
     "dontblocklocal", "blockagainlocal",
     # setimgvis is client-only; the server-owned equivalent is changeimgvis.
     "setimgvis", "putleaps",
-    "setbackpal", "setletters", "setmap", "setminimap",
+    "setbackpal", "setletters",
     "showtext", "showtext2", "showstats", "replaceani",
     "setfocus", "centermap", "putcomp", "putnewcomp", "removecompus",
     "setpause", "dontshowtime", "showbomb", "showbow", "showsword", "showani",

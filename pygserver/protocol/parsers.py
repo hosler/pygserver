@@ -4,7 +4,6 @@ import logging
 from dataclasses import replace
 from typing import List, Tuple
 from reborn_protocol.props import (
-    COLORS_NEWWORLD,
     PLAYER_PROPS,
     StreamPolicy,
     Wire,
@@ -14,6 +13,7 @@ from reborn_protocol.props import (
 )
 
 from .packet_codec import PacketReader
+from .colors import clamp_colors, colors_wire_width
 from .constants import (
     PLPROP
 )
@@ -103,6 +103,11 @@ def _store(prop_id: int):
     return lambda props, value: props.__setitem__(prop_id, value)
 
 
+def _store_colors(props, value):
+    """Clamp on read, as PropertyColors::deserialize does (PropertySerializers.h:758)."""
+    props[PLPROP.COLORS] = clamp_colors(value)
+
+
 def _store_half_tiles(prop_id: int):
     """X/Y stay in the raw half-tile units callers already divide by 2."""
     return lambda props, value: props.__setitem__(prop_id, int(value * 2))
@@ -152,7 +157,7 @@ _INBOUND_PROP_HANDLERS = {
     PLPROP.GANI: _store(PLPROP.GANI),
     PLPROP.HEADIMAGE: _store_head_image,
     PLPROP.CURCHAT: _store_chat,
-    PLPROP.COLORS: _store(PLPROP.COLORS),
+    PLPROP.COLORS: _store_colors,
     PLPROP.X: _store_half_tiles(PLPROP.X),
     PLPROP.Y: _store_half_tiles(PLPROP.Y),
     # SPRITE and DIRECTION are the same prop id (17).
@@ -187,7 +192,7 @@ _INBOUND_STREAM = StreamPolicy(table=_CARRY_PLAYER_PROPS, max_prop_id=100,
 
 
 def parse_player_props(data: bytes, start_pos: int = 0,
-                       colors_len: int = COLORS_NEWWORLD) -> dict:
+                       colors_len: Optional[int] = None) -> dict:
     """
     Parse player properties from packet data.
 
@@ -195,11 +200,13 @@ def parse_player_props(data: bytes, start_pos: int = 0,
 
     colors_len is PLPROP_COLORS' wire width, a server-wide mode switch on the
     reference server (PropertyColors::getColorCount -> isNewWorldMode,
-    PropertySerializers.cpp:628-632) rather than anything derivable from the
-    client's version. It defaults to the new-world width so the reader matches
-    build_player_props' 8-byte writes; the classic width stays reachable by
-    passing reborn_protocol.props.COLORS_CLASSIC.
+    PropertySerializers.h:793-796) rather than anything derivable from the
+    client's version. None asks colors_wire_width() for the start-up
+    server mode (8 for newworld, otherwise 5), so the reader always agrees
+    with build_player_props; a caller can pin a width explicitly.
     """
+    if colors_len is None:
+        colors_len = colors_wire_width()
     props, _clean, _pos = parse_prop_stream(
         data, start_pos, _INBOUND_STREAM.with_colors_len(colors_len),
         _INBOUND_PROP_HANDLERS)

@@ -196,32 +196,30 @@ class NCManager:
             logger.info(f"NC {session.player.account_name} deleted NPC {npc_id}")
 
     async def _handle_npc_reset(self, session: NCSession, data: bytes):
-        """Handle NC_NPCRESET - Reset an NPC (PlayerNCPackets.cpp:88).
+        """Handle NC_NPCRESET - Reset an NPC (PlayerNCPackets.cpp:88-111).
 
-        The reference restores a recorded initial state; pygserver records
-        none, so this clears the script-visible state (flags and the NPC-scoped
-        GS1 variables), re-attaches its script and fires `created`.
+        Database NPCs only (:99). The delete goes to every connection on every
+        level (Server.cpp:2329-2341), the NPC returns to the state recorded
+        when it was added and warps back there (NPC::resetToInitialState,
+        NPC.cpp:117-162), then its `created` event runs again (:103). The
+        script source is not reloaded.
         """
         npc_id = PacketReader(data).read_gint3()
 
-        npc = self.server.npc_manager.get_npc(npc_id)
-        # PlayerNCPackets.cpp:99: database NPCs only.
-        if npc is not None and getattr(npc, 'database_npc', False):
-            if npc.level is not None:
-                from .protocol.packets import build_npc_del
-                await self.server.broadcast_to_level(
-                    npc.level.name, build_npc_del(npc.id))
-            npc.flags.clear()
-            npc.gs1_scopes = {"this": {}, "thiso": {}}
-            if npc.gs1_source:
-                self.server.npc_manager.attach_gs1(npc, npc.gs1_source)
-            else:
-                await self.server.npc_manager._trigger_created(npc)
-            npc._script_dirty = True
-            npc.mark_dirty()
-            await self._send_to_ncs(
-                f"NPC script of {npc.name} reset by {session.player.account_name}")
-            logger.info(f"NC {session.player.account_name} reset NPC {npc_id}")
+        manager = self.server.npc_manager
+        npc = manager.get_npc(npc_id)
+        if npc is None or not getattr(npc, 'database_npc', False):
+            return
+        from .protocol.packets import build_npc_del
+        await self.server.broadcast_to_all(build_npc_del(npc.id))
+        await manager.reset_to_initial_state(npc)
+        if npc.gs1_source:
+            manager.attach_gs1(npc, npc.gs1_source)
+        else:
+            await manager._trigger_created(npc)
+        await self._send_to_ncs(
+            f"NPC script of {npc.name} reset by {session.player.account_name}")
+        logger.info(f"NC {session.player.account_name} reset NPC {npc_id}")
 
     async def _handle_npc_script_get(self, session: NCSession, data: bytes):
         """Handle NC_NPCSCRIPTGET - Get NPC script."""
@@ -248,8 +246,11 @@ class NCManager:
         npc = self.server.npc_manager.get_npc(npc_id)
         if npc:
             try:
+                # setScript, then a CREATED event is queued
+                # (PlayerNCPackets.cpp:226-228, origin/beta4); the join
+                # statements in `created` refill the CLASS list.
                 self.server.npc_manager.attach_gs1(
-                    npc, script, raise_errors=True, fire_created=False)
+                    npc, script, raise_errors=True)
             except Exception as error:
                 await self._send_compile_error(session, "NPC", str(error))
                 return
