@@ -213,7 +213,17 @@ class ServerConfig:
     # Script mode: GServer-v2/server/src/scripting/Script.cpp:430-434;
     # option name from GServer-v2/bin/servers/default/config/serveroptions.txt:305.
     serverside: bool = True
+    # Send links / signs to the client even with the NPC server present
+    # (Server.h:154-155, PlayerClient.cpp:1495-1500). A missing key reads
+    # false in the reference; from_file applies that. A bare ServerConfig()
+    # carries the shipped default config's values (serveroptions.txt:325,328).
+    clientsidelinks: bool = True
+    clientsidesigns: bool = True
     baddyitems: bool = False
+    # updateboard2 keeps its change (Server.h:137-138, Level.cpp:1852-1875);
+    # `levelsautosave` additionally saves it to the level file.
+    savelevels: bool = False
+    levelsautosave: bool = False
     # Item drops (Server.h:123-124,514-515; PlayerClient.cpp:1898-1998).
     # `deathitemtypes` / `bushitemtypes` stay None while the option is absent,
     # which means the reference default list.
@@ -409,6 +419,11 @@ class ServerConfig:
         try:
             # The encoding RC_SERVEROPTIONSSET writes the file with.
             with open(path, 'r', encoding=OPTIONS_FILE_ENCODING) as f:
+                # A key absent from a config file reads false
+                # (Server.h:154-155); only a listed key turns it on. Written
+                # through vars() so rc._OptionProbe, which records setattr
+                # calls, does not report these as the probed option.
+                vars(config).update(clientsidelinks=False, clientsidesigns=False)
                 for line in f:
                     line = line.strip()
                     if not line or line.startswith('#'):
@@ -528,6 +543,8 @@ class ServerConfig:
                                 key[9:]: _uint_setting(key, scalar)}
                         elif key in (
                             'serverside',
+                            'clientsidelinks', 'clientsidesigns',
+                            'savelevels', 'levelsautosave',
                             'baddyitems',
                             'lockplayerz',
                             'defaultweapons', 'enableexbodycolors',
@@ -603,7 +620,8 @@ class ServerConfig:
             if getattr(self, key):
                 lines.append(f"{key} = {getattr(self, key)}")
         for key in (
-            'serverside',
+            'serverside', 'clientsidelinks', 'clientsidesigns',
+            'savelevels', 'levelsautosave',
             'baddyitems', 'dropitemsdead', 'bushitems', 'vasesdrop',
             'enableexbodycolors',
             'lockplayerz',

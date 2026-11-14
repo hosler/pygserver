@@ -905,10 +905,17 @@ def test_updateboard_broadcasts_region():
             async def broadcast_to_level(self, name, packet, *a, **k):
                 sent.append(packet)
         level = Level("test.nw")
-        npc = make_npc("if (created) { updateboard 0,0,4,4; }", level)
+        npc = make_npc("if (created) { tiles[1,2] = 77; updateboard 0,0,4,4; }", level)
         run_npc_event(npc, "created", Server(), None)
         await asyncio.sleep(0)
         assert len(sent) == 1 and isinstance(sent[0], bytes)
+        # {GCHAR x y w h} then 16 GSHORT tiles, the written one in row 2, column 1.
+        packet = sent[0]
+        assert [packet[1 + i] - 32 for i in range(4)] == [0, 0, 4, 4]
+        encoded = packet[5:5 + 32]
+        tiles = [((encoded[i] - 32) << 7) + encoded[i + 1] - 32
+                 for i in range(0, 32, 2)]
+        assert tiles[2 * 4 + 1] == 77
 
     asyncio.run(main())
 

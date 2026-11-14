@@ -6,6 +6,7 @@ import time
 from reborn_protocol import PLSTATUS
 
 from ..attachments import absolute_position, set_attachment
+from ..link_sign_touch import run_touches, touches_for_props
 from ..protocol.colors import normalize_colors
 from ..protocol.constants import PLI, PLPROP
 from ..protocol.packets import (
@@ -93,6 +94,9 @@ class MovementHandlers:
 
         # Capture the last absolute position before replacing any wire axes.
         absolute_position(self)
+        # Server-side sign and link tests read the state before this packet
+        # is applied (PlayerProps.cpp:466-546, 1080-1115).
+        touches = touches_for_props(self, props) if self.level else []
         if PLPROP.ATTACHNPC in props:
             kind, npc_id = props[PLPROP.ATTACHNPC]
             if npc_id <= 0 or kind == 0:
@@ -292,7 +296,12 @@ class MovementHandlers:
                     self.id, {PLPROP.NICKNAME: self.nickname}),
                 exclude={self.id})
 
-        if self.level:
+        touch_taken = False
+        if self.level and touches:
+            # testForTouch: signs, then links, before the NPC touch
+            # (PlayerClient.cpp:1775-1790).
+            touch_taken = await run_touches(self, touches)
+        if self.level and not touch_taken:
             # Fire GS1 playertouchsme for NPCs the player has walked onto
             if getattr(self.server, 'npc_manager', None):
                 await self.server.npc_manager.check_touches(self)
@@ -328,8 +337,8 @@ class MovementHandlers:
         its cached mod time first (PlayerClientPackets.cpp:994-1016). The
         answer is the full static block with the visited rule; the request
         records nothing, the player stays put and no dynamic data goes out.
-        Links and signs follow the reference's NPC-server rule
-        (PlayerClient.cpp:1495-1500), as nothing here is an entry."""
+        Links and signs follow the same withholding rule as an entry
+        (PlayerClient.cpp:1495-1500)."""
         reader = PacketReader(data)
         cached_time = reader.read_gint5()
         level_name = reader.remaining().decode('latin-1', errors='replace')
@@ -339,7 +348,4 @@ class MovementHandlers:
         if not level:
             logger.debug(f"Adjacent level not served: {level_name}")
             return
-        config = self.server.config
-        await self.send_static_level_data(
-            level, cached_time,
-            links_and_signs=not getattr(config, 'serverside', True))
+        await self.send_static_level_data(level, cached_time)

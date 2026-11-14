@@ -282,6 +282,7 @@ class World:
         level._tiles = replacement._tiles
         level._base_tiles = replacement._base_tiles
         level.clear_board_changes()           # Level.cpp:656
+        level.clear_script_tiles()            # Level.cpp:657-658
         level._links = replacement._links
         level._signs = replacement._signs
         level._chests = replacement._chests

@@ -88,6 +88,8 @@ class Level:
         # then the change list, a respawn restores from it, the bush/vase drop
         # roll reads it and a save writes it. See board_changes.py.
         self._base_tiles = bytearray(self.BOARD_SIZE)
+        # GS1 script tile layer (write_script_tile); None until a script writes.
+        self._script_tiles: Optional[bytearray] = None
         self._board_changes = BoardChangeList()
         self.board_layers: Dict[int, bytearray] = {}
 
@@ -489,13 +491,13 @@ class Level:
         a respawn nor a joiner's replay brings the client's tile back. Client
         board edits go through alter_board instead.
 
-        Two script writers use this as it stands. GS1 `board[i] = n` writes the
-        level's own tile array in the reference too (GS1Variables.cpp:41-59,
-        through SubLevel::getTiles): no board change, no packet, so a client
-        that already holds the board keeps its copy and a first-time entrant
-        gets the new tile. GS1 `tiles[x,y] = n` goes through record_tile_write
-        below; a bomb blast is a client board edit in the reference and goes
-        through alter_board (combat.py)."""
+        GS1 `board[i] = n` uses this as it stands. It writes the level's own
+        tile array in the reference too (GS1Variables.cpp:41-59, through
+        SubLevel::getTiles): no board change, no packet, so a client that
+        already holds the board keeps its copy and a first-time entrant gets
+        the new tile. GS1 `tiles[x,y] = n` writes the script layer instead
+        (write_script_tile); a bomb blast is a client board edit in the
+        reference and goes through alter_board (combat.py)."""
         if in_level_bounds(x, y):
             idx = level_index(x, y) * 2
             for board in (self._tiles, self._base_tiles):
@@ -503,20 +505,45 @@ class Level:
                 board[idx + 1] = (tile_id >> 8) & 0xFF
             self._board_changes.patch_cell(level_index(x, y), tile_id & 0xFFFF)
 
-    def record_tile_write(self, x: int, y: int, tile_id: int, now: float,
-                          corrections: Optional[List[BoardChange]] = None
-                          ) -> Optional[BoardChange]:
-        """A script tile write that stays: set_tile plus a 1x1 board change that
-        does not respawn, so a player who enters later, or comes back, is
-        replayed the tile. The reference turns a script tile edit into a board
-        change in Level::applyBoardChangeFromScriptTiles -> alterBoard
-        (Level.cpp:1751-1799); the permanent variant is `updateboard2`, which
-        passes forceRespawn=false, allowRespawn=false (Level.cpp:1858-1862).
-        The reference only does that on `updateboard`; pygserver's `tiles[]`
-        write is immediate, so the change is recorded at the write."""
-        self.set_tile(x, y, tile_id)
-        return self.alter_board(x, y, 1, 1, [tile_id & 0xFFFF], now, 0,
-                                allow_respawn=False, corrections=corrections)
+    # -- the GS1 script tile layer ---------------------------------------------
+    #
+    # `tiles[x,y] = n` writes only a script-side copy of the board
+    # (Level::getMapTileForEditing, Level.cpp:3135-3153): nothing is sent and
+    # nothing is recorded until `updateboard` (applyBoardChangeFromScriptTiles,
+    # Level.cpp:1751-1799). The copy starts as the level's file tiles, is
+    # invisible to `tiles[]` reads (they read the live board) and to entrants
+    # (the board packet), and is dropped when the level reloads (Level.cpp:
+    # 657-658).
+
+    def write_script_tile(self, x: int, y: int, tile_id: int) -> None:
+        """One `tiles[x,y] = n` write into the script layer."""
+        if not in_level_bounds(x, y):
+            return
+        if self._script_tiles is None:
+            self._script_tiles = bytearray(self._base_tiles)
+        idx = level_index(x, y) * 2
+        self._script_tiles[idx] = tile_id & 0xFF
+        self._script_tiles[idx + 1] = (tile_id >> 8) & 0xFF
+
+    def script_tiles_rect(self, x: int, y: int, width: int,
+                          height: int) -> List[int]:
+        """The tiles `updateboard` publishes for a rectangle inside this
+        level: the script layer's, or tile 0 everywhere when no script ever
+        wrote to this level (Level.cpp:1765-1770 skips such a part, leaving
+        its share of the array at 0)."""
+        if self._script_tiles is None:
+            return [0] * (width * height)
+        tiles = []
+        for dy in range(height):
+            for dx in range(width):
+                idx = level_index(x + dx, y + dy) * 2
+                tiles.append(self._script_tiles[idx]
+                             | (self._script_tiles[idx + 1] << 8))
+        return tiles
+
+    def clear_script_tiles(self) -> None:
+        """Level reload drops the script layer (Level.cpp:657-658)."""
+        self._script_tiles = None
 
     # -- board changes (board_changes.py) --------------------------------------
 

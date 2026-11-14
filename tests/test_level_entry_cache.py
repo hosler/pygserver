@@ -769,20 +769,149 @@ def run_gs1(server, level, code):
     run(main())
 
 
-def test_f_a_gs1_tiles_write_while_away_is_replayed_on_return(tmp_path, clock):
-    """GS1 `tiles[x,y] = n` becomes a board change (Level.cpp:1751-1799,
-    applyBoardChangeFromScriptTiles -> alterBoard), replayed on entry
-    (Level.cpp:518-529). Mutation: making Level.record_tile_write a plain
-    set_tile (no alter_board) loses the tile for the returning player."""
-    old = {}
+def modify_tiles(player):
+    """The tile of every board-modify packet in `player`'s send log, in order
+    (PLO_BOARDMODIFY / BOARDMODIFY2 end with the GSHORT tiles of a 1x1)."""
+    out = []
+    for packet_id, body in sent(player):
+        if packet_id in BOARD_MODIFY_IDS:
+            reader = PacketReader(body)
+            if packet_id == PLO.BOARDMODIFY2:
+                reader.read_gchar(), reader.read_gchar()
+            reader.read_gchar(), reader.read_gchar(), reader.read_gchar(), reader.read_gchar()
+            out.append(reader.read_gshort())
+    return out
+
+
+def test_f_a_gs1_tiles_write_alone_is_never_seen_or_recorded(tmp_path, clock):
+    """GS1 `tiles[x,y] = n` only fills a script copy (GS1Variables.cpp:
+    416-442, Level.cpp:3135-3153): nothing is sent to anyone present, nothing
+    is recorded, and a player returning later is replayed nothing. Mutation:
+    sending from the setter, or recording through alter_board there (the
+    old Level.record_tile_write), fails."""
+    seen = {}
 
     def write(server, level):
-        old["tile"] = level.get_tile(5, 5)
-        run_gs1(server, level, "if (created) { tiles[5,5] = %d; }" % ((old["tile"] + 7) & 0xFFF))
+        other = loaded_player(server, 4)
+        run(other.warp("a.nw", 30, 30))
+        other.send_raw.reset_mock()
+        seen["other"] = other
+        seen["old"] = level.get_tile(5, 5)
+        run_gs1(server, level, "if (created) { tiles[5,5] = %d; }" % ((seen["old"] + 7) & 0xFFF))
 
     got, level = return_after_write(tmp_path, clock, write)
+    assert not any(i in BOARD_MODIFY_IDS for i in got), got
+    assert modify_tiles(seen["other"]) == []
+    assert level.board_changes == [] and level.get_tile(5, 5) == seen["old"]
+
+
+def test_f_a_gs1_updateboard_sends_records_and_replays_while_live(tmp_path, clock):
+    """`updateboard` publishes the script tiles as a board change
+    (Level::updateBoard, Level.cpp:1847-1850 -> alterBoard :1668-1749): sent
+    to the players present, recorded, and replayed to a returning visited
+    player while it is live. Mutation: no alter_board in the flush (nothing
+    recorded) or no send fails."""
+    seen = {}
+
+    def write(server, level):
+        other = loaded_player(server, 4)
+        run(other.warp("a.nw", 30, 30))
+        other.send_raw.reset_mock()
+        seen["other"] = other
+        seen["old"] = level.get_tile(5, 5)
+        seen["new"] = (seen["old"] + 7) & 0xFFF
+        run_gs1(server, level, "if (created) { tiles[5,5] = %d; updateboard 5,5,1,1; }" % seen["new"])
+
+    got, level = return_after_write(tmp_path, clock, write)
+    assert modify_tiles(seen["other"]) == [seen["new"]]
+    assert [(c.x, c.y, c.tiles, c.old_tiles) for c in level.board_changes] == [
+        (5, 5, [seen["new"]], [seen["old"]])]
     assert any(i in BOARD_MODIFY_IDS for i in got), got
-    assert [(c.x, c.y, c.tiles) for c in level.board_changes] == [(5, 5, [(old["tile"] + 7) & 0xFFF])]
+
+
+def test_f_a_gs1_updateboard_change_is_gone_after_it_reverted(tmp_path, clock):
+    """The change reverts after `respawntime` (LevelBoardChange.cpp:39-49,
+    scripting-gs1-commands.md:3234-3248): the swap is sent to the players on
+    the level, and the entry stays in the list holding the old tiles, so a
+    player returning after that is replayed the OLD tile, not the new one.
+    Mutations: a permanent change (allow_respawn False) replays the new tile;
+    an expiry that does not send leaves `other` without the revert."""
+    server = two_levels(tmp_path)
+    player = loaded_player(server)
+    run(player.warp("a.nw", 30, 30))
+    level = server.world.get_level("a.nw")
+    clock.now = 5010.0
+    run(player.warp("b.nw", 30, 30))
+    other = loaded_player(server, 4)
+    run(other.warp("a.nw", 30, 30))
+    old = level.get_tile(5, 5)
+    new = (old + 7) & 0xFFF
+    run_gs1(server, level, "if (created) { tiles[5,5] = %d; updateboard 5,5,1,1; }" % new)
+    other.send_raw.reset_mock()
+    change = level.board_changes[0]
+    assert run(server.board_changes.tick(change.expires_at + 1)) == 1
+    assert modify_tiles(other) == [old]
+    assert [c.tiles for c in level.board_changes] == [[old]]
+    assert level.get_tile(5, 5) == old
+    player.send_raw.reset_mock()
+    clock.now = 5020.0
+    run(player._handle_level_warp(warp_plain(30, 30, "a.nw")))
+    assert modify_tiles(player) == [old]
+
+
+def test_f_a_gs1_updateboard_on_a_gmap_goes_to_the_3x3_as_boardmodify2(tmp_path, clock):
+    """On a gmap the change is PLO_BOARDMODIFY2 {mapX}{mapY}... to the players
+    in the 3x3 around the segment (LevelBoardChange.cpp:57-58 ->
+    Server.cpp:2390-2414). Mutation: sending to the segment only leaves the
+    neighbour without the packet."""
+    server = gmap_world(tmp_path)
+    near, far = loaded_player(server, 2), loaded_player(server, 3)
+    run(near.warp("c1.nw", 30, 30))
+    run(far.warp("a.nw", 30, 30))
+    level = server.world.get_level("c0.nw")
+    near.send_raw.reset_mock()
+    far.send_raw.reset_mock()
+    run_gs1(server, level, "if (created) { tiles[5,5] = 321; updateboard 5,5,1,1; }")
+    packets = [(i, b) for i, b in sent(near) if i == PLO.BOARDMODIFY2]
+    assert len(packets) == 1
+    reader = PacketReader(packets[0][1])
+    assert [reader.read_gchar() for _ in range(6)] == [0, 0, 5, 5, 1, 1]
+    assert reader.read_gshort() == 321
+    assert [i for i, _ in sent(far) if i in BOARD_MODIFY_IDS] == []
+
+
+def test_f_a_reload_drops_the_script_layer(tmp_path, clock):
+    """Level::reload clears the script tiles (Level.cpp:657-658). Mutation:
+    removing level.clear_script_tiles() from World.reload_level fails."""
+    server = two_levels(tmp_path)
+    level = server.world.get_level("a.nw")
+    run_gs1(server, level, "if (created) { tiles[5,5] = 321; }")
+    assert level.script_tiles_rect(5, 5, 1, 1) == [321]
+    run(server.world.reload_level("a.nw"))
+    assert level.script_tiles_rect(5, 5, 1, 1) == [0]
+
+
+@pytest.mark.parametrize("savelevels,permanent", [(False, False), (True, True)])
+def test_f_a_gs1_updateboard2_is_updateboard_unless_savelevels(tmp_path, clock, savelevels, permanent):
+    """Level.cpp:1852-1875: with `savelevels` off updateboard2 is exactly
+    updateboard (it reverts); with it on the change does not respawn.
+    Mutation: ignoring `savelevels` fails one row either way."""
+    server = two_levels(tmp_path, savelevels=savelevels)
+    level = server.world.get_level("a.nw")
+    run_gs1(server, level, "if (created) { tiles[5,5] = 321; updateboard2 5,5,1,1; }")
+    change = level.board_changes[0]
+    assert (change.expires_at is None) is permanent
+    assert (change.old_tiles is None) is permanent
+
+
+def test_f_a_gs1_updateboard2_with_levelsautosave_saves_the_level_file(tmp_path, clock):
+    """`savelevels` and `levelsautosave` together keep the tiles in the level
+    file (Level.cpp:1858-1873). Mutation: not saving leaves the file tile."""
+    server = two_levels(tmp_path, savelevels=True, levelsautosave=True)
+    level = server.world.get_level("a.nw")
+    run_gs1(server, level, "if (created) { tiles[5,5] = 321; updateboard2 5,5,1,1; }")
+    assert Level.load(str(tmp_path / "a.nw")).get_tile(5, 5) == 321
+    assert level.get_base_tile(5, 5) == 321
 
 
 def test_f_a_gs1_board_write_matches_the_reference_array_write(tmp_path, clock):

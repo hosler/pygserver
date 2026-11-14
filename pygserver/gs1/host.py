@@ -397,53 +397,52 @@ class GS1Host(Host):
         return level, x, y
 
     def _write_tile(self, level, x, y, tile):
-        """GS1 tiles[x,y] = n: the write becomes a board change that later
-        entrants are replayed (Level.record_tile_write, Level.cpp:1751-1799),
-        sent to the level (and on a grid map the segments around it)."""
-        manager = getattr(self.server, "board_changes", None)
-        if (self.server is None or manager is None
-                or not hasattr(level, "record_tile_write")):
-            level.set_tile(x, y, tile)
-            self._broadcast_tiles(level, x, y, 1, 1)
+        """GS1 tiles[x,y] = n: only the level's script tile layer changes.
+        Nothing is sent and nothing is recorded until `updateboard`
+        (Level::getMapTileForEditing, Level.cpp:3135-3153; GS1Variables.cpp:
+        416-442)."""
+        if hasattr(level, "write_script_tile"):
+            level.write_script_tile(x, y, tile)
+
+    def _publish_board_area(self, level, x, y, width, height, tiles,
+                            allow_respawn=True):
+        """`updateboard x,y,w,h`: publish `tiles` (row-major, from the script
+        layer) as a board change that reverts after `respawntime` seconds
+        and send it to the level, on a grid map to the 3x3 around it
+        (Level::applyBoardChangeFromScriptTiles -> alterBoard with
+        forceRespawn, Level.cpp:1751-1799, :1668-1749; LevelBoardChange.cpp:
+        51-62). `allow_respawn` False is the permanent `updateboard2`."""
+        if self.server is None or not hasattr(level, "alter_board"):
             return
         from ..board_changes import respawn_context
-        now, _ = respawn_context(self.server)
+        now, respawn_seconds = respawn_context(self.server)
         corrections = []
-        change = level.record_tile_write(x, y, tile, now, corrections)
+        change = level.alter_board(
+            x, y, width, height, tiles, now, respawn_seconds,
+            allow_respawn=allow_respawn, force_respawn=allow_respawn,
+            corrections=corrections)
         if change is None:
             return
-        for sent in [change] + corrections:
-            _schedule(manager.send_to_level(level, sent))
-
-    def _broadcast_tiles(self, level, x, y, width, height):
-        if self.server is None or not hasattr(level, "_tiles"):
+        manager = getattr(self.server, "board_changes", None)
+        if manager is not None:
+            for sent in [change] + corrections:
+                _schedule(manager.send_to_level(level, sent))
             return
-        from ..protocol.packets import PacketBuilder
-        tiles = PacketBuilder()
-        for row in range(y, y + height):
-            for column in range(x, x + width):
-                tiles.write_gshort(level.get_tile(column, row))
-        try:
-            from ..protocol.packets import build_board_modify, build_board_modify2
-            world = getattr(self.server, "world", None)
-            gmap_info = (
-                world.get_gmap_for_level(level.name)
-                if world and hasattr(world, "get_gmap_for_level")
-                else None
-            )
-            if gmap_info:
-                _, map_x, map_y = gmap_info
-                packet = build_board_modify2(
-                    map_x, map_y, x, y, width, height, tiles.build()
-                )
-            else:
-                packet = build_board_modify(
-                    x, y, width, height, tiles.build()
-                )
-            _schedule(self.server.broadcast_to_level(
-                level.name, packet))
-        except Exception:
-            logger.debug("tiles assignment broadcast failed", exc_info=True)
+        from ..protocol.packets import (
+            PacketBuilder, build_board_modify, build_board_modify2)
+        payload = PacketBuilder()
+        for tile in tiles:
+            payload.write_gshort(tile)
+        world = getattr(self.server, "world", None)
+        gmap_info = (world.get_gmap_for_level(level.name)
+                     if world and hasattr(world, "get_gmap_for_level") else None)
+        if gmap_info:
+            _, map_x, map_y = gmap_info
+            packet = build_board_modify2(map_x, map_y, x, y, width, height,
+                                         payload.build())
+        else:
+            packet = build_board_modify(x, y, width, height, payload.build())
+        _schedule(self.server.broadcast_to_level(level.name, packet))
 
     # -- commands ----------------------------------------------------------
     def call_command(self, name, args, ctx) -> None:

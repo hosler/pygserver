@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 from . import level_cache
 from .attachments import absolute_position, clear_attachment
+from .link_sign_touch import level_data_has_links, level_data_has_signs
 from .protocol.constants import PLPROP
 from .protocol.packets import (
     build_board_layer_raw,
@@ -413,8 +414,7 @@ class LevelTransitions:
             out += raw_packet(build_board_layer_raw(layer, bytes(tiles)))
         return bytes(out)
 
-    async def send_static_level_data(self, level, cached_time: Optional[int], *,
-                                     links_and_signs: bool = True):
+    async def send_static_level_data(self, level, cached_time: Optional[int]):
         """sendStaticLevelData (PlayerClient.cpp:1446-1522).
 
         The board goes out unless the player has left this level before AND
@@ -436,15 +436,16 @@ class LevelTransitions:
         if not visited or cached_time < level_mod_time:
             out += self.board_bytes(level)
             sent_board = True
-            if links_and_signs:
-                # Sent with the board whatever the `serverside` option: the
-                # reference leaves links and signs to its NPC server
-                # (:1495-1500), which pygserver does not model for links.
+            # Withheld only with the NPC server present and the matching
+            # clientside option off (:1495-1500; link_sign_touch).
+            config = getattr(self.server, 'config', None)
+            if level_data_has_links(config):
                 for link in level.get_links():
                     out += build_level_link(
                         link['dest_level'], link['x'], link['y'],
                         link['width'], link['height'],
                         link['dest_x'], link['dest_y'])
+            if level_data_has_signs(config):
                 for (sx, sy), text in level.get_signs().items():
                     out += build_level_sign(sx, sy, text)
         item_manager = getattr(self.server, 'item_manager', None)

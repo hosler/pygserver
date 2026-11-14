@@ -93,7 +93,7 @@ def test_set_tile_stays_permanent_for_scripts_and_combat(board):
 
 
 def test_set_tile_under_a_pending_cut_survives_the_respawn(board):
-    """A server write (GS1 tiles[], blast blocks) under a pending cut: the
+    """A server write (GS1 board[], blast blocks) under a pending cut: the
     live board, joiners, the respawn and the save all show the server's tile
     (Level.set_tile patches the entries over the cell)."""
     rig, player, clock = board
@@ -350,7 +350,7 @@ def test_a_save_after_a_respawn_holds_the_base(board):
 
 
 def test_server_side_tile_writes_are_saved(board):
-    """set_tile (GS1 tiles[]/board[] at gs1/host.py, combat block blasts)
+    """set_tile (GS1 board[] at gs1/host.py, combat block blasts)
     writes the base, so it survives a save, also under a pending cut."""
     rig, player, clock = board
     cut(rig, player, 10, 20)

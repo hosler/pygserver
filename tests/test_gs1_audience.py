@@ -13,6 +13,8 @@ Uses real Level/Audience instances against a small FakeServer, per the
 test_gs1_hit_events.py idiom.
 """
 import asyncio
+
+import pytest
 from unittest.mock import AsyncMock
 
 from pygserver.gs1_host import (
@@ -304,52 +306,157 @@ def test_board_out_of_range_index_is_zero():
     assert npc.gs1_scopes["this"]["t"] == 0.0
 
 
-def test_updateboard_sends_the_requested_rows():
-    """The region slice is level_index()-based; a 2x2 at (3, 2) must carry the
-    four tiles written there, not some other row."""
+def decode_modify(packet):
+    """(x, y, w, h, tiles) of a PLO_BOARDMODIFY, hand-decoded from the
+    reference GCHAR/GSHORT layout without a client codec."""
+    x, y, w, h = (packet[1 + i] - 32 for i in range(4))
+    encoded = packet[5:5 + 2 * w * h]
+    tiles = [((encoded[i] - 32) << 7) + encoded[i + 1] - 32
+             for i in range(0, len(encoded), 2)]
+    return x, y, w, h, tiles
+
+
+def test_updateboard_sends_the_script_tiles_of_the_requested_rows():
+    """The region is the script layer's, level_index()-based: a 2x2 at (3, 2)
+    carries the four tiles the script wrote there (Level.cpp:1751-1799).
+    Mutation: reading the live board instead (the old model) sends zeros."""
     async def main():
         server = FakeServer()
         level = server.add_level("t.nw")
-        for x, y, tile in ((3, 2, 10), (4, 2, 11), (3, 3, 12), (4, 3, 13)):
-            level.set_tile(x, y, tile)
-        npc = make_npc("if (created) { updateboard 3,2,2,2; }", level)
+        npc = make_npc("if (created) { tiles[3,2] = 10; tiles[4,2] = 11;"
+                       " tiles[3,3] = 12; tiles[4,3] = 13; updateboard 3,2,2,2; }", level)
         run_npc_event(npc, "created", server, None)
         await asyncio.sleep(0)
-        return server.broadcasts
+        return server.broadcasts, level
 
-    broadcasts = asyncio.run(main())
+    broadcasts, level = asyncio.run(main())
     assert len(broadcasts) == 1
-    packet = broadcasts[0][1]
-    # Hand-decode the reference GSHORT layout without using a client codec.
-    encoded = packet[5:13]
-    tiles = [((encoded[i] - 32) << 7) + encoded[i + 1] - 32
-             for i in range(0, len(encoded), 2)]
-    assert tiles == [10, 11, 12, 13]
+    assert decode_modify(broadcasts[0][1]) == (3, 2, 2, 2, [10, 11, 12, 13])
+    assert [(c.x, c.y, c.width, c.height) for c in level.board_changes] == [(3, 2, 2, 2)]
 
 
-def test_tiles_assignment_broadcasts_a_gshort_tile():
+def test_a_tiles_assignment_alone_sends_nothing_and_records_nothing():
+    """GS1Variables.cpp:416-442 writes only the script copy: tiles written
+    but never flushed are never seen by anyone. Mutation: broadcasting from
+    the setter (the old behaviour) fails."""
     async def main():
         server = FakeServer()
         level = server.add_level("t.nw")
         npc = make_npc("if (created) { tiles[12,12] = 314; }", level)
         run_npc_event(npc, "created", server, None)
         await asyncio.sleep(0)
-        return server.broadcasts[0][1]
+        return server.broadcasts, level
 
-    packet = asyncio.run(main())
-    encoded = packet[5:7]
-    tile_id = ((encoded[0] - 32) << 7) + encoded[1] - 32
-    assert tile_id == 314
+    broadcasts, level = asyncio.run(main())
+    assert broadcasts == []
+    assert level.board_changes == [] and level.get_tile(12, 12) == 0
+
+
+def test_updateboard_over_an_area_no_script_wrote_publishes_tile_zero():
+    """Level.cpp:1765-1770: a level with no script layer leaves its part of
+    the array at 0, which alterBoard then sends. Mutation: publishing the
+    live board's tiles fails."""
+    async def main():
+        server = FakeServer()
+        level = server.add_level("t.nw")
+        level.set_tile(3, 2, 10)
+        npc = make_npc("if (created) { updateboard 3,2,1,1; }", level)
+        run_npc_event(npc, "created", server, None)
+        await asyncio.sleep(0)
+        return server.broadcasts
+
+    broadcasts = asyncio.run(main())
+    assert decode_modify(broadcasts[0][1]) == (3, 2, 1, 1, [0])
+
+
+@pytest.mark.parametrize("code", ["updateboard 1,2,3;", "updateboard 1,2,3,4,5;"])
+def test_updateboard_needs_exactly_four_arguments(code):
+    """GS1Commands.cpp:3716-3717 throws invalid_argument otherwise. Mutation:
+    accepting more than four (the old `< 4` test) fails the second case."""
+    async def main():
+        server = FakeServer()
+        level = server.add_level("t.nw")
+        npc = make_npc("if (created) { " + code + " }", level)
+        run_npc_event(npc, "created", server, None)
+        await asyncio.sleep(0)
+        return server.broadcasts
+
+    assert asyncio.run(main()) == []
+
+
+def test_updateboard_records_a_change_that_reverts_after_respawntime():
+    """Level::updateBoard forces the respawn (Level.cpp:1847-1850): the
+    change keeps the base tiles as its old tiles and expires after
+    `respawntime` (default 15 s). Mutation: allow_respawn False (the
+    permanent form) fails."""
+    async def main():
+        server = FakeServer()
+        level = server.add_level("t.nw")
+        level.set_tile(3, 2, 10)
+        npc = make_npc("if (created) { tiles[3,2] = 99; updateboard 3,2,1,1; }", level)
+        run_npc_event(npc, "created", server, None)
+        await asyncio.sleep(0)
+        return level
+
+    level = asyncio.run(main())
+    change = level.board_changes[0]
+    assert change.tiles == [99] and change.old_tiles == [10]
+    assert change.expires_at is not None
+    assert level.get_tile(3, 2) == 99
+    level.expire_board_changes(change.expires_at + 1)
+    assert level.get_tile(3, 2) == 10
 
 
 def test_updateboard_clamps_the_region_to_the_board():
     async def main():
         server = FakeServer()
         level = server.add_level("t.nw")
-        npc = make_npc("if (created) { updateboard 62,62,10,10; }", level)
+        npc = make_npc("if (created) { tiles[62,62] = 5; updateboard 62,62,10,10; }", level)
         run_npc_event(npc, "created", server, None)
         await asyncio.sleep(0)
         return server.broadcasts
 
     broadcasts = asyncio.run(main())
     assert len(broadcasts) == 1  # clamped to 2x2, not an out-of-range slice
+    x, y, w, h, tiles = decode_modify(broadcasts[0][1])
+    assert (x, y, w, h) == (62, 62, 2, 2) and tiles[0] == 5
+
+
+def test_updateboard_across_a_gmap_seam_gives_each_segment_its_part():
+    """Level::applyBoardChangeFromScriptTiles gathers the tiles of every
+    sub-level the rectangle covers (Level.cpp:1751-1799) and alterBoard
+    splits the change per part (:1698-1738): the west segment gets columns
+    62-63 and the east one columns 0-1, each sent to its own segment and
+    recorded on it. Mutation: the one-segment clamp leaves b.nw without a
+    packet or a change."""
+    async def main():
+        server = FakeServer()
+        west = server.add_level("a.nw")
+        east = server.add_level("b.nw")
+        gmap = GMap("world.gmap")
+        gmap.width, gmap.height = 2, 1
+        gmap.grid = {(0, 0): "a.nw", (1, 0): "b.nw"}
+        server.world._gmaps["world.gmap"] = gmap
+        run_npc_event(make_npc("if (created) { tiles[0,5] = 13; tiles[1,5] = 14; }", east),
+                      "created", server, None)
+        run_npc_event(make_npc("if (created) { tiles[62,5] = 11; tiles[63,5] = 12;"
+                               " updateboard 62,5,4,1; }", west), "created", server, None)
+        await asyncio.sleep(0)
+        return server, west, east
+
+    server, west, east = asyncio.run(main())
+
+    def decode_modify2(packet):
+        gx, gy, x, y, w, h = (packet[1 + i] - 32 for i in range(6))
+        encoded = packet[7:7 + 2 * w * h]
+        tiles = [((encoded[i] - 32) << 7) + encoded[i + 1] - 32
+                 for i in range(0, len(encoded), 2)]
+        return gx, gy, x, y, w, h, tiles
+
+    assert [(name, decode_modify2(packet)) for name, packet in server.broadcasts] == [
+        ("a.nw", (0, 0, 62, 5, 2, 1, [11, 12])),
+        ("b.nw", (1, 0, 0, 5, 2, 1, [13, 14]))]
+    assert [(c.x, c.y, c.width, c.height, c.tiles) for c in west.board_changes] == [
+        (62, 5, 2, 1, [11, 12])]
+    assert [(c.x, c.y, c.width, c.height, c.tiles) for c in east.board_changes] == [
+        (0, 5, 2, 1, [13, 14])]
