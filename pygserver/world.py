@@ -153,6 +153,7 @@ class World:
     def __init__(self, server: 'GameServer'):
         self.server = server
         self._level_manager = LevelManager(server.config.levels_dir)
+        self._level_manager.world = self
         self._gmaps: Dict[str, GMap] = {}
 
     def add_level(self, level: Level):

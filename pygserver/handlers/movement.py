@@ -6,6 +6,7 @@ import time
 from reborn_protocol import PLSTATUS
 
 from ..attachments import absolute_position, set_attachment
+from ..audience import SEND_TO_ALL_PROPS
 from ..link_sign_touch import run_touches, touches_for_props
 from ..protocol.colors import normalize_colors
 from ..protocol.constants import PLI, PLPROP
@@ -243,6 +244,7 @@ class MovementHandlers:
                 await self.server.combat_manager.handle_status_death(self)
 
         # Relay the parts of the update other players can see.
+        global_props = {}
         if self.level:
             broadcast_props = {}
             # Position: clients may send classic X/Y (15/16, half-tiles) OR
@@ -282,18 +284,27 @@ class MovementHandlers:
             if PLPROP.SHIELDPOWER in props:
                 broadcast_props[PLPROP.SHIELDPOWER] = (self.shield_power, self.shield_image)
 
+            # The sendToAll props (head here; nickname is sent below) go to
+            # everyone, not the 3x3 (PlayerProps.cpp:419).
+            for prop_id in SEND_TO_ALL_PROPS:
+                if prop_id in broadcast_props:
+                    global_props[prop_id] = broadcast_props.pop(prop_id)
+
             if broadcast_props:
                 packet = build_other_player_props(self.id, broadcast_props)
-                await self.server.broadcast_to_world(
+                # Live player props reach the 3x3 around the player, the
+                # players that got its join (PlayerProps.cpp:1244).
+                await self.server.broadcast_nearby(
                     self.level.name, packet, exclude={self.id}
                 )
 
         # A changed nickname goes to every player on the server, not just the
         # level (SetResults::sendToAll, PlayerProps.cpp:203).
         if nickname_changed:
+            global_props[PLPROP.NICKNAME] = self.nickname
+        if global_props:
             await self.server.broadcast_to_all(
-                build_other_player_props(
-                    self.id, {PLPROP.NICKNAME: self.nickname}),
+                build_other_player_props(self.id, global_props),
                 exclude={self.id})
 
         touch_taken = False

@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 
 from .account import RCRight, mask_rc_rights
 from .attachments import absolute_position
+from .audience import SEND_TO_ALL_PROPS
 
 from .protocol.colors import colors_wire_width, normalize_colors
 from .protocol.constants import PLI, PLO, PLPROP, PLTYPE
@@ -1070,10 +1071,17 @@ class RCManager:
         if own:
             await player.send_props(own)
             level = getattr(player, 'level', None)
+            everyone = {prop_id: value for prop_id, value in own.items()
+                        if prop_id in SEND_TO_ALL_PROPS}
+            if everyone:
+                await self.server.broadcast_to_all(
+                    build_other_player_props(player.id, everyone),
+                    exclude={player.id})
             visible = {prop_id: value for prop_id, value in own.items()
-                       if prop_id in _RC_RELAYED_PROPS}
+                       if prop_id in _RC_RELAYED_PROPS
+                       and prop_id not in SEND_TO_ALL_PROPS}
             if visible and level is not None:
-                await self.server.broadcast_to_world(
+                await self.server.broadcast_nearby(
                     level.name, build_other_player_props(player.id, visible),
                     exclude={player.id})
 

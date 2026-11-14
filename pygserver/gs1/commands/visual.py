@@ -22,7 +22,10 @@ def _broadcast_showimgs(host, npc, images, *, reset=False):
         return
     from ...protocol.packets import build_npc_showimgs
     packet = build_npc_showimgs(npc.id, images, reset=reset)
-    _schedule(host.server.broadcast_to_level(npc.level.name, packet))
+    # NPC::addShowImg sends to the players around the NPC (NPC.cpp:263).
+    cast = (getattr(host.server, "broadcast_nearby", None)
+            or host.server.broadcast_to_level)
+    _schedule(cast(npc.level.name, packet))
 
 def _c_showimg(self, a, npc, player, ctx):
     if npc is None or len(a) < 4:

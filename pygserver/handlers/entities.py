@@ -5,10 +5,10 @@ import logging
 import os
 from pathlib import Path
 
-from ..protocol.constants import PLI, PLO, PLTYPE, NPCPROP, BDPROP, BDMODE, LevelItemType
+from ..protocol.constants import PLI, PLO, NPCPROP, BDPROP, BDMODE, LevelItemType
 from ..protocol.packets import (
     PacketReader, build_baddy_props, build_default_weapon,
-    build_npc_del, build_npc_del2, build_npc_props,
+    build_npc_props,
 )
 from ..text_safety import has_control_chars, sanitize_value, strip_control_chars
 from .registry import handles
@@ -304,7 +304,10 @@ class EntityHandlers:
             return
         reader = PacketReader(data)
         npc = self.server.npc_manager.get_npc(reader.read_gint3())
-        if npc is None or npc.level is not self.level:
+        # getLevel() is the gmap for every cell of it (PlayerClientPackets.cpp:207).
+        if (npc is None or npc.level is None or self.level is None or
+                not (npc.level is self.level
+                     or self.server.npc_manager._same_gmap(npc.level, self.level))):
             return
         from reborn_protocol.props import NPC_PROPS, decode_value, payload_len
         from ..protocol.colors import NPC_COLORS_READ_WIDTH, clamp_colors
@@ -332,7 +335,9 @@ class EntityHandlers:
             # Choke point for client-settable NPC strings (see text_safety).
             updates.update(npc.apply_client_prop(prop_id, sanitize_value(value)))
         if updates:
-            await self.server.broadcast_to_world(
+            # NPC::sendPropsFromSendResults: the players around the NPC
+            # (NPC.cpp:1670-1671).
+            await self.server.broadcast_nearby(
                 npc.level.name, build_npc_props(npc.id, updates), exclude={self.id})
 
     @handles(PLI.NPCDEL)
@@ -343,13 +348,6 @@ class EntityHandlers:
         npc = self.server.npc_manager.get_npc(PacketReader(data).read_gint3())
         if npc is None:
             return
-        level = npc.level
-        await self.server.npc_manager.destroy_npc(npc, notify=False)
-        if level is not None:
-            # Server.cpp:1610-1638 also invalidates copies outside this level.
-            for other in list(self.server.players.values()):
-                if not other.connection_type & PLTYPE.ANYCLIENT:
-                    continue
-                packet = (build_npc_del(npc.id) if other.level is level else
-                          build_npc_del2(level.name, npc.id))
-                await other.send_raw(packet)
+        # Server::deleteNPC (Server.cpp:1622-1636): the gmap's name, PLO_NPCDEL
+        # to everyone on the gmap, PLO_NPCDEL2 to the other clients that need it.
+        await self.server.npc_manager.destroy_npc(npc)

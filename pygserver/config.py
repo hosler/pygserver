@@ -310,6 +310,10 @@ class ServerConfig:
     sendplayertriggers: bool = True
     # LevelBaddy.cpp:270,302: seconds a dead baddy stays dead.
     baddyrespawntime: int = 60
+    # Player props sync box on a gmap, in tiles each way (Server.h:127;
+    # Level::findPlayersInRangeForSync, Level.cpp:3265-3318).
+    syncdistancex: int = 192
+    syncdistancey: int = 192
     # Server.h:134: seconds until a 2x2 board change (a cut bush) is restored
     # (board_changes.py).
     respawntime: int = 15
@@ -510,6 +514,9 @@ class ServerConfig:
                         elif key == 'baddyrespawntime':
                             # LevelBaddy.cpp:270,302 reads an unsigned 32-bit value.
                             config.baddyrespawntime = _uint_setting(key, scalar)
+                        elif key in ('syncdistancex', 'syncdistancey'):
+                            # SettingCache<uint32_t> (Server.h:127).
+                            setattr(config, key, _uint_setting(key, scalar))
                         elif key == 'respawntime':
                             # Server.h:134: board-change respawn, uint16_t.
                             config.respawntime = _uint_setting(key, scalar, 16)
@@ -635,6 +642,8 @@ class ServerConfig:
             lines.append(f"{key} = {str(getattr(self, key)).lower()}")
         lines.append(f"baddyrespawntime = {self.baddyrespawntime}")
         lines.append(f"respawntime = {self.respawntime}")
+        lines.append(f"syncdistancex = {self.syncdistancex}")
+        lines.append(f"syncdistancey = {self.syncdistancey}")
         lines.append(f"mindeathgralats = {self.mindeathgralats}")
         lines.append(f"maxdeathgralats = {self.maxdeathgralats}")
         for key in ('deathitemtypes', 'bushitemtypes'):

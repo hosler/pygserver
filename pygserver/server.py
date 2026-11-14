@@ -454,18 +454,17 @@ class GameServer:
 
         if player.id in self.players:
             del self.players[player.id]
-        forget = getattr(getattr(self, 'npc_manager', None), 'forget_player', None)
-        if forget is not None:
-            forget(player)
 
         # Part chat channels + roster pushes (after the players-dict removal
         # so the parted player gets no roster traffic)
         if self.irc_manager:
             await self.irc_manager.remove_player(player)
 
-        # Notify other players in the same contiguous world.
+        # Notify the players around the leaver.
         if player.level:
-            await self.broadcast_to_world(
+            # leaveLevel on a disconnect (Server.cpp:1679) tells the 3x3
+            # (PlayerClient.cpp:1390).
+            await self.broadcast_nearby(
                 player.level.name,
                 player.build_leave_packet(),
                 exclude={player.id}
@@ -547,6 +546,19 @@ class GameServer:
                                  exclude: Optional[Set[int]] = None):
         """Broadcast a packet across a level's containing map."""
         await self.audience.broadcast_to_world(level_name, packet, exclude)
+
+    async def broadcast_nearby(self, level_name: str, packet: bytes,
+                               exclude: Optional[Set[int]] = None):
+        """Broadcast to the players around a level: its 3x3 on a gmap
+        (Server::sendPacketToNearby; see Audience.players_in_range_for_data).
+        Off a gmap that is the level broadcast."""
+        if self.world.get_gmap_for_level(level_name) is None:
+            if exclude:
+                await self.broadcast_to_level(level_name, packet, exclude)
+            else:
+                await self.broadcast_to_level(level_name, packet)
+            return
+        await self.audience.broadcast_nearby(level_name, packet, exclude)
 
     async def broadcast_to_all(self, packet: bytes, exclude: Optional[Set[int]] = None):
         """Broadcast packet to all logged-in players."""

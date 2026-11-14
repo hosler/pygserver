@@ -43,10 +43,10 @@ def test_carry_byte_round_trip(code):
 def test_carry_update_relay_preserves_bomb_and_empty_values(code):
     sender = SimpleNamespace(id=8, level=SimpleNamespace(name='lift.nw'),
                               server=SimpleNamespace(config=SimpleNamespace(),
-                                                     broadcast_to_world=AsyncMock()))
+                                                     broadcast_nearby=AsyncMock()))
     asyncio.run(MovementHandlers._handle_player_props(sender, bytes([51, code + 32])))
     assert sender.carrysprite == code
-    packet = sender.server.broadcast_to_world.await_args.args[1]
+    packet = sender.server.broadcast_nearby.await_args.args[1]
     assert packet[3:-1] == bytes([51, code + 32])
 
 

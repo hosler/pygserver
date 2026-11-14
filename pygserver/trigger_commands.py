@@ -107,7 +107,8 @@ async def _npc_move(server, player, fields, action):
                  ticks, options)]
         if npc.level is not None:
             await send_move_packets(
-                npc.id, move, server.audience.players_in_world(npc.level.name))
+                npc.id, move,
+                server.audience.players_in_range_for_data(npc.level.name))
         npc.x = _tile_position(npc.x + dx)
         npc.y = _tile_position(npc.y + dy)
     return True
@@ -132,7 +133,8 @@ async def _npc_setpos(server, player, fields, action):
                   .write_gchar(NPCPROP.Y).write_gchar(int(y * 2))
                   .write_newline().build())
         if npc.level is not None:
-            await server.broadcast_to_level(npc.level.name, packet)
+            # TriggerCommandHandlers.cpp:292: sendPacketToNearby.
+            await server.broadcast_nearby(npc.level.name, packet)
     return True
 
 

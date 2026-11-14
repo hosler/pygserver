@@ -124,6 +124,9 @@ class World:
         if name in self.gmap_levels:
             gmap = MagicMock()
             gmap.name = "world"
+            # A one-cell map holding this segment, for the range queries.
+            gmap.width = gmap.height = 1
+            gmap.get_level_at = lambda x, y: name if (x, y) == (0, 0) else None
             return gmap, 0, 0
         return None
 
@@ -135,6 +138,7 @@ class LevelServer:
         self.players = {}
         self.broadcast_to_level = AsyncMock()
         self.broadcast_to_world = AsyncMock()
+        self.broadcast_nearby = AsyncMock()
         self.npc_manager = MagicMock()
         self.npc_manager.on_player_enters = AsyncMock()
         self.npc_manager.on_player_leaves = AsyncMock()
@@ -222,7 +226,8 @@ class TestContiguousWorldPlayerProps:
 
         left = build_player_left(player.id)
         assert all(call.args[1] != left
-                   for call in server.broadcast_to_world.await_args_list)
+                   for mock in (server.broadcast_to_world, server.broadcast_nearby)
+                   for call in mock.await_args_list)
 
 
 def baddy_payload(baddy_id, props):

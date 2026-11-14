@@ -16,12 +16,13 @@ from pathlib import Path
 
 from . import collision, level_cache, npc_motion
 from .attachments import absolute_position
+from .level import gmap_file_name
 
 from .protocol.packets import (
-    PacketBuilder, build_npc_bytecode_raw, build_npc_del, build_npc_del2,
-    build_npc_moved, build_npc_props)
+    PacketBuilder, build_nc_npc_delete, build_npc_bytecode_raw, build_npc_del,
+    build_npc_del2, build_npc_moved, build_npc_props)
 from .protocol.colors import COLORS_STORED, normalize_colors
-from .protocol.constants import PLO, NPCPROP
+from .protocol.constants import PLO, PLTYPE, NPCPROP
 from .text_safety import strip_control_chars
 
 if TYPE_CHECKING:
@@ -45,6 +46,12 @@ _REJECT = object()
 # (32..96, always printable); deserialize() reads GChar then subtracts MidPoint.
 HURT_MIDPOINT = 32
 _HURT_WIRE_BIAS = 2 * HURT_MIDPOINT
+
+
+def level_wire_name(level) -> str:
+    """Level.wire_name for any level-like object (the gmap's name on a gmap)."""
+    wire_name = getattr(level, 'wire_name', None)
+    return wire_name() if wire_name is not None else level.name
 
 
 def clamp_hurt_half_pixels(value) -> int:
@@ -378,14 +385,6 @@ class NPC:
         self.move_queue = npc_motion.new_queue()
         self._move_events = 0
         self._position_check = False
-        # Players who knew this NPC on the segment it just left, player -> that
-        # level's name. They keep hearing about it while it stays on a
-        # neighbouring segment of the gmap (NPCManager._npc_recipients). The
-        # player object is kept with the id and compared by identity: ids are
-        # reused by later logins, which must not inherit a predecessor's hold
-        # (NPCManager.forget_player purges on disconnect).
-        self._seam_players: Dict[int, Tuple['Player', str]] = {}
-        self._last_relocate = 0.0
         # Wall probes left for script-driven move flushes this tick
         # (npc_motion.WALL_BUDGET); the tick loop refills it.
         self._wall_budget = npc_motion.WALL_BUDGET
@@ -550,9 +549,16 @@ class NPC:
                 return {}
             setattr(self, attr, value)
             if attr in ('x', 'y'):
-                # A client moving the NPC ends a running move, and the
-                # testForLinks clamp follows (NPC.cpp:2038).
-                npc_motion.cancel_moves(self)
+                # NPC::setProp leaves the move queue alone (NPC.cpp:1085-1110);
+                # only the script paths clear it. The testForLinks clamp
+                # follows (NPC.cpp:2038).
+                # Only an NPC server rolls or clamps a position
+                # (NPC::testForTouch returns without one, NPC.cpp:2141-2146,
+                # and client NPC props are refused with one,
+                # PlayerClientPackets.cpp:192), so on a gmap the out-of-range
+                # value stays. Off a gmap pygserver still clamps.
+                if self.map_cell() is None:
+                    self._position_check = True
             return {prop_id: value, paired: value}
         if 23 <= prop_id <= 32:
             saves = getattr(self, 'saves', [0] * 10)
@@ -709,6 +715,18 @@ class NPC:
             for index, image in self.showimgs.items()}
         return build_npc_showimgs(self.id, images, reset=True)
 
+    def map_cell(self) -> Optional[Tuple[int, int]]:
+        """The gmap cell this NPC stands in (character.mapX/mapY), or None
+        off a gmap."""
+        gmap_cell = getattr(self.level, 'gmap_cell', None)
+        info = gmap_cell() if gmap_cell is not None else None
+        return (info[1], info[2]) if info is not None else None
+
+    def wire_level_name(self) -> str:
+        """NPC::getLevelName (NPC.cpp:627-630) as clients see it: the gmap
+        for an NPC on a gmap segment."""
+        return level_wire_name(self.level) if self.level is not None else ""
+
     def wire_props(self, *, include_script: bool = True,
                    include_position: bool = True) -> Dict[int, Any]:
         """The props of a full send, by NPCPROP id."""
@@ -731,6 +749,12 @@ class NPC:
         if not include_position:
             for prop in (NPCPROP.X, NPCPROP.Y, NPCPROP.X2, NPCPROP.Y2):
                 del props[prop]
+        # On a gmap X/Y/X2/Y2 are local to the cell and GMAPLEVELX/Y (GBYTE1,
+        # NPC.h:668-669) name the cell. They stay in while a move runs: only
+        # the four position props are held back then (NPC.cpp:493-500).
+        cell = self.map_cell()
+        if cell is not None:
+            props[NPCPROP.GMAPLEVELX], props[NPCPROP.GMAPLEVELY] = cell
         if include_script and self._wire_mode is None:
             self._wire_mode = self.bytecode_active
         if include_script and self.bytecode_active:
@@ -1155,8 +1179,6 @@ class NPCManager:
     #: Longest a tick advances the NPC move queues, like the 0.25 s clamp on
     #: smooth movement: a stalled loop does not replay seconds of motion.
     MAX_MOVE_TICK_MS = 250
-    #: Minimum gap between two gmap rolls of one NPC.
-    RELOCATE_COOLDOWN = 0.5
 
     def __init__(self, server: 'GameServer'):
         self.server = server
@@ -1593,28 +1615,38 @@ class NPCManager:
 
             if notify:
                 await self._send_npc_delete(npc, level_name)
-        getattr(npc, '_seam_players', {}).clear()
 
     async def _send_npc_delete(self, npc: NPC, level_name: str):
         """Server::deleteNPC (Server.cpp:1625-1641): every client on the NPC's
         level, every client that has not been to that level and every client
         that left it after the NPC arrived is told. Clients elsewhere get
         PLO_NPCDEL2 naming the level, so one that comes back later has
-        already dropped it. Players on another segment of the same gmap
-        hold it as a seam holder and get PLO_NPCDEL, as on the reference's
-        single gmap level."""
+        already dropped it. On a gmap the level is the gmap: every player on
+        any of its segments gets PLO_NPCDEL, the others PLO_NPCDEL2 naming
+        the gmap (npc->getLevelName(), :1623); the visited record read is
+        still the segment's (:1631)."""
         arrived = getattr(npc, 'level_time', None)
         lookup = getattr(getattr(self.server, 'world', None),
                          'get_gmap_for_level', None)
         info = lookup(level_name) if lookup is not None else None
         same_world = set(info[0].grid.values()) if info else {level_name}
+        wire_name = gmap_file_name(info[0]) if info else level_name
         delete = build_npc_del(npc.id)
-        delete2 = build_npc_del2(level_name, npc.id)
+        delete2 = build_npc_del2(wire_name, npc.id)
+        nc_delete = build_nc_npc_delete(npc.id)
         everyone = getattr(self.server, 'get_all_players', None)
         players = (everyone() if everyone is not None
                    else [p for p in getattr(self.server, 'players', {}).values()
                          if getattr(p, 'logged_in', True)])
         for player in list(players):
+            # Only game clients get the client packets (the reference casts
+            # to PlayerClient, Server.cpp:1629); an NC connection gets
+            # PLO_NC_NPCDELETE instead (:1636-1639); RC gets nothing.
+            kind = getattr(player, 'connection_type', PLTYPE.CLIENT)
+            if not kind & PLTYPE.ANYCLIENT:
+                if kind & PLTYPE.NC:
+                    await player.send_raw(nc_delete)
+                continue
             here = getattr(getattr(player, 'level', None), 'name', None)
             if here in same_world:
                 await player.send_raw(delete)
@@ -1638,33 +1670,64 @@ class NPCManager:
             return
         await self.relocate_npc(npc, new_level)
 
+    def _same_gmap(self, one: 'Level', other: 'Level') -> bool:
+        """True when both levels are segments of one gmap: the reference's
+        single gmap level, so moving between them is no level change."""
+        here, there = self._gmap_info(one), self._gmap_info(other)
+        return (here is not None and there is not None
+                and here[0].name == there[0].name)
+
+    async def _cross_cell(self, npc: NPC, new_level: 'Level'):
+        """A move into another cell of the same gmap. The reference keeps the
+        NPC on its gmap level (no setLevel, no PLO_NPCMOVED) and only sets
+        the map position for each axis that changed, plus the local X2/Y2
+        (NPC.cpp:458-467); while a move runs the position props are held
+        back (:493-500). The props go to the players around the new cell
+        (sendPacketToNearby, Server.cpp:2390-2414)."""
+        old_level = npc.level
+        old_cell = npc.map_cell()
+        level_time = npc.level_time
+        old_level.remove_npc(npc)
+        new_level.add_npc(npc)
+        npc.level_time = level_time         # modTime[LEVEL] is untouched
+        new_cell = npc.map_cell()
+        props: Dict[int, Any] = {}
+        if old_cell is None or new_cell is None:
+            return
+        if new_cell[0] != old_cell[0]:
+            props[NPCPROP.GMAPLEVELX] = new_cell[0]
+        if new_cell[1] != old_cell[1]:
+            props[NPCPROP.GMAPLEVELY] = new_cell[1]
+        if not npc.move_queue:
+            props[NPCPROP.X2] = npc.x
+            props[NPCPROP.Y2] = npc.y
+        npc.observe_props(level_cache.clock())
+        if props:
+            await self._broadcast_to_npc(npc, build_npc_props(npc.id, props))
+
     async def relocate_npc(self, npc: NPC, new_level: 'Level'):
         """Move `npc` into `new_level` and tell the clients.
 
-        NPC.cpp:206-231: PLO_NPCMOVED (new level and local position) makes a
-        client that knows the NPC re-home or hide it; players on the new level
+        Inside one gmap this is a cell change (`_cross_cell`). Otherwise
+        NPC.cpp:203-227: PLO_NPCMOVED (local position and the destination's
+        name, the gmap for a gmap) goes to every player so a client that
+        knows the NPC re-homes or hides it; players near it on the new level
         then get the full props, show-images and running move queue as for a
-        new arrival (Level::sendNPCToPlayer, Level.cpp:1466-1485). The
-        reference sends PLO_NPCMOVED to every player and keeps updating the
-        ones nearby; only the old level's players held the NPC before, so only
-        they are told, and while the NPC stays on a neighbouring segment of the
-        gmap they keep receiving its updates (`_npc_recipients`)."""
+        new arrival (Level::sendNPCToPlayer, Level.cpp:1466-1485)."""
         old_level = npc.level
+        if old_level is not None and self._same_gmap(old_level, new_level):
+            await self._cross_cell(npc, new_level)
+            return
         if old_level is not None:
             old_level.remove_npc(npc)
             # NPC.cpp:210: every player hears of the move, so one that left
             # the old level earlier drops the copy it still holds.
-            moved = build_npc_moved(npc.id, new_level.name, npc.x, npc.y)
+            moved = build_npc_moved(npc.id, level_wire_name(new_level), npc.x, npc.y)
             broadcast_to_all = getattr(self.server, 'broadcast_to_all', None)
             if broadcast_to_all is not None:
                 await broadcast_to_all(moved)
             else:
                 await self.server.broadcast_to_level(old_level.name, moved)
-            # Players of the segment it left (not those it never reached).
-            near = {level.name for level, _ in self.nearby_levels(new_level)}
-            if old_level.name in near:
-                for player in self.server.audience.players_on_level(old_level.name):
-                    npc._seam_players[player.id] = (player, old_level.name)
         new_level.add_npc(npc)
         # setLevel -> refreshModTimes (NPC.cpp:247-254): a player who comes
         # back after the move gets the whole NPC.
@@ -1672,28 +1735,20 @@ class NPCManager:
         if npc.initial_level is None:   # first warp (NPC.cpp:236-240)
             npc.record_initial_state(new_level.name)
         npc._dirty = False
-        npc._last_relocate = time.monotonic()
         # The new level has heard of none of the moves yet; the tick sends the
         # whole queue to it with the next batch (NPC.cpp:1484 equivalent).
         for move in npc.move_queue:
             move.sent = False
+        # NPC.cpp:227 sendNPCToNearbyPlayers (Level.cpp:1487-1496): the
+        # props, then the bytecode, to the players around the NPC.
         props = npc.build_props_packet()
-        await self.server.broadcast_to_level(new_level.name, props)
-        # NPC.cpp:227 sendNPCToNearbyPlayers: the bytecode follows the props.
+        await self._broadcast_to_npc(npc, props)
         bytecode = npc.build_bytecode_packet()
         if bytecode:
-            await self.server.broadcast_to_level(new_level.name, bytecode)
+            await self._broadcast_to_npc(npc, bytecode)
         showimgs = npc.build_showimgs_packet()
         if showimgs is not None:
-            await self.server.broadcast_to_level(new_level.name, showimgs)
-        # Holders that are still in reach (this also covers the ones from an
-        # earlier roll) get the exact position, not just PLO_NPCMOVED's half
-        # tiles; the ones the NPC left behind are told to forget it now, as
-        # nothing may be dirty afterwards to trigger that.
-        for holder in await self._seam_holders(npc):
-            await holder.send_raw(props)
-            if bytecode:
-                await holder.send_raw(bytecode)
+            await self._broadcast_to_npc(npc, showimgs)
 
     async def reset_to_initial_state(self, npc: NPC):
         """NPC::resetToInitialState (NPC.cpp:117-162): drop everything a
@@ -1723,12 +1778,18 @@ class NPCManager:
         npc.__dict__.pop("_gs1_class_pending", None)
         npc.move_queue.clear()
         npc._move_events = 0
-        npc._seam_players.clear()
         npc.x, npc.y = npc.initial_x, npc.initial_y
         target = (self.server.world.get_level(npc.initial_level)
                   if npc.initial_level else None)
         if target is not None and target is not npc.level:
             await self.relocate_npc(npc, target)
+        # NPC.cpp:146-150: the map position counts as changed now unless the
+        # cell is 0,0, so a later entry delta carries it.
+        now = level_cache.clock()
+        npc.observe_props(now)
+        if npc.map_cell() not in (None, (0, 0)):
+            npc._prop_times[NPCPROP.GMAPLEVELX] = now
+            npc._prop_times[NPCPROP.GMAPLEVELY] = now
         # The delete wiped the clients' copy of the showimgs layers, which
         # the server keeps (NPC.cpp:117-162 does not touch showImgList).
         npc._resend_showimgs = True
@@ -1743,57 +1804,19 @@ class NPCManager:
             if observe is not None:
                 observe(now)
 
-    def forget_player(self, player: 'Player') -> None:
-        """A player left the server: no NPC may keep it as a holder (its id
-        can be handed to the next login)."""
-        for npc in self._npcs.values():
-            held = npc._seam_players.get(player.id)
-            if held is not None and held[0] is player:
-                del npc._seam_players[player.id]
-
-    def _holds(self, player, home: str) -> bool:
-        """True while `player` is still connected and still on the segment
-        `home` it held an NPC from."""
-        if self.server.get_player(getattr(player, 'id', None)) is not player:
-            return False
-        return getattr(getattr(player, 'level', None), 'name', None) == home
-
-    async def _seam_holders(self, npc: NPC) -> List['Player']:
-        """Reconcile the players holding `npc` from a segment it left, and
-        return the ones that still do. A holder is dropped once it enters the
-        NPC's level (it got the NPC as an arrival), leaves its segment or
-        disconnects; one the NPC has moved out of reach of is told to delete
-        it so it does not keep a frozen copy."""
-        if not npc._seam_players or npc.level is None:
-            return []
-        level_name = npc.level.name
-        near = {near.name for near, _ in self.nearby_levels(npc.level)}
-        holders = []
-        for player_id, (player, home) in list(npc._seam_players.items()):
-            if not self._holds(player, home) or home == level_name:
-                del npc._seam_players[player_id]
-            elif home not in near:
-                del npc._seam_players[player_id]
-                await player.send_raw(build_npc_del(npc.id))
-            else:
-                holders.append(player)
-        return holders
-
     async def _npc_recipients(self, npc: NPC) -> List['Player']:
-        """Players on the NPC's level plus those still holding it from a
-        segment it left (see relocate_npc and _seam_holders)."""
-        recipients = self.server.audience.players_on_level(npc.level.name)
-        if not npc._seam_players:
-            return recipients
-        recipients.extend(await self._seam_holders(npc))
-        return recipients
+        """The players live updates of `npc` reach: the 3x3 around its cell
+        on a gmap, its level otherwise (Level::findPlayersInRangeForData,
+        Level.cpp:3320-3372)."""
+        return self.server.audience.players_in_range_for_data(npc.level.name)
 
     async def _broadcast_to_npc(self, npc: NPC, packet: bytes):
-        if not npc._seam_players:
-            await self.server.broadcast_to_level(npc.level.name, packet)
-            return
-        for player in await self._npc_recipients(npc):
-            await player.send_raw(packet)
+        """Server::sendPacketToNearby around the NPC (Server.cpp:2390-2414).
+        Every player in range shares the gmap's name, so no
+        PLO_SETACTIVELEVEL wraps the packet (:2402-2412)."""
+        cast = (getattr(self.server, 'broadcast_nearby', None)
+                or self.server.broadcast_to_level)
+        await cast(npc.level.name, packet)
 
     async def confine_position(self, npc: NPC):
         """NPC::testForLinks position handling (cc20c9d0, NPC.cpp:2038-2091).
@@ -1805,11 +1828,8 @@ class NPCManager:
         abs(), which leaves a small negative offset where it is and mirrors a
         larger one; we floor instead so walking left rolls left. A neighbour
         that does not exist leaves the NPC where it is (it would otherwise
-        vanish into a segment nobody can load).
-
-        An NPC that just rolled waits RELOCATE_COOLDOWN seconds before it may
-        roll again, so one that oscillates across a seam cannot make every tick
-        send the whole NPC (script included) to a level."""
+        vanish into a segment nobody can load). A roll is a cell change, sent
+        as props only (`_cross_cell`)."""
         npc._position_check = False
         level = npc.level
         if level is None:
@@ -1834,9 +1854,6 @@ class NPCManager:
         name = gmap.get_level_at(grid_x + shift_x, grid_y + shift_y)
         target = world.get_level(name) if name else None
         if target is None:
-            return
-        if time.monotonic() - npc._last_relocate < self.RELOCATE_COOLDOWN:
-            npc._position_check = True      # roll once the cooldown is over
             return
         npc.x = (px - shift_x * 1024) / 16.0
         npc.y = (py - shift_y * 1024) / 16.0
@@ -1936,7 +1953,7 @@ class NPCManager:
                                 and npc._wire_mode != npc.bytecode_active)
                     if switched:
                         await self._broadcast_to_npc(
-                            npc, build_npc_del2(npc.level.name, npc.id))
+                            npc, build_npc_del2(npc.wire_level_name(), npc.id))
                         for move in npc.move_queue:
                             move.sent = False
                     if script_update:

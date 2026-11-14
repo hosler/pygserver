@@ -72,6 +72,8 @@ def rc(tmp_path):
         object() if name in ("Sword", "Wand") else None)
     server.gs2_manager.announce_weapon = AsyncMock()
     server.broadcast_to_world = AsyncMock()
+    server.broadcast_nearby = AsyncMock()
+    server.broadcast_to_all = AsyncMock()
     server.is_staff = lambda name: False
     level = SimpleNamespace(name="start.nw")
     player = SimpleNamespace(

@@ -651,7 +651,8 @@ def test_e_a_hop_records_the_old_cell_and_sends_only_dynamic_data(tmp_path, cloc
     assert player.visited_levels.left_at("c0.nw") == 5050.0
     assert not player.visited_levels.visited("c1.nw")
     assert ids(player) == D_EMPTY
-    assert sent(player)[-1] == (PLO.SETACTIVELEVEL, b"c1.nw")
+    # The block closes with the gmap's name (PlayerClient.cpp:1555).
+    assert sent(player)[-1] == (PLO.SETACTIVELEVEL, b"m.gmap")
 
 
 def test_e_a_diagonal_hop_marks_the_cell_in_between(tmp_path, clock):

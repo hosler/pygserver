@@ -23,7 +23,7 @@ from pygserver.world import GMap, World
 def arena(tmp_path, monkeypatch):
     monkeypatch.setattr('time.time', lambda: 100.0)
     server = SimpleNamespace(config=SimpleNamespace(levels_dir=str(tmp_path)),
-                             broadcast_to_level=AsyncMock(), broadcast_to_world=AsyncMock(),
+                             broadcast_to_level=AsyncMock(), broadcast_to_world=AsyncMock(), broadcast_nearby=AsyncMock(),
                              players={})
     server.world = World(server)
     level = Level('source.nw')

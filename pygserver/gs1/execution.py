@@ -406,6 +406,7 @@ def _other_form(player, prop_id, value):
 async def _send_player_props(player, server, dirty):
     from ..protocol.constants import PLPROP
     from ..protocol.packets import build_other_player_props
+    from ..audience import SEND_TO_ALL_PROPS
     await player.send_props(dirty)
     if server is None:
         server = getattr(player, "server", None)
@@ -416,14 +417,15 @@ async def _send_player_props(player, server, dirty):
         return
     me = getattr(player, "id", None)
     exclude = {me} if me is not None else None
-    if PLPROP.NICKNAME in others and hasattr(server, "broadcast_to_all"):
-        await server.broadcast_to_all(build_other_player_props(
-            me, {PLPROP.NICKNAME: others.pop(PLPROP.NICKNAME)}), exclude=exclude)
+    everyone = {pid: others.pop(pid) for pid in SEND_TO_ALL_PROPS if pid in others}
+    if everyone and hasattr(server, "broadcast_to_all"):
+        await server.broadcast_to_all(
+            build_other_player_props(me, everyone), exclude=exclude)
     level = getattr(player, "level", None)
     if not others or level is None:
         return
     packet = build_other_player_props(me, others)
-    cast = (getattr(server, "broadcast_to_world", None)
+    cast = (getattr(server, "broadcast_nearby", None)
             or getattr(server, "broadcast_to_level", None))
     if cast is not None:
         await cast(level.name, packet, exclude=exclude)

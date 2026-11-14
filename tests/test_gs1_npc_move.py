@@ -15,7 +15,7 @@ from pygserver.level import Level
 from pygserver.npc import NPC
 from pygserver.protocol.constants import NPCPROP, PLO
 from pygserver.protocol.packets import (
-    build_npc_move, build_npc_move2, build_npc_moved)
+    build_npc_move, build_npc_move2, build_npc_moved, build_npc_props)
 from reborn_protocol.props import NPC_PROPS, StreamPolicy, parse_prop_stream
 from pygserver.server import GameServer
 from pygserver.world import GMap
@@ -390,13 +390,13 @@ def test_gmap_npc_rolls_into_the_neighbour_segment(tmp_path):
     run(server.npc_manager.confine_position(npc))
     assert npc.level is east and (npc.x, npc.y) == (0.5, 10.0)
     assert npc.id in {n.id for n in east.get_npcs()} and not west.get_npcs()
-    calls = {call.args[0]: call.args[1] for call in server.broadcast_to_level.await_args_list}
-    # PLO_NPCMOVED goes to every player (NPC.cpp:210), the props to the new level.
-    moved = build_npc_moved(npc.id, "e.nw", 0.5, 10.0)
-    assert on_west.send_raw.await_args_list[0].args[0] == moved
-    assert on_east.send_raw.await_args_list[0].args[0] == moved
-    assert "w.nw" not in calls
-    assert calls["e.nw"] == npc.build_props_packet()
+    # Still the gmap level: no PLO_NPCMOVED, only the changed map axis and
+    # the local position, to both cells around it (NPC.cpp:458-467).
+    expected = build_npc_props(npc.id, {NPCPROP.GMAPLEVELX: 1,
+                                        NPCPROP.X2: 0.5, NPCPROP.Y2: 10.0})
+    for player in (on_west, on_east):
+        assert [c.args[0] for c in player.send_raw.await_args_list] == [expected]
+    server.broadcast_to_level.assert_not_awaited()
 
 
 def test_gmap_npc_rolls_left_and_stays_put_off_the_map(tmp_path):
@@ -810,6 +810,12 @@ def test_a_gmap_roll_announces_the_queue_to_the_new_level_once(tmp_path):
 
 
 # -- the gmap seam ---------------------------------------------------------------------
+#
+# The reference keeps a gmap's NPCs on the one gmap level: crossing a seam sets
+# GMAPLEVELX/Y for the changed axis plus the local X2/Y2 (NPC.cpp:458-467), and
+# every live update goes to the players whose cell is in the 3x3 around the
+# NPC's cell (Server::sendPacketToNearby, Server.cpp:2390-2414;
+# Level::findPlayersInRangeForData, Level.cpp:3320-3372).
 
 def _strip(server, names=("w.nw", "e.nw", "f.nw", "g.nw")):
     levels = [flat_level(name) for name in names]
@@ -817,47 +823,47 @@ def _strip(server, names=("w.nw", "e.nw", "f.nw", "g.nw")):
                                gmap={(i, 0): name for i, name in enumerate(names)})
 
 
-def test_a_player_left_behind_on_the_old_segment_keeps_hearing_the_npc(tmp_path):
+def test_a_live_update_reaches_the_3x3_around_the_npc_cell_only(tmp_path):
     (west, east, far, last), server = _strip(tmp_path)
     watcher = add_player(server, west, 2)
     resident = add_player(server, east, 3)
-    stranger = add_player(server, last, 4)
+    beyond = add_player(server, far, 4)
+    stranger = add_player(server, last, 5)
     npc = add_npc(server, west, 64.5, 10.0)
     run(server.npc_manager.confine_position(npc))
     assert npc.level is east
-    assert PLO.NPCMOVED in sent_ids(watcher)          # told it moved on
-    for player in (watcher, resident, stranger):
+    for player in (watcher, resident, beyond, stranger):
         player.send_raw.reset_mock()
     npc.message = "hi"
     npc.mark_dirty()
     run(server.npc_manager.tick())
-    assert PLO.NPCPROPS in sent_ids(watcher)          # ... and keeps hearing it
-    assert PLO.NPCPROPS in sent_ids(resident)
-    assert not stranger.send_raw.await_args_list      # a far segment never does
+    for player in (watcher, resident, beyond):            # cells 0..2 around cell 1
+        assert sent_ids(player) == [PLO.NPCPROPS]
+    assert not stranger.send_raw.await_args_list          # cell 3 is out of range
     npc_motion.queue_move(npc, server, (16, 0), 1.0, npc_motion.APPEND)
     run(server.npc_manager._send_new_moves())
-    assert PLO.MOVE2 in sent_ids(watcher)
+    assert PLO.MOVE2 in sent_ids(watcher) and not stranger.send_raw.await_args_list
 
 
-def test_the_old_segment_is_told_to_forget_an_npc_that_moves_out_of_reach(tmp_path):
+def test_a_cell_leaving_range_gets_no_delete(tmp_path):
+    """No PLO_NPCDEL for players the NPC moves away from: the reference
+    client hides it by its own 3x3 test."""
     (west, east, far, last), server = _strip(tmp_path)
     watcher = add_player(server, west, 2)
     npc = add_npc(server, west, 64.5, 10.0)
     run(server.npc_manager.confine_position(npc))
-    assert [home for _, home in npc._seam_players.values()] == ["w.nw"]
+    assert sent_ids(watcher) == [PLO.NPCPROPS]
     watcher.send_raw.reset_mock()
-    npc.x = 64.5                                      # on into the third segment
-    npc._last_relocate = 0.0
+    npc.x = 64.5                                      # on into the third cell
     run(server.npc_manager.confine_position(npc))
     assert npc.level is far
-    # Nothing is dirty and no tick runs: the roll itself tells the holder,
-    # after the move every player hears (NPC.cpp:210).
-    assert sent_ids(watcher) == [PLO.NPCMOVED, PLO.NPCDEL] and not npc._seam_players
     run(server.npc_manager.tick())
-    assert sent_ids(watcher) == [PLO.NPCMOVED, PLO.NPCDEL]   # and only once
+    assert sent_ids(watcher) == []
 
 
-def test_a_warp_to_an_unrelated_level_tells_the_old_segment_to_forget_the_npc(tmp_path):
+def test_a_warp_to_an_unrelated_level_is_announced_to_every_player(tmp_path):
+    """NPC.cpp:203-211: a real level change is PLO_NPCMOVED to everyone, with
+    no follow-up delete."""
     (west, east, far, last), server = _strip(tmp_path)
     elsewhere = flat_level("z.nw")
     server.world.add_level(elsewhere)
@@ -868,22 +874,24 @@ def test_a_warp_to_an_unrelated_level_tells_the_old_segment_to_forget_the_npc(tm
     run(server.npc_manager.warp_npc(npc, "z.nw", 5.0, 5.0))
     for _ in range(3):
         run(server.npc_manager.tick())
-    assert sent_ids(watcher) == [PLO.NPCMOVED, PLO.NPCDEL] and not npc._seam_players
+    assert [c.args[0] for c in watcher.send_raw.await_args_list] == [
+        build_npc_moved(npc.id, "z.nw", 5.0, 5.0)]
 
 
-def test_an_empty_queue_roll_gives_the_holder_the_exact_position(tmp_path):
+def test_a_roll_sends_the_exact_local_position_and_the_changed_axis(tmp_path):
     (west, east, far, last), server = _strip(tmp_path)
     watcher = add_player(server, west, 2)
     resident = add_player(server, east, 3)
     npc = add_npc(server, west, 64.3125, 10.0)        # 0.3125 tiles: not a half tile
     run(server.npc_manager.confine_position(npc))
     assert npc.x == 0.3125
-    assert sent_ids(watcher) == [PLO.NPCMOVED, PLO.NPCPROPS]
-    assert watcher.send_raw.await_args.args[0] == npc.build_props_packet()
-    assert sent_ids(resident) == [PLO.NPCMOVED, PLO.NPCPROPS]
+    expected = build_npc_props(npc.id, {NPCPROP.GMAPLEVELX: 1,
+                                        NPCPROP.X2: 0.3125, NPCPROP.Y2: 10.0})
+    for player in (watcher, resident):
+        assert [c.args[0] for c in player.send_raw.await_args_list] == [expected]
 
 
-def test_a_holder_on_the_destroyed_npcs_own_segment_gets_one_delete(tmp_path):
+def test_a_player_on_the_npcs_cell_gets_one_delete(tmp_path):
     (west, east, far, last), server = _strip(tmp_path)
     watcher = add_player(server, west, 2)
     npc = add_npc(server, west, 64.5, 10.0)
@@ -896,78 +904,39 @@ def test_a_holder_on_the_destroyed_npcs_own_segment_gets_one_delete(tmp_path):
     assert sent_ids(watcher) == [PLO.NPCDEL]
 
 
-def test_a_reused_player_id_does_not_inherit_the_old_holders_updates(tmp_path):
-    (west, east, far, last), server = _strip(tmp_path)
-    old = add_player(server, west, 2)
-    npc = add_npc(server, west, 64.5, 10.0)
-    run(server.npc_manager.confine_position(npc))
-    west.remove_player(old)
-    del server.players[2]                             # disconnected, id 2 is free
-    newcomer = add_player(server, west, 2)            # the next login reuses it
-    npc.message = "x"
-    npc.mark_dirty()
-    run(server.npc_manager.tick())
-    assert not newcomer.send_raw.await_args_list and not npc._seam_players
-
-
-def test_removing_a_player_purges_it_from_every_holder_list(tmp_path):
-    (west, east, far, last), server = _strip(tmp_path)
-    watcher = add_player(server, west, 2)
-    npc = add_npc(server, west, 64.5, 10.0)
-    run(server.npc_manager.confine_position(npc))
-    assert npc._seam_players
-    west.remove_player(watcher)
-    watcher.level = None                              # nothing left to announce
-    watcher.account_name = "w"
-    watcher.logged_in = False
-    run(server._remove_player(watcher))
-    assert not npc._seam_players
-
-
-def test_a_roll_resends_an_already_announced_queue_to_the_new_level(tmp_path):
+def test_a_roll_does_not_resend_an_announced_queue(tmp_path):
+    """The players around the NPC already hold its moves; a cell change is
+    no level change, so nothing is re-sent (NPC.cpp:458-467)."""
     (west, east, far, last), server = _strip(tmp_path)
     on_west = add_player(server, west, 2)
     on_east = add_player(server, east, 3)
     npc = add_npc(server, west, 63.5, 10.0)
     npc_motion.queue_move(npc, server, (32, 0), 2.0, npc_motion.APPEND)
-    run(server.npc_manager._send_new_moves())         # the old level hears it
-    assert sent_ids(on_west).count(PLO.MOVE2) == 1 and not sent_ids(on_east)
-    assert npc.move_queue[0].sent
+    run(server.npc_manager._send_new_moves())
+    assert sent_ids(on_west).count(PLO.MOVE2) == 1
+    assert sent_ids(on_east).count(PLO.MOVE2) == 1     # cell 1 is in the 3x3
     npc.x = 64.5                                      # the walk crossed the seam
     run(server.npc_manager.confine_position(npc))
-    assert npc.level is east and not npc.move_queue[0].sent
+    assert npc.level is east and npc.move_queue[0].sent
     run(server.npc_manager._send_new_moves())
     assert sent_ids(on_east).count(PLO.MOVE2) == 1
+    # While the move runs only the map position goes out (NPC.cpp:493-500).
+    assert on_east.send_raw.await_args.args[0] == build_npc_props(
+        npc.id, {NPCPROP.GMAPLEVELX: 1})
 
 
-def test_a_holder_is_dropped_when_the_npc_rolls_back_onto_its_segment(tmp_path):
+def test_rolling_back_is_props_only(tmp_path):
     (west, east, far, last), server = _strip(tmp_path)
     watcher = add_player(server, west, 2)
     npc = add_npc(server, west, 64.5, 10.0)
     run(server.npc_manager.confine_position(npc))
-    assert npc._seam_players
     watcher.send_raw.reset_mock()
     npc.x = -0.5
-    npc._last_relocate = 0.0
     run(server.npc_manager.confine_position(npc))
-    assert npc.level is west and not npc._seam_players
-    # The move every player hears, then one arrival and no extra copy.
-    assert sent_ids(watcher) == [PLO.NPCMOVED, PLO.NPCPROPS]
-
-
-def test_a_holder_who_walked_into_the_npc_segment_is_dropped(tmp_path):
-    (west, east, far, last), server = _strip(tmp_path)
-    watcher = add_player(server, west, 2)
-    npc = add_npc(server, west, 64.5, 10.0)
-    run(server.npc_manager.confine_position(npc))
-    west.remove_player(watcher)
-    east.add_player(watcher)
-    watcher.level = east
-    watcher.send_raw.reset_mock()
-    npc.message = "x"
-    npc.mark_dirty()
-    run(server.npc_manager.tick())
-    assert sent_ids(watcher) == [PLO.NPCPROPS] and not npc._seam_players
+    assert npc.level is west
+    assert [c.args[0] for c in watcher.send_raw.await_args_list] == [
+        build_npc_props(npc.id, {NPCPROP.GMAPLEVELX: 0,
+                                 NPCPROP.X2: 63.5, NPCPROP.Y2: 10.0})]
 
 
 def test_destroying_the_npc_reaches_players_on_the_old_segment(tmp_path):
@@ -980,30 +949,23 @@ def test_destroying_the_npc_reaches_players_on_the_old_segment(tmp_path):
     assert sent_ids(watcher) == [PLO.NPCDEL]
 
 
-def test_an_npc_oscillating_across_a_seam_rolls_at_most_once_per_cooldown(tmp_path):
+def test_an_npc_oscillating_across_a_seam_sends_only_map_and_position_props(tmp_path):
+    """Every roll is a cell change: the map axis and X2/Y2, never the whole
+    NPC, so no cooldown is needed between rolls."""
     (west, east, far, last), server = _strip(tmp_path)
-    add_player(server, west, 2)
-    add_player(server, east, 3)
-    npc = add_npc(server, west, 64.5, 10.0)
+    watcher = add_player(server, west, 2)
+    npc = add_npc(server, west, 64.5, 10.0, image="big.png")
     manager = server.npc_manager
-    rolls = 0
-    original = manager.relocate_npc
-
-    async def counting(npc_, level_):
-        nonlocal rolls
-        rolls += 1
-        await original(npc_, level_)
-    manager.relocate_npc = counting
 
     async def go():
-        for tick in range(40):
+        for _ in range(40):
             npc.x = 64.5 if npc.level is west else -0.5
             await manager.confine_position(npc)
     run(go())
-    assert rolls == 1 and npc._position_check             # the rest waits its turn
-    npc._last_relocate -= manager.RELOCATE_COOLDOWN
-    run(manager.confine_position(npc))
-    assert rolls == 2
+    packets = [c.args[0] for c in watcher.send_raw.await_args_list]
+    assert len(packets) == 40
+    assert all(prop_ids(packet) == {NPCPROP.GMAPLEVELX, NPCPROP.X2, NPCPROP.Y2}
+               for packet in packets)
 
 
 # -- script position writes ---------------------------------------------------------------
@@ -1043,7 +1005,7 @@ def test_a_script_write_past_a_gmap_edge_rolls_into_the_neighbour(tmp_path):
     assert edge.x == 6.0                              # no segment there: wrapped in place
 
 
-def test_python_api_and_client_position_writes_cancel_the_queue(tmp_path):
+def test_python_api_position_writes_cancel_the_queue_a_client_write_does_not(tmp_path):
     level = flat_level()
     server = make_server(tmp_path, level)
     for attr in ("x", "y"):
@@ -1055,7 +1017,8 @@ def test_python_api_and_client_position_writes_cancel_the_queue(tmp_path):
     client = add_npc(server, level, 10.0, 10.0, npc_id=10003)
     npc_motion.queue_move(client, server, (16, 0), 5.0, 0)
     client.apply_client_prop(NPCPROP.X, 12.5)
-    assert not client.move_queue and client.x == 12.5
+    # NPC::setProp X/Y never touches moveQueue (NPC.cpp:1085-1110).
+    assert len(client.move_queue) == 1 and client.x == 12.5
 
 
 # -- sword washit across a seam ---------------------------------------------------------

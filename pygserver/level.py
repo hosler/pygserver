@@ -58,6 +58,11 @@ BADDY_TYPE_TO_NAME = {
 }
 
 
+def gmap_file_name(gmap) -> str:
+    """The gmap's level name as clients see it ("chicken.gmap")."""
+    return gmap.name if gmap.name.endswith('.gmap') else gmap.name + '.gmap'
+
+
 class Level:
     """
     Represents a game level (64x64 tiles).
@@ -105,6 +110,9 @@ class Level:
 
         # NPCs on this level
         self._npcs: Dict[int, 'NPC'] = {}
+        # The World that serves this level (set by LevelManager), so an NPC
+        # here can find its gmap cell; None for a level outside any world.
+        self.world = None
         self.is_sparring_zone = False
 
         # Level links (warps)
@@ -704,6 +712,19 @@ class Level:
         if client_script.lstrip(' \t\r\n\v\f\xa7').startswith('sparringzone'):
             self.is_sparring_zone = True
 
+    def gmap_cell(self):
+        """(gmap, cell x, cell y) when this level is a gmap segment of its
+        world, else None."""
+        lookup = getattr(self.world, 'get_gmap_for_level', None)
+        return lookup(self.name) if lookup is not None else None
+
+    def wire_name(self) -> str:
+        """The level name clients see for what is on this level: the gmap
+        ("chicken.gmap") for a gmap segment, whose NPCs belong to the gmap
+        level in the reference (LevelLoader.cpp:384), else this level."""
+        cell = self.gmap_cell()
+        return gmap_file_name(cell[0]) if cell is not None else self.name
+
     def remove_npc(self, npc: 'NPC'):
         """Remove an NPC from this level."""
         self._npcs.pop(npc.id, None)
@@ -772,6 +793,8 @@ class LevelManager:
         self._levels: Dict[str, Level] = {}
         self._paths: Optional[Dict[str, Path]] = None
         self._last_scan = 0.0
+        # The owning World, handed to every level this manager serves.
+        self.world = None
 
     def level_paths(self, refresh: bool = False) -> Dict[str, Path]:
         """Map bare level file names to paths, searching subdirectories.
@@ -840,6 +863,7 @@ class LevelManager:
         except LevelLoadError as e:
             logger.warning(f"Refusing level {level_path}: {e}")
             return None
+        level.world = self.world
         self._levels[name] = level
         return level
 
@@ -849,6 +873,7 @@ class LevelManager:
 
     def add_level(self, level: Level):
         """Add a level to the cache."""
+        level.world = self.world
         self._levels[level.name] = level
 
     def get_all_levels(self) -> List[Level]:

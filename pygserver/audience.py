@@ -44,9 +44,10 @@ combat.py. NPC/baddy blasts retain the circle policies below.
 
 import math
 from enum import Enum, auto
-from typing import Callable, Iterable, List, Optional, Set, TYPE_CHECKING
+from typing import Callable, Iterable, List, Optional, Set, Tuple, TYPE_CHECKING
 
 from .attachments import absolute_position
+from .protocol.constants import PLPROP
 
 if TYPE_CHECKING:
     from .level import Level
@@ -78,6 +79,19 @@ def contains(shape: Shape, cx: float, cy: float, radius: float,
 # Named policies: which shape each event uses. Changing one of these changes a
 # gameplay hitbox, so they are declared here instead of hidden in a loop.
 # =============================================================================
+
+# The player props the reference sends to every player rather than the ones
+# around the sender (SetResults::sendToAll): nickname
+# (server/src/player/PlayerProps.cpp:203), head image (:419) and the
+# player-list status (:1001); the GS1 `sethead` forces it for the head
+# (server/src/scripting/gs1/GS1Commands.cpp:2533). Every other prop stays on
+# sendToLevel, which is the 3x3 on a gmap. One packet carries both kinds as
+# two separate buffers (outAll / outLevel,
+# server/src/utilities/PropertySerializers.cpp:726-737), so a sendToAll prop
+# is never repeated in the nearby packet. The player-list status has no
+# storage in this server yet (prop 53 is also an alias of the last custom
+# attribute in the constants), so it is left out of the set.
+SEND_TO_ALL_PROPS = frozenset({PLPROP.NICKNAME, PLPROP.HEADIMAGE})
 
 BOMB_BLAST_NPCS = Shape.CIRCLE
 BOMB_BLAST_BADDIES = Shape.CIRCLE
@@ -136,6 +150,85 @@ class Audience:
                     players.append(player)
         return players
 
+    def levels_in_range_for_data(self, level_name: str,
+                                 cell: Optional[Tuple[int, int]] = None) -> List[str]:
+        """The level names whose players and NPCs are in range for data of
+        `level_name`: on a gmap the segments of the 3x3 around its cell (or
+        around `cell`, a map position that need not be the level's own),
+        clipped to the map (Level.cpp:3341-3344, :3446-3449); otherwise the
+        level itself."""
+        gmap_info = self.server.world.get_gmap_for_level(level_name)
+        if gmap_info is None:
+            return [level_name]
+        gmap, cell_x, cell_y = gmap_info
+        if cell is not None:
+            cell_x, cell_y = cell
+        names = []
+        for step_y in (-1, 0, 1):
+            for step_x in (-1, 0, 1):
+                name = gmap.get_level_at(cell_x + step_x, cell_y + step_y)
+                if name and name not in names:
+                    names.append(name)
+        return names
+
+    def players_in_range_for_data(self, level_name: str,
+                                  exclude: Optional[Set[int]] = None,
+                                  cell: Optional[Tuple[int, int]] = None) -> List['Player']:
+        """Level::findPlayersInRangeForData (Level.cpp:3320-3372): on a gmap
+        the players whose cell lies in the 3x3 around `level_name`'s cell;
+        off a gmap the level's players. Live NPC updates go to these
+        (Server::sendPacketToNearby, Server.cpp:2390-2414). `cell` takes the
+        3x3 around another map position instead (a leaver's destination)."""
+        players = []
+        for name in self.levels_in_range_for_data(level_name, cell):
+            players.extend(self.players_on_level(name, exclude))
+        return players
+
+    def npcs_in_range_for_data(self, level_name: str) -> List:
+        """Level::findNPCsInRangeForData (Level.cpp:3425-3477): the NPCs of
+        the 3x3 around `level_name`'s cell on a gmap, else the level's."""
+        npcs = []
+        for name in self.levels_in_range_for_data(level_name):
+            level = self.server.world.get_level(name)
+            if level is not None:
+                npcs.extend(level.get_npcs())
+        return npcs
+
+    def players_in_range_for_sync(self, level_name: str, x: float, y: float,
+                                  exclude: Optional[Set[int]] = None,
+                                  cell: Optional[Tuple[int, int]] = None) -> List['Player']:
+        """Level::findPlayersInRangeForSync (Level.cpp:3265-3318) for a player
+        at level-local tiles (x, y) on `level_name`: on a gmap the players
+        within `syncdistancex` / `syncdistancey` tiles on both axes,
+        inclusive, in gmap tiles (default 192, Server.h:127); every player of
+        the gmap once the box covers the whole map. Off a gmap the level's
+        players (`syncbydistanceinside` is not modelled; its default is off,
+        Server.h:126)."""
+        gmap_info = self.server.world.get_gmap_for_level(level_name)
+        if gmap_info is None:
+            return self.players_on_level(level_name, exclude)
+        gmap, cell_x, cell_y = gmap_info
+        if cell is not None:
+            cell_x, cell_y = cell
+        config = getattr(self.server, 'config', None)
+        sync_x = getattr(config, 'syncdistancex', 192)
+        sync_y = getattr(config, 'syncdistancey', 192)
+        everyone = self.players_in_world(level_name, exclude)
+        if sync_x >= gmap.width * 64 and sync_y >= gmap.height * 64:
+            return everyone
+        origin_x = cell_x * 64 + x
+        origin_y = cell_y * 64 + y
+        out = []
+        for player in everyone:
+            info = self.server.world.get_gmap_for_level(player.level.name)
+            if info is None:
+                continue
+            px, py = absolute_position(player)
+            if (abs(info[1] * 64 + px - origin_x) <= sync_x
+                    and abs(info[2] * 64 + py - origin_y) <= sync_y):
+                out.append(player)
+        return out
+
     # -- spatial -----------------------------------------------------------
 
     def players_near(self, level_name: str, x: float, y: float, radius: float,
@@ -183,4 +276,10 @@ class Audience:
                                  exclude: Optional[Set[int]] = None):
         """Send `packet` to every client in the containing map."""
         for player in self.players_in_world(level_name, exclude):
+            await player.send_raw(packet)
+
+    async def broadcast_nearby(self, level_name: str, packet: bytes,
+                               exclude: Optional[Set[int]] = None):
+        """Send `packet` to the players in range for data of `level_name`."""
+        for player in self.players_in_range_for_data(level_name, exclude):
             await player.send_raw(packet)

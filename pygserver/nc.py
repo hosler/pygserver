@@ -188,8 +188,8 @@ class NCManager:
 
         npc = self.server.npc_manager.get_npc(npc_id)
         if npc is not None and getattr(npc, 'database_npc', False):
+            # destroy_npc tells every NC connection (Server.cpp:1636-1639).
             await self.server.npc_manager.destroy_npc(npc)
-            await self._broadcast_to_ncs(build_nc_npc_delete(npc_id))
             await self._send_to_ncs(
                 f"NPC {npc.name} deleted by {session.player.account_name}")
 

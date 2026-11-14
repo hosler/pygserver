@@ -255,8 +255,10 @@ def _spawn_npc(self, image, script, x, y, ctx):
     if script:
         nm.attach_gs1(npc, to_str(script))
     self._dirty(npc)
-    if hasattr(self.server, "broadcast_to_level"):
-        _schedule(self.server.broadcast_to_level(lvl.name, npc.build_props_packet()))
+    cast = (getattr(self.server, "broadcast_nearby", None)
+            or getattr(self.server, "broadcast_to_level", None))
+    if cast is not None:
+        _schedule(cast(lvl.name, npc.build_props_packet()))
     return npc
 
 def _c_putnpc(self, a, npc, player, ctx):

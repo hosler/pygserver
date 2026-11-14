@@ -30,6 +30,7 @@ from typing import TYPE_CHECKING, List, Optional
 
 from . import level_cache
 from .attachments import absolute_position, clear_attachment
+from .level import gmap_file_name
 from .link_sign_touch import level_data_has_links, level_data_has_signs
 from .protocol.constants import PLPROP
 from .protocol.packets import (
@@ -56,11 +57,6 @@ if TYPE_CHECKING:
     from .level import Level
 
 logger = logging.getLogger(__name__)
-
-
-def gmap_file_name(gmap) -> str:
-    """The gmap's level name as clients see it ("chicken.gmap")."""
-    return gmap.name if gmap.name.endswith('.gmap') else gmap.name + '.gmap'
 
 
 def raw_packet(packet: bytes) -> bytes:
@@ -210,7 +206,12 @@ class LevelTransitions:
 
     def _detach(self):
         """The synchronous half of leaveLevel: record, then leave the
-        level's player list (PlayerClient.cpp:1362-1365)."""
+        level's player list (PlayerClient.cpp:1362-1365).
+
+        The record goes on the cell actually being left. The reference reads
+        the cell from the position warp() has already overwritten with the
+        destination (:1357), so a warp marks the destination's cell (0,0 off a gmap)
+        as visited on the old gmap, a cell never entered; not reproduced."""
         old = self.level
         if old is not None:
             self._record_leave(old)
@@ -218,10 +219,20 @@ class LevelTransitions:
             self.level = None
         return old
 
-    async def _announce_leave(self, old):
+    async def _announce_leave(self, old, destination=None):
         """The packet half of leaveLevel (PlayerClient.cpp:1367-1396): the new
-        leader of a plain level is told, nearby players get JOINLEAVELVL=0
-        for the leaver and the leaver gets it for each of them."""
+        leader of a plain level is told, the players around the leaver get
+        JOINLEAVELVL=0 for it (sendPacketToNearby, the 3x3 on a gmap, :1390)
+        and the leaver gets it for each player in its sync range (:1392-1396).
+
+        `destination` is ((cell x, cell y), x, y): the position warp() has
+        already stored when it calls leaveLevel (:1246-1272), the (0, 0) cell
+        for a destination off every gmap. Both ranges are taken around it on
+        the old gmap, as the reference does, so a player that leaves the gmap
+        from a far cell announces itself around the cell it arrives in; the
+        packet that re-levels it for everybody is the location update sent
+        at the end of the level change (:1327-1339). Without a destination
+        (a reload) the leaver's own cell and position are used."""
         if (not self._gmap_info(old)
                 and old.get_leader_id() is not None):
             new_leader = self.server.get_player(old.get_leader_id())
@@ -230,12 +241,19 @@ class LevelTransitions:
         npc_manager = getattr(self.server, 'npc_manager', None)
         if npc_manager is not None:
             await npc_manager.on_player_leaves(self, old)
-        await self.server.broadcast_to_world(
-            old.name, build_player_left(self.id), exclude={self.id})
         audience = getattr(self.server, 'audience', None)
-        if audience is not None:
-            for other in audience.players_in_world(old.name, exclude={self.id}):
-                await self.send_raw(build_player_left(other.id))
+        if audience is None:
+            return
+        if destination is not None:
+            cell, x, y = destination
+        else:
+            cell, (x, y) = None, absolute_position(self)
+        for other in audience.players_in_range_for_data(
+                old.name, exclude={self.id}, cell=cell):
+            await other.send_raw(build_player_left(self.id))
+        for other in audience.players_in_range_for_sync(
+                old.name, x, y, exclude={self.id}, cell=cell):
+            await self.send_raw(build_player_left(other.id))
 
     async def leave_level(self):
         """PlayerClient::leaveLevel on its own (a level reload)."""
@@ -263,7 +281,9 @@ class LevelTransitions:
         if warp_packet:
             await self.send_raw(warp_packet)
         if old is not None:
-            await self._announce_leave(old)
+            target = self._gmap_info(level)
+            await self._announce_leave(
+                old, ((target[1], target[2]) if target else (0, 0), x, y))
         horse_manager = getattr(self.server, 'horse_manager', None)
         if horse_manager is not None:
             await horse_manager.handle_player_warp(self, old, level)
@@ -317,7 +337,7 @@ class LevelTransitions:
             await self.gmap_hop(gmap, axes)
         if changed:
             await self.send_props(changed)
-            await self.server.broadcast_to_world(
+            await self.server.broadcast_nearby(
                 self.level.name, build_other_player_props(self.id, changed),
                 exclude={self.id})
 
@@ -461,8 +481,13 @@ class LevelTransitions:
     async def send_dynamic_level_data(self, level):
         """sendDynamicLevelData (PlayerClient.cpp:1524-1605): board changes,
         then horses and baddies (not on a gmap), the ghost icon, the leader
-        flag, the NPCs and the props exchange. NPCs are filtered by the time
-        the player last left this level (:1534)."""
+        flag, the NPCs and the props exchange.
+
+        On a gmap the NPCs are those of the 3x3 around the player's cell
+        (Level.cpp:1450), every one filtered by the time the player last left
+        the cell entered (:1534, passed at :1552); a neighbour's own record
+        is never read. Cells shared with the previous 3x3 go out again, as
+        deltas or whole, and cells leaving range get nothing."""
         since = self.visited_levels.left_at(level.name)
         board_changes = getattr(self.server, 'board_changes', None)
         if board_changes is not None:
@@ -481,20 +506,24 @@ class LevelTransitions:
         await self.send_raw(build_ghost_icon(False))
         await self._inform_if_level_leader()
 
-        # The NPC block is framed by PLO_SETACTIVELEVEL (Level.cpp:1446-1464,
-        # PlayerClient.cpp:1555). pygserver's NPCs belong to a segment, not
-        # to the gmap, so on a gmap both name the segment.
-        npcs = list(level.get_npcs())
-        if npcs:
-            await self.send_raw(build_set_active_level(level.name))
-        for npc in npcs:
+        # PLO_SETACTIVELEVEL names the NPC's owner before the first NPC and
+        # again whenever the owner changes (Level.cpp:1455-1459), then the
+        # player's level closes the block (PlayerClient.cpp:1555). On a gmap
+        # every name is the gmap's: its NPCs belong to the gmap level.
+        active = None
+        for npc in self.server.audience.npcs_in_range_for_data(level.name):
+            owner = npc.wire_level_name()
+            if owner != active:
+                await self.send_raw(build_set_active_level(owner))
+                active = owner
             await self._send_npc(npc, since)
-        await self.send_raw(build_set_active_level(level.name))
+        await self.send_raw(build_set_active_level(self.wire_level_name(level)))
 
-        # Exchange props with everyone else already in the world (see
-        # audience.Audience for the one definition of who that is).
-        for other in self.server.audience.players_in_world(
-                level.name, exclude={self.id}):
+        # Exchange props with the players in sync range (:1587-1602): on a
+        # gmap the syncdistancex/y box around the player, else the level.
+        x, y = absolute_position(self)
+        for other in self.server.audience.players_in_range_for_sync(
+                level.name, x, y, exclude={self.id}):
             await self.send_raw(other.build_props_packet())
             await other.send_raw(self.build_props_packet())
 

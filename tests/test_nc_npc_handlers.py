@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock
 
 from pygserver.nc import NCManager, NCSession
 from pygserver.npc import NPC, NPCManager
-from pygserver.protocol.constants import PLO, NPCPROP
+from pygserver.protocol.constants import PLO, PLTYPE, NPCPROP
 
 
 def run(coro):
@@ -45,18 +45,24 @@ class FakeLevel:
         return list(self.npcs)
 
 
+connections = []
+
+
 def make_nc():
+    connections.clear()
     levels = {name: FakeLevel(name) for name in ("town.nw", "cave.nw")}
     server = SimpleNamespace(
         config=SimpleNamespace(serverside=True),
         world=SimpleNamespace(get_level=levels.get),
         broadcast_to_level=AsyncMock(),
         broadcast_to_all=AsyncMock(),
-        get_all_players=lambda: [],
+        get_all_players=lambda: list(connections),
     )
     server.npc_manager = NPCManager(server)
     nc = NCManager(server)
-    player = SimpleNamespace(id=7, account_name="editor", send_raw=AsyncMock())
+    player = SimpleNamespace(id=7, account_name="editor", send_raw=AsyncMock(),
+                             connection_type=PLTYPE.NC)
+    connections.append(player)
     session = nc.register_session(player)
     return nc, session, server, levels
 
@@ -361,3 +367,27 @@ def test_npc_reset_restores_every_modelled_character_field():
     for field, value in initial.items():
         assert getattr(npc, field) == value, field
     assert npc.nickname == ""
+
+
+def test_a_destroy_tells_the_nc_once_and_the_rc_nothing():
+    """Server::deleteNPC (Server.cpp:1636-1639): an NC connection gets
+    PLO_NC_NPCDELETE, an RC connection nothing; the NC-initiated delete sends
+    it once too."""
+    nc, session, server, levels = make_nc()
+    rc_player = SimpleNamespace(id=8, connection_type=PLTYPE.RC, send_raw=AsyncMock())
+    connections.append(rc_player)
+    packet = gchar(PLO.NC_NPCDELETE) + gint3(10050) + b"\n"
+
+    async def go():
+        await nc._handle_npc_add(session, b"Guard,10050,Soldier,me,town.nw,1,1")
+        await nc._handle_npc_add(session, b"Other,10051,Soldier,me,town.nw,1,1")
+        session.player.send_raw.reset_mock()
+        await server.npc_manager.destroy_npc(server.npc_manager.get_npc(10050))
+        assert sent(session).count(packet) == 1
+        session.player.send_raw.reset_mock()
+        await nc._handle_npc_delete(session, gint3(10051))
+
+    run(go())
+
+    assert sent(session).count(gchar(PLO.NC_NPCDELETE) + gint3(10051) + b"\n") == 1
+    assert rc_player.send_raw.await_count == 0
