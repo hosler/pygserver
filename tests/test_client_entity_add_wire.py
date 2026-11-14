@@ -28,6 +28,7 @@ def test_putnpc_decodes_file_image_and_position(tmp_path):
     server = MagicMock()
     server.config = ServerConfig(putnpc_enabled=True, serverside=False)
     server.broadcast_to_level = AsyncMock()
+    server.broadcast_nearby = AsyncMock()
     from pygserver.filesystem import FileSystem
     from pygserver.npc import NPCManager
     server.filesystem = FileSystem(server, str(tmp_path))
@@ -45,7 +46,11 @@ def test_putnpc_decodes_file_image_and_position(tmp_path):
     npc = next(iter(server.npc_manager._npcs.values()))
     assert (npc.image, npc.x, npc.y) == ("guard.png", 22.0, 12.5)
     assert npc.gs1_source == "setimg scripted.png;\n"
-    server.broadcast_to_level.assert_awaited_once()
+    # Server::addNPC: everyone around the NPC, creator included
+    # (Server.cpp:1586-1590), not only the creator's segment.
+    server.broadcast_nearby.assert_awaited_once()
+    assert server.broadcast_nearby.await_args.args[0] == "test.nw"
+    server.broadcast_to_level.assert_not_awaited()
 
 
 def test_putnpc_disabled_creates_nothing():

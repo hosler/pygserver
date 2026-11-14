@@ -6,6 +6,7 @@ import math
 from reborn_protocol.gs1.values import to_num, to_str
 
 from ..execution import _schedule
+from .. import frame
 from ...audience import GS1_EXPLOSION_PLAYERS, contains  # noqa: F401  - kept: original import block (star-import consumers rely on it)
 from ..host import NPC_CHARPROP, PLAYER_CHARPROP, PLAYER_PROP_WIRE, PLPROP, _NPC_GATTRIB_PROPS, _PLAYER_GATTRIB_PROPS, _charprop_target  # noqa: F401  - kept: original import block (star-import consumers rely on it)
 import asyncio  # noqa: F401  - kept: original import block (star-import consumers rely on it)
@@ -33,8 +34,13 @@ def _c_showimg(self, a, npc, player, ctx):
     index = _showimg_index(a)
     if not 0 <= index <= 199:
         return
-    props = {0: to_str(a[1]), 1: int(to_num(a[2]) * 2),
-             2: int(to_num(a[3]) * 2)}
+    # Whole-map tiles on a gmap, sent relative to the NPC's own segment as
+    # pygserver always has. The reference stores and sends the raw position
+    # (NPCServer.cpp:619-630), whole-map on a gmap; which frame the client
+    # draws a gmap NPC's image in is not established here.
+    x, y = frame.to_level(self.server, getattr(npc, "level", None),
+                          to_num(a[2]), to_num(a[3]))
+    props = {0: to_str(a[1]), 1: int(x * 2), 2: int(y * 2)}
     if len(a) >= 5:
         z = int(to_num(a[4]))
         if z != 0:

@@ -202,17 +202,24 @@ def cancel_moves(npc) -> None:
 _INT32_MIN = -2 ** 31
 
 
-def script_coordinate(server, npc, attr: str, tiles: float) -> Optional[float]:
+def script_coordinate(server, npc, attr: str, tiles: float,
+                      whole_map: bool = False) -> Optional[float]:
     """What a script `x = ...` / `y = ...` stores (NPC.cpp:1870-1935).
 
     The reference does not clamp: it truncates tiles * 16 to an int32 pixel and
     wraps it through toLocalPixelPosition (`% 1024`, C remainder, so a small
-    negative stays negative), then re-maps the gmap cell from the global pixel.
-    An out-of-range cast is undefined in C++; x86-64 yields INT_MIN, which wraps
+    negative stays negative), then re-maps the gmap cell from the global pixel
+    with a truncating divide (toMapPosition, Extents.h:559-562). An
+    out-of-range cast is undefined in C++; x86-64 yields INT_MIN, which wraps
     to 0, and so do we. None for a non-finite value.
 
+    `whole_map` says `tiles` is a global whole-map position (a GS1 script on a
+    gmap) instead of one relative to the NPC's own segment. The returned value
+    is always relative to the NPC's current segment.
+
     On a gmap the pixel stays unwrapped when the segment it points into exists:
-    NPCManager.confine_position does the re-map (a roll into that level). A
+    NPCManager.confine_position does the re-map (a roll into that level; a
+    whole-map write is flagged so the roll truncates like the setter). A
     pixel pointing at no segment wraps inside the current one, where the
     reference would strand the NPC in a segment nobody can load."""
     if not math.isfinite(tiles):
@@ -227,11 +234,25 @@ def script_coordinate(server, npc, attr: str, tiles: float) -> Optional[float]:
         info = world.get_gmap_for_level(level.name)
     if info is not None:
         gmap, grid_x, grid_y = info
-        shift = pixel // SEGMENT_PX
+        grid = grid_x if attr == "x" else grid_y
+        if whole_map:
+            target = trunc_div(pixel, SEGMENT_PX)
+            pixel -= grid * SEGMENT_PX
+            shift = target - grid
+        else:
+            shift = pixel // SEGMENT_PX
         cell = (grid_x + shift, grid_y) if attr == "x" else (grid_x, grid_y + shift)
         if shift == 0 or gmap.get_level_at(*cell):
+            if whole_map and hasattr(npc, "_roll_truncates"):
+                npc._roll_truncates = True
             return pixel / 16.0
     return int(math.fmod(pixel, SEGMENT_PX)) / 16.0
+
+
+def trunc_div(value: int, divisor: int) -> int:
+    """C integer division: toward zero."""
+    quotient = abs(value) // divisor
+    return quotient if value >= 0 else -quotient
 
 
 # -- stepping -------------------------------------------------------------------

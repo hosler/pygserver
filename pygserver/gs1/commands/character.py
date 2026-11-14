@@ -11,6 +11,7 @@ from ..host import (
     NPC_CHARPROP, PLAYER_CHARPROP, PLAYER_PROP_WIRE, PLPROP, _CLASSIC_COLOR_INDEX, _NPC_GATTRIB_PROPS, _PLAYER_GATTRIB_PROPS, _charprop_target,
 )
 from ..execution import _schedule
+from .. import frame
 from ...audience import GS1_EXPLOSION_PLAYERS, contains  # noqa: F401  - kept: original import block (star-import consumers rely on it)
 from ..host import _CLASSIC_COLORS  # noqa: F401  - kept: original import block (star-import consumers rely on it)
 import asyncio  # noqa: F401  - kept: original import block (star-import consumers rely on it)
@@ -212,6 +213,16 @@ def _c_triggeraction(self, a, npc, player, ctx):
     action = to_csv(fields)
     level = getattr(npc, "level", None)
     npc_id = getattr(npc, "id", 0)
+    # Whole-map tiles on a gmap name the segment the trigger lands in; the
+    # wire carries the local position and goes to the players around it
+    # (Server::sendTriggerAction, Server.cpp:2000-2008). No segment there:
+    # nobody can stand on it, so only the server-side handlers run.
+    placed = frame.segment_at(self.server, level, x, y) if level is not None else None
+    if placed is not None:
+        level, x, y = placed
+    elif level is not None:
+        x, y = frame.to_level(self.server, level, x, y)
+        level = None
 
     async def _dispatch():
         # GServer-v2 GS1Commands.cpp:3635 targets only the source player for clientside.
@@ -239,8 +250,9 @@ def _c_triggeraction(self, a, npc, player, ctx):
         manager = getattr(self.server, "npc_manager", None)
         if manager is not None and level is not None:
             await manager.fire_trigger_at(level, x, y, action, player, npc)
-            await self.server.broadcast_to_level(
-                level.name, build_trigger_action(0, npc_id, x, y, action))
+            cast = (getattr(self.server, "broadcast_nearby", None)
+                    or self.server.broadcast_to_level)
+            await cast(level.name, build_trigger_action(0, npc_id, x, y, action))
 
     _schedule(_dispatch())
 
@@ -249,7 +261,14 @@ def _spawn_npc(self, image, script, x, y, ctx):
     nm = getattr(self.server, "npc_manager", None) if self.server is not None else None
     if lvl is None or nm is None or not hasattr(nm, "create_npc"):
         return None
-    npc = nm.create_npc(level=lvl, x=to_num(x), y=to_num(y))
+    # Whole-map tiles on a gmap: the NPC goes into the segment the position
+    # names (Server::addNPC, Server.cpp:1485-1502; NPCServer.cpp:400-416 for
+    # putnpc2); a position on no segment creates nothing (frame.py).
+    placed = frame.segment_at(self.server, lvl, to_num(x), to_num(y))
+    if placed is None:
+        return None
+    lvl, x, y = placed
+    npc = nm.create_npc(level=lvl, x=x, y=y)
     if image:
         npc.image = to_str(image)
     if script:
@@ -357,7 +376,12 @@ def _c_puthorse(self, a, npc, player, ctx):
     lvl = self._level_of(ctx)
     if hm is None or lvl is None or not hasattr(hm, "add_horse"):
         return
-    _schedule(hm.add_horse(lvl, to_num(a[1]), to_num(a[2]),
+    # Whole-map tiles on a gmap (fn_puthorse, GS1Commands.cpp:1776-1795).
+    placed = frame.segment_at(self.server, lvl, to_num(a[1]), to_num(a[2]))
+    if placed is None:
+        return
+    lvl, x, y = placed
+    _schedule(hm.add_horse(lvl, x, y,
                            direction=0, bushes=2, image=to_str(a[0])))
 
 def _c_takehorse(self, a, npc, player, ctx):

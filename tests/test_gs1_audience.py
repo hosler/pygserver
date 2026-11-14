@@ -266,9 +266,11 @@ def test_tiles_read_crosses_into_the_adjacent_gmap_segment():
     assert npc.gs1_scopes["this"]["t"] == 123.0
 
 
-def test_tiles_read_at_exactly_64_stays_on_the_current_segment():
-    """Upstream's bound is `tileX > 64`, not `>=` (GS1Variables.cpp:400), so
-    tiles[64,y] wraps to column 0 of the CURRENT level."""
+def test_tiles_read_at_exactly_64_is_the_next_segment_on_a_gmap():
+    """A gmap is one Level of the whole map, so tiles[64,y] is whole-map
+    column 64: column 0 of the segment east (GS1Variables.cpp:403-413). The
+    `tileX > 64` bound of tilesCheckForAdjacent (:365-385) acts only on a
+    bigmap level."""
     server = FakeServer()
     here = server.add_level("a.nw")
     east = server.add_level("b.nw")
@@ -282,7 +284,13 @@ def test_tiles_read_at_exactly_64_stays_on_the_current_segment():
     npc = make_npc("if (created) { this.t = tiles[64,5]; }", here)
     run_npc_event(npc, "created", server, None)
 
-    assert npc.gs1_scopes["this"]["t"] == 11.0
+    assert npc.gs1_scopes["this"]["t"] == 22.0
+
+    # The same whole-map index from the east segment reads the same tile.
+    other = make_npc("if (created) { this.t = tiles[64,5]; this.u = tiles[0,5]; }", east)
+    run_npc_event(other, "created", server, None)
+    assert other.gs1_scopes["this"]["t"] == 22.0
+    assert other.gs1_scopes["this"]["u"] == 11.0
 
 
 def test_board_index_is_the_flat_level_index():
@@ -437,7 +445,9 @@ def test_updateboard_across_a_gmap_seam_gives_each_segment_its_part():
         gmap.width, gmap.height = 2, 1
         gmap.grid = {(0, 0): "a.nw", (1, 0): "b.nw"}
         server.world._gmaps["world.gmap"] = gmap
-        run_npc_event(make_npc("if (created) { tiles[0,5] = 13; tiles[1,5] = 14; }", east),
+        # tiles[] is whole-map on a gmap (GS1Variables.cpp:403-442): the east
+        # segment's columns 0-1 are 64-65 from any segment.
+        run_npc_event(make_npc("if (created) { tiles[64,5] = 13; tiles[65,5] = 14; }", east),
                       "created", server, None)
         run_npc_event(make_npc("if (created) { tiles[62,5] = 11; tiles[63,5] = 12;"
                                " updateboard 62,5,4,1; }", west), "created", server, None)

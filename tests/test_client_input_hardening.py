@@ -47,6 +47,7 @@ def served(tmp_path):
     server = MagicMock()
     server.config = ServerConfig(putnpc_enabled=True, serverside=False)
     server.broadcast_to_level = AsyncMock()
+    server.broadcast_nearby = AsyncMock()
     filesystem = FileSystem(server, str(tmp_path))
     (tmp_path / "images" / "pic.png").write_bytes(b"PNG")
     (tmp_path / "scripts" / "guard.txt").write_text("setimg x.png;\n")
@@ -73,7 +74,9 @@ def put_npc(served, scriptfile):
     player.level = level
     asyncio.run(player._handle_putnpc(
         encoded("x.png") + encoded(scriptfile) + bytes((72, 72))))
-    return served.server.broadcast_to_level
+    # Server::addNPC sends to the players around the NPC (Server.cpp:1586-1590).
+    assert not served.server.broadcast_to_level.await_count
+    return served.server.broadcast_nearby
 
 
 @pytest.mark.parametrize("name", [

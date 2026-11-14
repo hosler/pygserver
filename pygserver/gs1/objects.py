@@ -32,6 +32,7 @@ from reborn_protocol.gs1.values import to_num
 
 from .. import npc_motion
 from ..attachments import absolute_position
+from . import frame
 
 #: array name -> element kind
 ARRAYS = {
@@ -39,6 +40,14 @@ ARRAYS = {
     "compus": "baddy", "bombs": "bomb", "arrows": "arrow", "items": "item",
     "explos": "explosion", "horses": "horse", "signs": "sign",
 }
+
+#: Kinds whose x/y stay local to their segment on a gmap: a sign keeps a local
+#: whole-tile position (LevelSign.h:31; getSigns yields every part's signs
+#: unchanged, Level.cpp:1204-1224) and a baddy a local pixel position
+#: (LevelBaddy.h:127; getBaddyById finds none on a gmap, Level.cpp:2052-2056).
+#: Items, bombs, arrows, explosions and horses are global pixel positions in
+#: the reference, so those convert. All of these fields are read-only.
+_LOCAL_KINDS = frozenset(("sign", "baddy"))
 
 #: `<name>count` variable -> array name (playerscount predates this module)
 COUNTS = {name + "count": name for name in ARRAYS}
@@ -127,9 +136,11 @@ def sanitize(host, target, attr, value):
     Attributes with no numeric limit pass through unchanged."""
     if attr in _COORD_ATTRS and hasattr(target, "move_queue"):
         # An NPC's x/y are not clamped: the pixel wrap of NPC.cpp:1870-1935.
-        number = to_num(value)
+        # The script writes whole-map tiles on a gmap; the cell comes from the
+        # global pixel, truncated toward zero (NPC.cpp:1874-1891, frame.py).
+        server = getattr(host, "server", None)
         wrapped = npc_motion.script_coordinate(
-            getattr(host, "server", None), target, attr, number)
+            server, target, attr, to_num(value), whole_map=True)
         return DROP if wrapped is None else wrapped
     if attr in _COORD_ATTRS:
         low, high, integral = 0.0, coordinate_limit(host, target), False
@@ -530,10 +541,18 @@ def read_field(ref, field, sub=()):
                 value = flags.get(field)
                 return UNSET if value is None else value
             return UNSET
-        return _player_get(target, field)
-    if kind == "npc":
-        return _npc_get(target, field, sub)
-    return _level_object_get(kind, target, field)
+        value = _player_get(target, field)
+    elif kind == "npc":
+        value = _npc_get(target, field, sub)
+    else:
+        value = _level_object_get(kind, target, field)
+    if field in _COORD_ATTRS and value is not UNSET and kind not in _LOCAL_KINDS:
+        # Whole-map tiles on a gmap (frame.py). Players and NPCs carry their
+        # own level; the other level objects belong to the script's level.
+        level = (getattr(target, "level", None) if kind in ("player", "npc")
+                 else ref.host._level_of(ref.ctx))
+        value = frame.to_map_axis(ref.host.server, level, field, value)
+    return value
 
 
 def write_field(ref, field, value, sub=()):

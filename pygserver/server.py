@@ -272,6 +272,19 @@ class GameServer:
         if levels_path.exists():
             logger.info(f"Loading levels from {levels_path}")
 
+            # Load GMAPs first: a segment NPC's `created` script runs while
+            # its level loads and must already see the gmap, as on the
+            # reference, where the gmap is one level (GS1 frame, gs1/frame.py).
+            for gmap_name in self.config.gmaps:
+                gmap_path = levels_path / gmap_name
+                if gmap_path.exists():
+                    try:
+                        gmap = GMap.load(str(gmap_path))
+                        self.world.add_gmap(gmap)
+                        logger.info(f"Loaded GMAP: {gmap.name} ({gmap.width}x{gmap.height})")
+                    except Exception as e:
+                        logger.warning(f"Failed to load GMAP {gmap_name}: {e}")
+
             # Load individual levels, including nested folders (the
             # reference indexes level dirs recursively - FileSystem.cpp:91).
             # Only .nw files load eagerly; other suffixes resolve on demand.
@@ -285,17 +298,6 @@ class GameServer:
                     logger.debug(f"Loaded level: {level.name}")
                 except Exception as e:
                     logger.warning(f"Failed to load level {level_file}: {e}")
-
-            # Load GMAPs
-            for gmap_name in self.config.gmaps:
-                gmap_path = levels_path / gmap_name
-                if gmap_path.exists():
-                    try:
-                        gmap = GMap.load(str(gmap_path))
-                        self.world.add_gmap(gmap)
-                        logger.info(f"Loaded GMAP: {gmap.name} ({gmap.width}x{gmap.height})")
-                    except Exception as e:
-                        logger.warning(f"Failed to load GMAP {gmap_name}: {e}")
 
         # Load NPCs from scripts
         npcs_path = Path(self.config.npcs_dir)

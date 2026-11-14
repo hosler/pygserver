@@ -30,6 +30,7 @@ from reborn_protocol.gs1.host_shared import (
 )
 
 from .. import collision, npc_motion, tiletypes
+from . import frame
 from .player_flags import flag_table
 from .players import players_on_level_for, leader_player_for_level
 
@@ -206,8 +207,9 @@ class _GS1ObjectRef:
         attr = table.get(name) if table else None
         if attr is None:
             return UNSET
-        if self.kind == "player" and attr in ('x', 'y'):
-            return host_value(absolute_position(self.target)[attr == 'y'])
+        if attr in ('x', 'y'):
+            return host_value(self.host._map_coordinate(
+                self.target, attr, player=self.kind == "player"))
         return host_value(getattr(self.target, attr, 0))
 
     def set(self, name, value, indices=()):
@@ -296,13 +298,25 @@ class GS1Host(Host):
             return reader(self, name, indices, ctx, npc, player)
         if name in PLAYER_ATTR and player is not None:
             attr = PLAYER_ATTR[name]
-            value = (absolute_position(player)[attr == 'y'] if attr in ('x', 'y')
-                     else getattr(player, attr, 0))
+            value = (self._map_coordinate(player, attr, player=True)
+                     if attr in ('x', 'y') else getattr(player, attr, 0))
             # The player wire/state scale is 0/2/3; NPC glove power is 0/1/2.
             return self._coerce(value)
         if name in NPC_ATTR and npc is not None:
-            return self._coerce(getattr(npc, NPC_ATTR[name], 0))
+            attr = NPC_ATTR[name]
+            if attr in ('x', 'y'):
+                return self._coerce(self._map_coordinate(npc, attr))
+            return self._coerce(getattr(npc, attr, 0))
         return UNSET
+
+    def _map_coordinate(self, target, axis, player=False):
+        """A script read of an NPC's or a player's `x`/`y`: whole-map tiles
+        on a gmap (NPC.cpp:1869-1871, Player.cpp:1394-1396; see frame.py).
+        A player's position includes its attachment offset."""
+        local = (absolute_position(target)[axis == 'y'] if player
+                 else to_num(getattr(target, axis, 0)))
+        return frame.to_map_axis(self.server, getattr(target, "level", None),
+                                 axis, to_num(local))
 
     def set_builtin(self, name, value, indices, ctx) -> bool:
         if isinstance(ctx.this_obj, _GS1ObjectRef):
@@ -363,30 +377,25 @@ class GS1Host(Host):
         return False
 
     def _resolve_tile(self, indices, ctx):
-        """Resolve tiles[x,y], including classic bigmap segment overflow."""
+        """Resolve tiles[x,y] to (level, local x, local y), or None.
+
+        The index is `max(0, v)` truncated (GS1Visitor.cpp:1597-1604). The
+        level is the script's; on a gmap that is the whole map: the index is
+        wrapped and clamped by the map size and names the segment it falls
+        in, and a missing segment reads 0 and ignores a write
+        (GS1Variables.cpp:389-444). The neighbour hop of tilesCheckForAdjacent
+        (:365-385) acts only on a bigmap level, which pygserver has none of.
+        """
         if len(indices) < 2:
             return None
         level = getattr(ctx.this_obj, "level", None) if ctx.this_obj is not None else None
         if level is None or not hasattr(level, "get_tile"):
             return None
-        x = max(0, int(to_num(indices[0])))
-        y = max(0, int(to_num(indices[1])))
+        x = max(0, int(max(0.0, to_num(indices[0]))))
+        y = max(0, int(max(0.0, to_num(indices[1]))))
 
-        # GServer checks the adjacent segment before reducing the coordinates
-        # to the selected level's dimensions. The `> LEVEL_SIZE` (not `>=`)
-        # bound is upstream's: tilesCheckForAdjacent tests
-        # `tileX > subLevelTiles.width()` (GS1Variables.cpp:400), so tiles[64,y]
-        # reads column 0 of the CURRENT level rather than the next segment.
-        world = getattr(self.server, "world", None) if self.server is not None else None
-        if world is not None and (x > LEVEL_SIZE or y > LEVEL_SIZE):
-            info = world.get_gmap_for_level(getattr(level, "name", ""))
-            if info is not None:
-                gmap, gx, gy = info
-                target_name = gmap.get_level_at(gx + segment_index(x),
-                                                gy + segment_index(y))
-                target = world.get_level(target_name) if target_name else None
-                if target is not None:
-                    level = target
+        if frame.gmap_cell(self.server, level) is not None:
+            return frame.map_tile(self.server, level, x, y)
 
         width = int(getattr(level, "WIDTH", LEVEL_SIZE))
         height = int(getattr(level, "HEIGHT", LEVEL_SIZE))
@@ -651,6 +660,11 @@ class GS1Host(Host):
         value = objects.sanitize(self, player, attr, value)
         if value is objects.DROP:
             return  # non-finite: never let it reach state or a packet
+        if attr in ('x', 'y'):
+            # A script writes whole-map tiles on a gmap (Player.cpp:1397-1421);
+            # the player's state stays relative to its own segment.
+            value = frame.to_level_axis(self.server, getattr(player, "level", None),
+                                        attr, to_num(value))
         if attr in ('x', 'y') and getattr(player, 'attach_npc', (0, 0))[1]:
             # Script coordinates are absolute; retain offsets in wire state.
             base = absolute_position(player)[attr == 'y'] - getattr(player, attr)
@@ -691,24 +705,28 @@ class GS1Host(Host):
     # -- tiles and walls (collision.py holds the geometry) ------------------
 
     def _probe(self, args, ctx, rect_form):
-        """Parse onwall/onwater style arguments into (level, point|rect).
+        """Parse onwall/onwater style arguments into
+        (level, tile probe, point|rect).
 
         x,y are tiles (float32, truncated to pixels with the epsilon nudge,
         GS1Functions.cpp:1116-1188); width/height are floor(v*16) px, uint16.
-        None when the call is malformed or there is no level."""
+        On a gmap x,y are whole-map tiles, truncated in that global frame and
+        made relative to the script's segment (frame.py). None when the call
+        is malformed or there is no level."""
         level = self._level_of(ctx)
         if level is None or len(args) < (4 if rect_form else 2):
             return None
-        px = collision.tiles_to_pixels(to_num(args[0]))
-        py = collision.tiles_to_pixels(to_num(args[1]))
+        tiles = collision.TileProbe(self.server, level)
+        px = collision.tiles_to_pixels(to_num(args[0])) - tiles.origin_px[0]
+        py = collision.tiles_to_pixels(to_num(args[1])) - tiles.origin_px[1]
         if not rect_form:
-            return level, (px, py), None
+            return level, tiles, (px, py), None
         size = []
         for value in args[2:4]:
             number = to_num(value) * 16
             size.append(max(0, min(0xFFFF, math.floor(number)))
                         if math.isfinite(number) else 0)
-        return level, None, (px, py, size[0], size[1])
+        return level, tiles, None, (px, py, size[0], size[1])
 
     def _onwall(self, args, ctx, rect_form=False):
         """onwall(x,y) / onwall2(x,y,w,h): a wall tile, then (only for a
@@ -719,11 +737,11 @@ class GS1Host(Host):
         probe = self._probe(args, ctx, rect_form)
         if probe is None:
             return 0.0
-        level, point, rect = probe
+        level, tiles, point, rect = probe
         if point is not None:
-            if collision.is_on_wall_pixel(self.server, level, *point):
+            if tiles.type_at_pixel(*point) in tiletypes.WALL_TYPES:
                 return 1.0
-        elif collision.is_on_wall_rect(self.server, level, *rect):
+        elif tiles.any_in_rect(*rect, tiletypes.WALL_TYPES):
             return 1.0
         owner = self._object_owner(ctx)
         if owner is None or not hasattr(owner, "gs1_scopes"):
@@ -737,11 +755,12 @@ class GS1Host(Host):
         probe = self._probe(args, ctx, rect_form)
         if probe is None:
             return 0.0
-        level, point, rect = probe
+        level, tiles, point, rect = probe
+        # Water only, not lava, as collision.is_on_water_pixel.
         if point is not None:
-            wet = collision.is_on_water_pixel(self.server, level, *point)
+            wet = tiles.type_at_pixel(*point) == tiletypes.WATER
         else:
-            wet = collision.is_on_water_rect(self.server, level, *rect)
+            wet = tiles.any_in_rect(*rect, (tiletypes.WATER,))
         return 1.0 if wet else 0.0
 
     def _area_npcs(self, args, ctx):
@@ -756,8 +775,9 @@ class GS1Host(Host):
         if level is None or len(args) < 4:
             return []
         try:
-            px = math.floor(to_num(args[0]) * 16)
-            py = math.floor(to_num(args[1]) * 16)
+            ox, oy = frame.origin(self.server, level)
+            px = math.floor(to_num(args[0]) * 16) - ox * 16
+            py = math.floor(to_num(args[1]) * 16) - oy * 16
             size = [max(16, max(0, min(0xFFFF, math.floor(to_num(v) * 16))))
                     for v in args[2:4]]
         except (OverflowError, ValueError):
@@ -774,8 +794,11 @@ class GS1Host(Host):
         level = self._level_of(ctx)
         if level is None or len(args) < 2:
             return float(tiletypes.BLOCKING)
-        return float(collision.tile_type_at_script_tile(
-            self.server, level, to_num(args[0]), to_num(args[1])))
+        # Whole-map tiles on a gmap, truncated in that frame (frame.py).
+        tiles = collision.TileProbe(self.server, level)
+        return float(tiles.tile_type(
+            collision.tile_of(to_num(args[0])) - tiles.origin_tiles[0],
+            collision.tile_of(to_num(args[1])) - tiles.origin_tiles[1]))
 
     def _playersays(self, args, ctx, contains):
         # playersays(text) / playersays(index,text) — GS1Functions.cpp:963.
@@ -836,6 +859,8 @@ class GS1Host(Host):
         px, py = math.floor(to_num(args[0]) * 16), math.floor(to_num(args[1]) * 16)
         objects = self._players_on_level(ctx) if players else []
         level = self._level_of(ctx)
+        ox, oy = frame.origin(self.server, level)
+        px, py = px - ox * 16, py - oy * 16
         if players and not objects and level is not None:
             direct = getattr(level, "players", None)
             if direct is not None:
@@ -869,8 +894,8 @@ class GS1Host(Host):
             return []
         x, y = to_num(args[0]), to_num(args[1])
         players = self._players_on_level(ctx)
-        players.sort(key=lambda p: (to_num(absolute_position(p)[0]) - x) ** 2
-                     + (to_num(absolute_position(p)[1]) - y) ** 2)
+        players.sort(key=lambda p: (self._map_coordinate(p, 'x', player=True) - x) ** 2
+                     + (self._map_coordinate(p, 'y', player=True) - y) ** 2)
         return players
 
     def _nearest_player(self, args, ctx, return_id):
@@ -912,8 +937,9 @@ class GS1Host(Host):
             if condition is not None and not self._condition_for(
                     player, condition, ctx):
                 continue
-            px, py = absolute_position(player)
-            ranked.append((math.hypot(to_num(px) - x, to_num(py) - y), index))
+            px = self._map_coordinate(player, 'x', player=True)
+            py = self._map_coordinate(player, 'y', player=True)
+            ranked.append((math.hypot(px - x, py - y), index))
         ranked.sort(key=lambda pair: pair[0])
         return [float(index) for _, index in ranked]
 

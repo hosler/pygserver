@@ -7,6 +7,7 @@ from reborn_protocol.gs1.values import to_num
 
 from ...attachments import absolute_position
 from ..execution import _schedule
+from .. import frame
 from .. import objects as gs1_objects
 from ..host import NPC_CHARPROP, PLAYER_CHARPROP, PLAYER_PROP_WIRE, PLPROP, _NPC_GATTRIB_PROPS, _PLAYER_GATTRIB_PROPS, _charprop_target  # noqa: F401  - kept: original import block (star-import consumers rely on it)
 import asyncio  # noqa: F401  - kept: original import block (star-import consumers rely on it)
@@ -27,6 +28,12 @@ def _c_putbomb(self, a, npc, player, ctx):
         from ...combat import wire_tile_ok
         from ...protocol.packets import build_bomb_add
         x, y, power = to_num(a[1]), to_num(a[2]), to_num(a[0])
+        # Whole-map tiles on a gmap name the segment the bomb lands in
+        # (fn_putbomb, GS1Commands.cpp:1711-1723; frame.py).
+        placed = frame.segment_at(self.server, lvl, x, y)
+        if placed is None:
+            return
+        lvl, x, y = placed
         # One GCHAR carries each field; a bomb the wire cannot place is not
         # announced (the server keeps no state for script bombs).
         if not wire_tile_ok(x, y) or not math.isfinite(power):
@@ -42,6 +49,12 @@ def _explode(self, ctx, radius, power, x, y):
     lvl = self._level_of(ctx)
     if lvl is None or self.server is None:
         return
+    # Whole-map tiles on a gmap name the segment of the blast
+    # (fn_putexplosion, GS1Commands.cpp:1743-1773; frame.py).
+    placed = frame.segment_at(self.server, lvl, x, y)
+    if placed is None:
+        return
+    lvl, x, y = placed
     from ...combat import MAX_WIRE_RADIUS, wire_tile_ok
     if not all(isinstance(v, (int, float)) and math.isfinite(v) for v in (radius, power)):
         return
@@ -101,7 +114,11 @@ def _c_hitplayer(self, a, npc, player, ctx):
         except Exception:
             dtype = None
         target = players[idx]
-        hurt_dx, hurt_dy = _player_hurt_push(target, to_num(a[2]), to_num(a[3]))
+        # fromx/fromy are whole-map tiles on a gmap (Server::hitPlayer,
+        # Server.cpp:1958-1969); the push is measured in the target's frame.
+        from_x, from_y = frame.to_level(self.server, getattr(target, "level", None),
+                                        to_num(a[2]), to_num(a[3]))
+        hurt_dx, hurt_dy = _player_hurt_push(target, from_x, from_y)
         _schedule(cm.apply_damage(target, math.floor(to_num(a[1])),
                                   hurt_dx, hurt_dy, dtype))
 
@@ -145,10 +162,18 @@ def _c_hitobjects(self, a, npc, player, ctx):
     lvl = self._level_of(ctx)
     if lvl is None:
         return
+    # Whole-map tiles on a gmap name the segment hit (frame.py). Divergence:
+    # the reference writes the whole-map tile * 2 into the GCHAR fields
+    # (Server.cpp:1952-1956), which no segment-local client frame matches;
+    # pygserver sends the segment-local position like every other packet.
+    placed = frame.segment_at(self.server, lvl, to_num(a[1]), to_num(a[2]))
+    if placed is None:
+        return
+    lvl, hit_x, hit_y = placed
     try:
         from ...protocol.packets import build_hit_objects
         power = int(to_num(a[0]) * 2)
-        pkt = build_hit_objects(0, power, to_num(a[1]), to_num(a[2]), npc_id=npc.id)
+        pkt = build_hit_objects(0, power, hit_x, hit_y, npc_id=npc.id)
         # Server::hitObjectsAtPoint: sendPacketToNearby, nobody excluded
         # (Server.cpp:1952-1956).
         cast = (getattr(self.server, "broadcast_nearby", None)
@@ -173,7 +198,10 @@ def _c_hitnpc(self, a, npc, player, ctx):
         return
     target = npcs[idx]
     halfhearts = math.floor(to_num(a[1]))
-    dx, dy = _normalized_push(target, a[2], a[3])
+    # fromx/fromy are whole-map tiles on a gmap; compare in the target's frame.
+    from_x, from_y = frame.to_level(self.server, getattr(target, "level", None),
+                                    to_num(a[2]), to_num(a[3]))
+    dx, dy = _normalized_push(target, from_x, from_y)
     # stored as the NPC's signed half-pixel HURTDXDY push
     gs1_objects.set_npc_hurt(target, dx, dy)
     target.hearts = max(0.0, to_num(getattr(target, "hearts", 0)) - halfhearts / 2.0)
@@ -206,9 +234,13 @@ def _c_hitcompu(self, a, npc, player, ctx):
     leader = self._leader_player(ctx)
     if leader is None:
         return
+    # pygserver-only on a gmap: the reference does nothing there
+    # (GS1Commands.cpp:1405-1406, `!level->isGmap()`), but pygserver keeps
+    # baddies on gmap segments, so the command still works. fromx/fromy are
+    # whole-map tiles there, for consistency with every other GS1 coordinate.
+    from_x, from_y = frame.to_level(self.server, lvl, to_num(a[2]), to_num(a[3]))
     _schedule(bm.handle_baddy_hurt(
-        leader, baddies[idx].id, math.floor(to_num(a[1])),
-        to_num(a[2]), to_num(a[3])))
+        leader, baddies[idx].id, math.floor(to_num(a[1])), from_x, from_y))
 
 def _c_hurt(self, a, npc, player, ctx):
     # hurt <halfhearts> — C++ fn_hurt (GS1Commands.cpp:1423) floors the

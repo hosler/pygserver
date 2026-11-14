@@ -6,6 +6,7 @@ from reborn_protocol.coords import LEVEL_SIZE
 from reborn_protocol.gs1.values import to_num, to_str
 
 from ..execution import _schedule
+from .. import frame
 from ...audience import GS1_EXPLOSION_PLAYERS, contains  # noqa: F401  - kept: original import block (star-import consumers rely on it)
 from ..host import NPC_CHARPROP, PLAYER_CHARPROP, PLAYER_PROP_WIRE, PLPROP, _NPC_GATTRIB_PROPS, _PLAYER_GATTRIB_PROPS, _charprop_target  # noqa: F401  - kept: original import block (star-import consumers rely on it)
 import asyncio  # noqa: F401  - kept: original import block (star-import consumers rely on it)
@@ -14,9 +15,9 @@ import time  # noqa: F401  - kept: original import block (star-import consumers 
 
 logger = logging.getLogger(__name__)
 
-def _spawn_item(self, ctx, code, x, y):
+def _spawn_item(self, ctx, code, x, y, lvl=None):
     im = getattr(self.server, "item_manager", None) if self.server is not None else None
-    lvl = self._level_of(ctx)
+    lvl = lvl if lvl is not None else self._level_of(ctx)
     if im is None or lvl is None or not hasattr(im, "spawn_item"):
         return
     from ...protocol.constants import LevelItemType
@@ -37,12 +38,20 @@ def _c_lay(self, a, npc, player, ctx):
     # lay itemname — drop an item at the NPC's position
     if npc is None or not a:
         return
-    _spawn_item(self, ctx, a[0], getattr(npc, "x", 0), getattr(npc, "y", 0))
+    _spawn_item(self, ctx, a[0], getattr(npc, "x", 0), getattr(npc, "y", 0),
+                lvl=getattr(npc, "level", None))
 
 def _c_lay2(self, a, npc, player, ctx):
     # lay2 itemname,x,y — drop an item at an exact position
-    if len(a) >= 3:
-        _spawn_item(self, ctx, a[0], a[1], a[2])
+    if len(a) < 3:
+        return
+    # Whole-map tiles on a gmap name the segment (fn_lay2,
+    # GS1Commands.cpp:1647-1659; frame.py).
+    lvl = self._level_of(ctx)
+    placed = (frame.segment_at(self.server, lvl, to_num(a[1]), to_num(a[2]))
+              if lvl is not None else None)
+    if placed is not None:
+        _spawn_item(self, ctx, a[0], placed[1], placed[2], lvl=placed[0])
 
 def _c_take(self, a, npc, player, ctx):
     # take itemname — remove matching items within ~10 tiles of the NPC
@@ -91,10 +100,7 @@ def _updateboard(self, a, ctx, permanent):
     lvl = self._level_of(ctx)
     if lvl is None or not hasattr(lvl, "_tiles"):
         return
-    x = max(0, int(to_num(a[0])))
-    y = max(0, int(to_num(a[1])))
-    w = max(0, int(to_num(a[2])))
-    h = max(0, int(to_num(a[3])))
+    x, y, w, h = (_board_arg(v) for v in a[:4])
     config = getattr(self.server, "config", None)
     keep = bool(permanent and getattr(config, "savelevels", False))
     for part, px, py, pw, ph in _board_parts(self.server, lvl, x, y, w, h):
@@ -115,21 +121,28 @@ def _updateboard(self, a, ctx, permanent):
                     logger.exception("updateboard2 could not save %s", part.name)
 
 
+def _board_arg(value):
+    """An updateboard argument as a non-negative int (max(0, v), as
+    fn_updateboard, GS1Commands.cpp:3721-3724); +inf and huge values are kept
+    finite, NaN is 0."""
+    number = to_num(value)
+    if number != number:
+        return 0
+    return int(max(0.0, min(number, 2.0 ** 31)))
+
+
 def _board_parts(server, lvl, x, y, w, h):
     """The (level, x, y, w, h) pieces an `updateboard` rectangle covers, each
     in its own segment's tile coordinates. The reference walks every sub-level
     the rectangle touches (Level::applyBoardChangeFromScriptTiles,
     Level.cpp:1751-1799, getSubLevelsInRectangle :3170-3182) and alterBoard
     splits the change per part (:1698-1738); a part that does not exist is
-    skipped (:1707-1709).
+    skipped (:1696-1698).
 
     Frame: the reference's gmap is one Level covering the whole map, so the
-    rectangle is in whole-map tile coordinates. pygserver's `tiles[]` (the
-    script layer this reads) addresses the script's own segment and hops to
-    a neighbour past its edge (GS1Host._resolve_tile), so the rectangle is
-    taken the same way, from the script's own segment. The two frames agree
-    for the map's top-left segment. A level outside any gmap keeps the
-    one-segment clamp."""
+    rectangle is in whole-map tile coordinates, like `tiles[]`
+    (GS1Host._resolve_tile, frame.py), whichever segment runs the script.
+    A level outside any gmap keeps the one-segment clamp."""
     world = getattr(server, "world", None)
     info = (world.get_gmap_for_level(lvl.name)
             if world is not None and hasattr(world, "get_gmap_for_level") else None)
@@ -137,13 +150,20 @@ def _board_parts(server, lvl, x, y, w, h):
         w = min(LEVEL_SIZE - x, w)
         h = min(LEVEL_SIZE - y, h)
         return [(lvl, x, y, w, h)] if w > 0 and h > 0 and x < LEVEL_SIZE and y < LEVEL_SIZE else []
-    if w == 0 or h == 0:
-        return []
     gmap, gx, gy = info
+    # Bound the rectangle by the map before walking its parts. The reference
+    # has no explicit clamp: its area is a Rectangle<uint16_t, uint8_t>
+    # (Extents.h:320) and the part indices are uint8 (Level.cpp:3172-3173),
+    # so the walk is bounded by those types, and a part off the map is
+    # skipped (:1696-1698). Clamping to the map gives the same parts.
+    w = min(x + w, gmap.width * LEVEL_SIZE) - x
+    h = min(y + h, gmap.height * LEVEL_SIZE) - y
+    if w <= 0 or h <= 0:
+        return []
     parts = []
     for sy in range(y // LEVEL_SIZE, (y + h - 1) // LEVEL_SIZE + 1):
         for sx in range(x // LEVEL_SIZE, (x + w - 1) // LEVEL_SIZE + 1):
-            name = gmap.get_level_at(gx + sx, gy + sy)
+            name = gmap.get_level_at(sx, sy)
             part = world.get_level(name) if name else None
             if part is None or not hasattr(part, "_tiles"):
                 continue

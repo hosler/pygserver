@@ -218,7 +218,11 @@ class EntityHandlers:
         npc = manager.create_npc(level=self.level, x=x, y=y)
         npc.image = image
         manager.attach_gs1(npc, code)
-        await self.server.broadcast_to_level(
+        # Server::addNPC sends to everyone around the NPC, the creator
+        # included: the 3x3 on a gmap, the level otherwise (Server.cpp:1586-1590).
+        # The wire x/2, y/2 stay in the player's own segment: how a real
+        # client frames them on a gmap is not established.
+        await self.server.broadcast_nearby(
             self.level.name, npc.build_props_packet()
         )
 

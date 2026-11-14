@@ -133,6 +133,7 @@ def test_tiletype_reads_gmap_neighbour_and_missing_segment():
     east.set_tile(6, 3, WALL)
     world = FakeWorld([west, east], grid={(0, 0): "w.nw", (1, 0): "e.nw"})
     server = FakeServer(world)
+    # Whole-map tiles on a gmap (frame.py): (70,3) is in the east segment.
     npc = make_npc("if (created) { this.a = tiletype(70,3); this.b = tiletype(5,64); }",
                    west)
     scope = run(npc, server)
@@ -159,7 +160,10 @@ def test_gmap_probe_reaches_the_neighbour_in_every_direction(script, step):
         level.set_tile(7, 9, WALKABLE)
     server = FakeServer(world)
     here = levels[script]
-    x, y = 7.5 + 64 * step[0], 9.5 + 64 * step[1]
+    # A gmap is one level of the whole map (Level.h:461-472), so the probe is
+    # in whole-map tiles whichever segment runs the script.
+    x = 7.5 + 64 * (script[0] + step[0])
+    y = 9.5 + 64 * (script[1] + step[1])
     npc = make_npc(f"if (created) {{ this.w = onwall({x},{y}); this.t = tiletype({x},{y});"
                    f" this.w2 = onwall2({x},{y},0.5,0.5); }}", here)
     scope = run(npc, server)
@@ -173,9 +177,11 @@ def test_gmap_probe_just_past_an_edge_matches_the_next_column():
     west, east = flat_level("w.nw"), flat_level("e.nw")
     west.set_tile(63, 5, WALL)
     server = FakeServer(FakeWorld([west, east], grid={(0, 0): "w.nw", (1, 0): "e.nw"}))
-    npc = make_npc("if (created) { this.a = tiletype(-0.5,5); this.b = tiletype(-1,5);"
-                   " this.c = tiletype(-0.01,5); this.d = onwall(-0.5,5.5);"
-                   " this.e = onwall(-1,5.5); }", east)
+    # Whole-map tiles: column 63 is the west segment's last column, read here
+    # from a script in the east segment.
+    npc = make_npc("if (created) { this.a = tiletype(63.5,5); this.b = tiletype(63,5);"
+                   " this.c = tiletype(63.99,5); this.d = onwall(63.5,5.5);"
+                   " this.e = onwall(63,5.5); }", east)
     scope = run(npc, server)
     assert (scope["a"], scope["b"], scope["c"]) == (22.0, 22.0, 22.0)
     assert (scope["d"], scope["e"]) == (1.0, 1.0)

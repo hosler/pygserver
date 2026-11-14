@@ -385,6 +385,9 @@ class NPC:
         self.move_queue = npc_motion.new_queue()
         self._move_events = 0
         self._position_check = False
+        # Set by a whole-map script write: its cell roll truncates toward zero
+        # like the reference setter (npc_motion.script_coordinate).
+        self._roll_truncates = False
         # Wall probes left for script-driven move flushes this tick
         # (npc_motion.WALL_BUDGET); the tick loop refills it.
         self._wall_budget = npc_motion.WALL_BUDGET
@@ -1827,6 +1830,9 @@ class NPCManager:
         vanish into a segment nobody can load). A roll is a cell change, sent
         as props only (`_cross_cell`)."""
         npc._position_check = False
+        truncates = getattr(npc, "_roll_truncates", False)
+        if truncates:
+            npc._roll_truncates = False
         level = npc.level
         if level is None:
             return
@@ -1844,7 +1850,14 @@ class NPCManager:
             return
         world = self.server.world
         gmap, grid_x, grid_y = info
-        shift_x, shift_y = px // 1024, py // 1024
+        if truncates:
+            # A whole-map script write: the cell of the global pixel, by the
+            # reference's truncating divide (NPC.cpp:1874-1891). The new local
+            # pixel may be negative in cell 0.
+            shift_x = npc_motion.trunc_div(px + grid_x * 1024, 1024) - grid_x
+            shift_y = npc_motion.trunc_div(py + grid_y * 1024, 1024) - grid_y
+        else:
+            shift_x, shift_y = px // 1024, py // 1024
         if not shift_x and not shift_y:
             return
         name = gmap.get_level_at(grid_x + shift_x, grid_y + shift_y)
