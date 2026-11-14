@@ -88,11 +88,11 @@ def contains(shape: Shape, cx: float, cy: float, radius: float,
 # sendToLevel, which is the 3x3 on a gmap. One packet carries both kinds as
 # two separate buffers (outAll / outLevel,
 # server/src/utilities/PropertySerializers.cpp:726-737), so a sendToAll prop
-# is never repeated in the nearby packet. The player-list status has no
-# storage in this server yet (prop 53 is PSTATUSMSG in PLPROP, the reference's
-# PLAYERLISTSTATUS, PlayerProps.h:76; GATTRIB10 is 54), so it is left out of
-# the set.
-SEND_TO_ALL_PROPS = frozenset({PLPROP.NICKNAME, PLPROP.HEADIMAGE})
+# is never repeated in the nearby packet. The player-list status is prop 53,
+# PSTATUSMSG in PLPROP and PLAYERLISTSTATUS in the reference
+# (PlayerProps.h:76; GATTRIB10 is 54).
+SEND_TO_ALL_PROPS = frozenset({PLPROP.NICKNAME, PLPROP.HEADIMAGE,
+                               PLPROP.PSTATUSMSG})
 
 BOMB_BLAST_NPCS = Shape.CIRCLE
 BOMB_BLAST_BADDIES = Shape.CIRCLE

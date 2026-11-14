@@ -22,6 +22,11 @@ logger = logging.getLogger(__name__)
 # as latin-1; the files are read and written the same way so every byte
 # round-trips.
 OPTIONS_FILE_ENCODING = 'latin-1'
+
+# Server.h:177 playerlisticons default.
+DEFAULT_PLAYERLISTICONS = ('Online', 'Away', 'DND', 'Eating', 'Hiding',
+                           'No PMs', 'RPing', 'Sparring', 'PKing')
+
 # Characters str.splitlines() treats as a line end, beyond '\n' itself.
 LINE_BREAK_CHARS = frozenset('\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029')
 
@@ -300,6 +305,10 @@ class ServerConfig:
     # Server.h:163: weapons granted at login and kept from client deletion
     # (PlayerClient.cpp:606, PlayerClientPackets.cpp:883).
     protectedweapons: List[str] = field(default_factory=list)
+    # Server.h:177: the labels PLO_STATUSLIST offers; a player's status byte
+    # (prop 53) indexes this list (PlayerClient.cpp:529-536).
+    playerlisticons: List[str] = field(default_factory=lambda: list(
+        DEFAULT_PLAYERLISTICONS))
 
     # Server.h:125 / PlayerClientPackets.cpp:352: a client item drop is refused.
     disableitemdropping: bool = False
@@ -523,6 +532,12 @@ class ServerConfig:
                         elif key == 'protectedweapons':
                             config.protectedweapons = [
                                 w.strip() for w in value.split(',') if w.strip()]
+                        elif key == 'playerlisticons':
+                            # Settings.h:245-256 splits on commas; the list is
+                            # trimmed when it is sent (PlayerClient.cpp:534).
+                            config.playerlisticons = [
+                                w.strip() for w in value.split(',')
+                                if w.strip()]
                         elif key == 'nofoldersconfig':
                             config.nofoldersconfig = scalar.lower() == 'true'
                         elif key in ('sharefolder', 'maps'):
@@ -651,6 +666,8 @@ class ServerConfig:
                 lines.append(f"{key} = {','.join(getattr(self, key))}")
         lines += [f"spawnrate{name} = {rate}"
                   for name, rate in self.spawn_rates.items()]
+        if self.playerlisticons != list(DEFAULT_PLAYERLISTICONS):
+            lines.append(f"playerlisticons = {','.join(self.playerlisticons)}")
         if self.protectedweapons:
             lines.append(f"protectedweapons = {','.join(self.protectedweapons)}")
         return lines

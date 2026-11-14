@@ -69,6 +69,11 @@ class Touch(NamedTuple):
     pixel_x: int
     pixel_y: int
     facing: int
+    # Where the call came from: the index of the prop in the packet and the
+    # sprite byte in force, so the props after it can be tested again once
+    # a link warp has moved the player (PlayerProps.cpp:1191-1210).
+    prop_index: int = -1
+    sprite: int = 0
 
 
 _TOUCH_PROPS = frozenset((PLPROP.X, PLPROP.X2, PLPROP.Y, PLPROP.Y2, PLPROP.SPRITE))
@@ -78,13 +83,16 @@ def _pixel(tiles: float) -> int:
     return int(round(tiles * PIXELS_PER_TILE))
 
 
-def touches_for_props(player, props) -> List[Touch]:
+def touches_for_props(player, props, state=None,
+                      first_index=0) -> List[Touch]:
     """The testForTouch calls a PLI_PLAYERPROPS packet makes, in wire order
     (PlayerProps.cpp:466-501 X/Y, :543-546 SPRITE, :1080-1115 X2/Y2). An
     unchanged value is ignored before the test (:469, :488), so standing
     still never triggers one. Reads the player's state BEFORE the packet is
     applied. A player attached to an NPC reports relative offsets, which
-    are not level positions, so it makes no tests."""
+    are not level positions, so it makes no tests. `state` is (pixel x,
+    pixel y, facing, sprite byte) to start from instead of the player's, and
+    `first_index` the packet position of the first of `props`."""
     config = getattr(player.server, 'config', None)
     if not (server_tests_links(config) or server_tests_signs(config)):
         return []
@@ -93,32 +101,35 @@ def touches_for_props(player, props) -> List[Touch]:
     npc_id = getattr(player, 'attach_npc', (0, 0))[1]
     if npc_id or vars(player).get('_attachment_position_unknown', False):
         return []
-    px, py = _pixel(player.x), _pixel(player.y)
-    facing = player.direction & 3
-    sprite_byte = player.sprite
+    if state is None:
+        px, py = _pixel(player.x), _pixel(player.y)
+        facing = player.direction & 3
+        sprite_byte = player.sprite
+    else:
+        px, py, facing, sprite_byte = state
     touches: List[Touch] = []
-    for prop, value in props.items():
+    for index, (prop, value) in enumerate(props.items(), first_index):
         if prop in (PLPROP.X, PLPROP.X2):
             new = _pixel(value / 2.0) if prop == PLPROP.X else _pixel(value)
             if new == px:
                 continue
             direction = 2 + max(-1, min(1, new - px))
             px = new
-            touches.append(Touch(direction, px, py, facing))
+            touches.append(Touch(direction, px, py, facing, index, sprite_byte))
         elif prop in (PLPROP.Y, PLPROP.Y2):
             new = _pixel(value / 2.0) if prop == PLPROP.Y else _pixel(value)
             if new == py:
                 continue
             direction = 1 + max(-1, min(1, new - py))
             py = new
-            touches.append(Touch(direction, px, py, facing))
+            touches.append(Touch(direction, px, py, facing, index, sprite_byte))
         elif prop == PLPROP.SPRITE:
             if value == sprite_byte:
                 continue
             sprite_byte = value
             if (value & 3) != facing:
                 facing = value & 3
-                touches.append(Touch(facing, px, py, facing))
+                touches.append(Touch(facing, px, py, facing, index, sprite_byte))
     return touches
 
 
@@ -181,14 +192,37 @@ def link_destination_pixel(text: str, own_pixel: int, player_pixel_x: int,
         return int(value * PIXELS_PER_TILE)
 
 
+def _signs_in_reference_order(player):
+    """Level::getSigns (Level.cpp:1204-1226): off a gmap the level's signs;
+    on one every segment's signs, the segments in cell-index order (row by
+    row, Level.h:504-514), each in file order. The reference holds every
+    part of a gmap from the moment it loads the gmap (LevelLoader.cpp:
+    198-226), so every segment counts. `get_level` reads a segment from disk
+    once and the level manager caches it, so later packets cost a dict
+    lookup. A segment with no file is skipped, as a null part is
+    (Level.cpp:1218)."""
+    info = player._gmap_info(player.level)
+    if info is None:
+        yield from player.level.get_signs().items()
+        return
+    gmap = info[0]
+    for cell_y in range(gmap.height):
+        for cell_x in range(gmap.width):
+            name = gmap.get_level_at(cell_x, cell_y)
+            segment = player.server.world.get_level(name) if name else None
+            if segment is not None:
+                yield from segment.get_signs().items()
+
+
 def _sign_hit(player, touch: Touch) -> Optional[str]:
     """testForSigns (PlayerClient.cpp:1833-1853): facing up AND moving up,
     the same local pixel row as the sign tile, within [-24, +8] pixels of
     its column. On a gmap the reference walks the signs of every segment
-    (Level.cpp:1204-1226); only the player's own segment is read here."""
+    (Level.cpp:1204-1226), so a sign of another segment at the same local
+    pixel position answers too; the first hit wins."""
     if touch.facing != 0 or touch.direction != 0:
         return None
-    for (tile_x, tile_y), text in player.level.get_signs().items():
+    for (tile_x, tile_y), text in _signs_in_reference_order(player):
         sign_x, sign_y = tile_x * PIXELS_PER_TILE, tile_y * PIXELS_PER_TILE
         if touch.pixel_y == sign_y and sign_x - 24 <= touch.pixel_x <= sign_x + 8:
             return text
@@ -257,17 +291,50 @@ async def _warp_through(player, touch: Touch, link) -> bool:
     return True
 
 
-async def run_touches(player, touches: List[Touch]) -> bool:
+def _after_warp(player, props, touch: Touch) -> List[Touch]:
+    """The props after the one that warped, applied to the destination: the
+    tests they make start from the destination position and the facing in
+    force, then the packet's own position values replace the warp's
+    (PlayerProps.cpp:466-501, 1080-1115 set the pixel straight from the
+    prop)."""
+    rest = dict(list(props.items())[touch.prop_index + 1:])
+    if not rest:
+        return []
+    state = (_pixel(player.x), _pixel(player.y), touch.facing, touch.sprite)
+    touches = touches_for_props(player, rest, state, touch.prop_index + 1)
+    for prop, value in rest.items():
+        if prop == PLPROP.X:
+            player.x = value / 2.0
+        elif prop == PLPROP.X2:
+            player.x = value
+        elif prop == PLPROP.Y:
+            player.y = value / 2.0
+        elif prop == PLPROP.Y2:
+            player.y = value
+    absolute_position(player)
+    return touches
+
+
+async def run_touches(player, touches: List[Touch], props=None) -> bool:
     """testForTouch (PlayerClient.cpp:1775-1790) for each recorded test:
     signs, then links, stopping at the first hit of a call (a sign hit
     returns before the link test, so a sign and a link on one spot give the
     sign only). The NPC touch is skipped per call, not per packet, so this
     returns True only when EVERY call was taken by a sign or link; a call
     nothing took still gets its NPC touch from the caller.
-    `absolute_position` keeps the resolved position cache current."""
+    `absolute_position` keeps the resolved position cache current.
+
+    After a link warp the packet goes on (Player::setPropsFromPacket applies
+    its props one at a time and the warp is synchronous, PlayerProps.cpp:
+    1191-1210): with `props`, the props after the one that warped set the
+    destination's position and are tested there. The warp ends the call
+    either way, so the result is True once one has happened."""
     config = getattr(player.server, 'config', None)
     taken = 0
-    for touch in touches:
+    warped = False
+    queue = list(touches)
+    while queue:
+        touch = queue.pop(0)
         level = player.level
         if level is None:
             break
@@ -282,5 +349,8 @@ async def run_touches(player, touches: List[Touch]) -> bool:
             found = _link_hit(player, touch)
             if found is not None and await _warp_through(player, touch, found[1]):
                 absolute_position(player)
-                return True
-    return bool(touches) and taken == len(touches)
+                warped = True
+                if props is None:
+                    return True
+                queue = _after_warp(player, props, touch)
+    return warped or (bool(touches) and taken == len(touches))

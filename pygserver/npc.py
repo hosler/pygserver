@@ -548,17 +548,13 @@ class NPC:
             if value == getattr(self, attr, 0):
                 return {}
             setattr(self, attr, value)
-            if attr in ('x', 'y'):
-                # NPC::setProp leaves the move queue alone (NPC.cpp:1085-1110);
-                # only the script paths clear it. The testForLinks clamp
-                # follows (NPC.cpp:2038).
-                # Only an NPC server rolls or clamps a position
-                # (NPC::testForTouch returns without one, NPC.cpp:2141-2146,
-                # and client NPC props are refused with one,
-                # PlayerClientPackets.cpp:192), so on a gmap the out-of-range
-                # value stays. Off a gmap pygserver still clamps.
-                if self.map_cell() is None:
-                    self._position_check = True
+            # NPC::setProp leaves the move queue alone (NPC.cpp:1085-1110);
+            # only the script paths clear it. Nothing clamps or rolls the
+            # position here: that is NPC::testForLinks, reached through
+            # NPC::testForTouch, which returns without an NPC server
+            # (NPC.cpp:2141-2146), and client NPC props are refused with one
+            # (PlayerClientPackets.cpp:192). A client-set position stays as
+            # sent, on a gmap and off it.
             return {prop_id: value, paired: value}
         if 23 <= prop_id <= 32:
             saves = getattr(self, 'saves', [0] * 10)

@@ -191,6 +191,39 @@ def test_bomb_and_arrow_relays_stay_on_the_senders_segment(tmp_path, clock):
         + build_arrow_add(SENDER, 10.0, 12.0, 1, 0, 1))
 
 
+def throw_across_the_seam(server, sender):
+    """A held bomb in flight that is stored on the neighbour's segment while
+    the thrower stays in its own."""
+    from pygserver.combat import Bomb
+    bomb = Bomb(17, SENDER, "c11.nw", 10.0, 12.0, 1, 2)
+    bomb.in_flight = True
+    server.combat_manager._held_bombs[SENDER] = bomb
+    sender.carrysprite = 0
+    return bomb
+
+
+def test_a_thrown_bomb_that_lands_across_a_seam_goes_to_the_senders_cell(tmp_path, clock):
+    """msgPLI_BOMBADD: sendPacketToOneLevelPart at the sender's position
+    (PlayerClientPackets.cpp:237), whatever segment the bomb is stored in."""
+    server, players = gmap_arena(tmp_path)
+    throw_across_the_seam(server, players[SENDER])
+    run(server.combat_manager.handle_bomb_add(
+        players[SENDER], 10.0, 12.0, 1, timer_ticks=59))
+    assert audience(players) == {SAME}
+    assert received(players[SAME]) == build_bomb_add(SENDER, 10.0, 12.0, 1, 59)
+    assert 17 in server.combat_manager._bombs["c11.nw"]
+
+
+def test_a_held_bomb_explosion_goes_to_the_senders_cell(tmp_path, clock):
+    """msgPLI_EXPLOSION (PlayerClientPackets.cpp:855-856), not the bomb's
+    stored segment."""
+    server, players = gmap_arena(tmp_path)
+    throw_across_the_seam(server, players[SENDER])
+    assert run(server.combat_manager.handle_held_bomb_explosion(
+        players[SENDER], 10.0, 12.0, 4, 1))
+    assert audience(players) - {SENDER} == {SAME}
+
+
 # -- a plain level keeps its level audience -----------------------------------------------
 
 def test_plain_level_audience_is_the_level(tmp_path, clock):

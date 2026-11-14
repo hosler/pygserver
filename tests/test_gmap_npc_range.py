@@ -597,9 +597,10 @@ def test_a_client_set_position_does_not_roll_the_npc_across_the_seam(tmp_path, c
         build_npc_props(npc.id, {NPCPROP.X2: 70.0, NPCPROP.X: 70.0})]
 
 
-def test_a_client_set_position_off_a_gmap_is_still_clamped(tmp_path, clock):
-    """Unchanged outside a gmap: pygserver clamps to the level on the next
-    tick (the reference does not on this path; reported, not changed)."""
+def test_a_client_set_position_off_a_gmap_is_not_clamped_either(tmp_path, clock):
+    """The clamp lives in NPC::testForLinks, reached only with an NPC server
+    (NPC.cpp:2141-2146), and a client may only set NPC props without one
+    (PlayerClientPackets.cpp:192): the position stays as sent."""
     server = client_npc_world(tmp_path)
     npc = new_npc(server, "a.nw", x=12.0, y=14.0)
     sender = loaded_player(server, 2)
@@ -607,7 +608,7 @@ def test_a_client_set_position_off_a_gmap_is_still_clamped(tmp_path, clock):
     run(sender._dispatch_packet(
         PLI.NPCPROPS, npc_props_payload(npc.id, {NPCPROP.X2: 70.0})))
     run(server.npc_manager.tick())
-    assert npc.x == 61.0
+    assert npc.x == 70.0
 
 
 # -- sendToAll props reach everyone, the rest the 3x3 ---------------------------------------

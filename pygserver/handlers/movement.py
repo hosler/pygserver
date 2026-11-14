@@ -98,6 +98,7 @@ class MovementHandlers:
         # Server-side sign and link tests read the state before this packet
         # is applied (PlayerProps.cpp:466-546, 1080-1115).
         touches = touches_for_props(self, props) if self.level else []
+        touch_props = dict(props)       # Touch.prop_index counts in this order
         if PLPROP.ATTACHNPC in props:
             kind, npc_id = props[PLPROP.ATTACHNPC]
             if npc_id <= 0 or kind == 0:
@@ -156,6 +157,13 @@ class MovementHandlers:
             nickname_adjusted = self.nickname != requested
             nickname_changed = True
 
+        # PlayerProps.cpp:991-1003: an unchanged status is ignored; a changed
+        # one is stored and, once the player is loaded, sent to everyone.
+        status_changed = (PLPROP.PSTATUSMSG in props
+                          and props[PLPROP.PSTATUSMSG] != self.status_msg)
+        if status_changed:
+            self.status_msg = props[PLPROP.PSTATUSMSG]
+
         if PLPROP.DIRECTION in props:
             self.direction = props[PLPROP.DIRECTION]
 
@@ -165,10 +173,21 @@ class MovementHandlers:
         if PLPROP.CARRYSPRITE in props:
             self.carrysprite = props[PLPROP.CARRYSPRITE]
 
+        carry_reverted = False
+        if PLPROP.CARRYNPC in props and props[PLPROP.CARRYNPC] == self.npc_id:
+            props.pop(PLPROP.CARRYNPC)      # unchanged: ignored (:664)
         if PLPROP.CARRYNPC in props:
-            # Unconditional like CARRYSPRITE: 0 means the carried NPC was
-            # released, so a stale id must not survive a drop-without-throw.
-            self.npc_id = props[PLPROP.CARRYNPC]
+            if (self.level is not None
+                    and self.server.world.get_gmap_for_level(self.level.name)):
+                # PlayerProps.cpp:661-675: no carrying on a gmap, the change
+                # is reverted and the old value goes back to the sender only
+                # (SETPROP_RETURN_REVERT, :149-171).
+                carry_reverted = True
+                props.pop(PLPROP.CARRYNPC)
+            else:
+                # 0 means the carried NPC was released, so a stale id must
+                # not survive a drop-without-throw.
+                self.npc_id = props[PLPROP.CARRYNPC]
 
         if PLPROP.GANI in props:
             self.gani = props[PLPROP.GANI]
@@ -302,6 +321,8 @@ class MovementHandlers:
         # level (SetResults::sendToAll, PlayerProps.cpp:203).
         if nickname_changed:
             global_props[PLPROP.NICKNAME] = self.nickname
+        if status_changed and self.account_loaded:
+            global_props[PLPROP.PSTATUSMSG] = self.status_msg
         if global_props:
             await self.server.broadcast_to_all(
                 build_other_player_props(self.id, global_props),
@@ -311,7 +332,7 @@ class MovementHandlers:
         if self.level and touches:
             # testForTouch: signs, then links, before the NPC touch
             # (PlayerClient.cpp:1775-1790).
-            touch_taken = await run_touches(self, touches)
+            touch_taken = await run_touches(self, touches, touch_props)
         if self.level and not touch_taken:
             # Fire GS1 playertouchsme for NPCs the player has walked onto
             if getattr(self.server, 'npc_manager', None):
@@ -322,6 +343,8 @@ class MovementHandlers:
         corrections = {}
         if nickname_adjusted:
             corrections[PLPROP.NICKNAME] = self.nickname
+        if carry_reverted:
+            corrections[PLPROP.CARRYNPC] = self.npc_id
         if z_reverted:
             corrections[PLPROP.Z] = int(self.z)
             corrections[PLPROP.Z2] = self.z

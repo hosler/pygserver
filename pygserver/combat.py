@@ -454,8 +454,11 @@ class CombatManager:
             else:
                 timer_ticks = max(0, round(held.time_left / 0.05) - 1)
             self._bombs.setdefault(held.level_name, {})[held.id] = held
+            # The relay goes to the sender's cell, not the bomb's
+            # (PlayerClientPackets.cpp:238 sendPacketToOneLevelPart at the
+            # sender's position); `held.level_name` only owns the NPC effects.
             await self.server.broadcast_to_level(
-                held.level_name, build_bomb_add(player.id, x, y, power, timer_ticks),
+                player.level.name, build_bomb_add(player.id, x, y, power, timer_ticks),
                 exclude={player.id})
             return held
         if player.bombs <= 0:
@@ -485,7 +488,10 @@ class CombatManager:
             self._bombs[player.level.name] = {}
         self._bombs[player.level.name][bomb_id] = bomb
 
-        # Broadcast bomb to level
+        # Broadcast bomb to level. The reference relays a client bomb only
+        # when no NPC server exists (PlayerClientPackets.cpp:229-238: with one
+        # it adds the bomb to the level and sends nothing); pygserver relays
+        # it either way, a decision that is still open.
         if timer_ticks is None:
             timer_ticks = max(0, round(time_left / 0.05) - 1)
         packet = build_bomb_add(player.id, x, y, power, timer_ticks)
@@ -547,8 +553,10 @@ class CombatManager:
         # exploded locally: relay once, excluding it (GServer-v2
         # PlayerClientPackets.cpp msgPLI_EXPLOSION:829-844).
         power = (power & 7) | 8
+        # Audience: the sender's cell (PlayerClientPackets.cpp:855-856), never the
+        # bomb's stored level.
         await self.server.broadcast_to_level(
-            bomb.level_name, build_explosion(player.id, x, y, radius, power),
+            player.level.name, build_explosion(player.id, x, y, radius, power),
             exclude={player.id})
         level = self.server.world.get_level(bomb.level_name)
         if level is not None:

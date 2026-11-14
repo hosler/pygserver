@@ -177,10 +177,14 @@ async def test_login_decay_precedes_props_and_runs_once(
         assert player.last_spar_time == expected_time
         reader = PacketReader(packet)
         # The login-response frame leads with the reset (and, with the list
-        # server up, SERVERLISTCONNECTED) ahead of the props.
+        # server up, SERVERLISTCONNECTED), then the stage-0 staff guilds and
+        # status list, ahead of the props. Those two carry text, so the loop
+        # reads them to the packet terminator.
         packet_id = reader.read_gchar()
-        while packet_id in (PLO.SERVERLISTCONNECTED, PLO.RESETCLIENT):
-            assert reader.read_byte() == ord('\n')
+        while packet_id in (PLO.SERVERLISTCONNECTED, PLO.RESETCLIENT,
+                            PLO.STAFFGUILDS, PLO.STATUSLIST):
+            while reader.read_byte() != ord('\n'):
+                pass
             packet_id = reader.read_gchar()
         assert packet_id == PLO.PLAYERPROPS
         props, clean, _pos = parse_prop_stream(

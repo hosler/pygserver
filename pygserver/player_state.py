@@ -106,6 +106,9 @@ class Status:
         self.is_frozen = False
         self.is_ghost = False
         self.is_muted = False
+        # PLAYERLISTSTATUS (prop 53): the index into `playerlisticons`.
+        # Runtime only, never saved (Player.h:485 m_statusMsg).
+        self.status_msg = 0
 
         # Admin
         self.admin_rights = 0

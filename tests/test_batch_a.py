@@ -190,5 +190,7 @@ def test_early_bomb_landing_can_cross_segment_before_server_tick(monkeypatch):
         assert restored is bomb and bomb.level_name == target.name
         assert manager._bombs[target.name][bomb.id] is bomb
         assert not manager._throws and player.level is origin
-        assert server.broadcast_to_level.await_args.args[0] == target.name
+        # The bomb belongs to the destination, but the relay goes to the
+        # sender's cell (PlayerClientPackets.cpp:237).
+        assert server.broadcast_to_level.await_args.args[0] == origin.name
     asyncio.run(run())

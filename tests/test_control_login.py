@@ -191,7 +191,8 @@ def flat_ids(trace):
 def test_game_login_leads_with_serverlist_connected_then_reset_then_props(
         client_type, connected):
     # GServer-v2 PlayerClient.cpp:487-492 (origin/beta4): SERVERLISTCONNECTED
-    # when connected, PLO_RESETCLIENT, then the Stage-1 PLO_PLAYERPROPS.
+    # when connected, PLO_RESETCLIENT, the stage-0 staff guilds and status list
+    # (:524-536), then the Stage-1 PLO_PLAYERPROPS (:550).
     server = make_server()
     player, trace = make_wire_player(server, client_type, connected)
 
@@ -201,7 +202,8 @@ def test_game_login_leads_with_serverlist_connected_then_reset_then_props(
     lead = [190, 194] if connected else [194]
     first_kind, first = trace[0]
     assert first_kind == "login-frame"
-    assert first[:len(lead) + 1] == lead + [PLO.PLAYERPROPS]
+    assert first[:len(lead) + 3] == lead + [
+        PLO.STAFFGUILDS, PLO.STATUSLIST, PLO.PLAYERPROPS]
     ids = flat_ids(trace)
     assert ids.count(194) == 1
     assert ids.count(190) == int(connected)

@@ -442,3 +442,84 @@ def test_the_warp_passes_the_destinations_last_left_time(tmp_path, monkeypatch, 
     move(player, (PLPROP.X2, 17.0625))
     assert player.level.name == "b.nw"
     assert (PLO.BOARDPACKET in ids(player)) is board_resent
+
+
+# -- signs of every gmap segment, in the reference's order -------------------------------
+
+def sign_gmap(tmp_path, signs_by_segment, **options):
+    """The 2x2 gmap c0 c1 / c2 c3 with the given {name: {(x, y): text}}."""
+    from .test_level_entry_cache import two_levels
+    server = two_levels(tmp_path, serverside=True, clientsidelinks=False,
+                        clientsidesigns=False, **options)
+    for name in ("c0.nw", "c1.nw", "c2.nw", "c3.nw"):
+        server.world.add_level(level_with(
+            tmp_path, name, signs=signs_by_segment.get(name)))
+    gmap = tmp_path / "m.gmap"
+    gmap.write_text('GRMAP001\nWIDTH 2\nHEIGHT 2\nLEVELNAMES\n"c0.nw","c1.nw",\n'
+                    '"c2.nw","c3.nw"\nLEVELNAMESEND\n')
+    server.world.load_gmap(str(gmap))
+    return server
+
+
+def read_sign_from(server, segment):
+    player = make_player(server)
+    run(player.warp(segment, 30, 30))
+    player.send_raw.reset_mock()
+    stand(player, 9.0, 10.0625, 0)
+    move(player, (PLPROP.Y2, 10.0))
+    return [body for packet_id, body in sent(player) if packet_id == PLO.SAY2]
+
+
+def test_a_sign_in_another_gmap_segment_answers_at_the_same_local_position(tmp_path):
+    """Level::getSigns yields the signs of every segment and the test compares
+    them with the player's local pixels (Level.cpp:1204-1226,
+    PlayerClient.cpp:1833-1853): standing in c3, c0's sign is read.
+    Mutation: reading only the own segment gets nothing."""
+    server = sign_gmap(tmp_path, {"c0.nw": SIGN})
+    assert read_sign_from(server, "c3.nw") == [b"line one#bline two"]
+
+
+def test_the_first_segment_in_cell_order_wins_a_tie(tmp_path):
+    """Segments are walked row by row from the top left (Level.h:504-514), so
+    c1's sign beats the player's own c3 sign. Mutation: own segment first, or
+    last segment first, gives `own`."""
+    server = sign_gmap(tmp_path, {"c1.nw": {(10, 10): "first"},
+                                  "c3.nw": {(10, 10): "own"}})
+    assert read_sign_from(server, "c3.nw") == [b"first"]
+
+
+def test_a_plain_level_still_reads_only_its_own_signs(tmp_path):
+    server, player = make_world(tmp_path, links=(), signs=SIGN)
+    server.world.add_level(level_with(tmp_path, "c9.nw", signs={(10, 10): "other"}))
+    stand(player, 9.0, 10.0625, 0)
+    move(player, (PLPROP.Y2, 10.0))
+    assert [b for i, b in sent(player) if i == PLO.SAY2] == [b"line one#bline two"]
+
+
+# -- the packet goes on after a link warp --------------------------------------------------
+
+def test_the_props_after_a_link_warp_are_tested_in_the_destination(tmp_path):
+    """Player::setPropsFromPacket applies props one at a time and the warp is
+    synchronous (PlayerProps.cpp:1191-1210): the X2 steps onto a.nw's door to
+    b.nw, then the Y2 that follows moves up in b.nw and steps onto b.nw's door
+    back to a.nw. Mutation: stopping after the first warp ends in b.nw."""
+    back = {"dest_level": "a.nw", "x": 16, "y": 11, "width": 0, "height": 0,
+            "dest_x": "5", "dest_y": "6"}
+    server, player = make_world(tmp_path)
+    server.world.add_level(level_with(tmp_path, "b.nw", links=(back,)))
+    stand(player, 17.0, 10.0, 3)
+    move(player, (PLPROP.X2, 17.0625), (PLPROP.Y2, 10.0))
+    assert player.level.name == "a.nw"
+    assert (player.x, player.y) == (5.0, 6.0)
+    warps = [body for packet_id, body in sent(player) if packet_id == PLO.LEVELNAME]
+    # Each entry names its level in both halves of the level data.
+    from itertools import groupby
+    assert [name for name, _ in groupby(warps)] == [b"b.nw", b"a.nw"]
+
+
+def test_a_link_warp_leaves_the_destination_position_when_nothing_follows(tmp_path):
+    server, player = make_world(tmp_path)
+    stand(player, 17.0, 10.0, 3)
+    move(player, (PLPROP.X2, 17.0625))
+    assert player.level.name == "b.nw"
+    assert (player.x, player.y) == (15.0, 16.0)

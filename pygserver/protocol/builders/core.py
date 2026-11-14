@@ -342,10 +342,10 @@ def build_staff_guilds(guilds: List[str]) -> bytes:
 
 
 def build_status_list(statuses: List[str]) -> bytes:
-    """Build PLO_STATUSLIST packet."""
+    """Build PLO_STATUSLIST: one raw comma-joined string, not quoted
+    (PlayerClient.cpp:534)."""
     builder = PacketBuilder().write_gchar(PLO.STATUSLIST)
-    for status in statuses:
-        builder.write_gstring(status)
+    builder.write_string(','.join(s.strip() for s in statuses))
     builder.write_newline()
     return builder.build()
 

@@ -370,14 +370,15 @@ def first_frame(servermode, client_type=5, account="player", staff=()):
 def test_normal_mode_sends_neither_176_nor_177():
     ids, _ = first_frame("normal")
     assert 176 not in ids and 177 not in ids
-    assert ids[:2] == [194, PLO.PLAYERPROPS]
+    assert ids[:4] == [194, PLO.STAFFGUILDS, PLO.STATUSLIST, PLO.PLAYERPROPS]
 
 
 @pytest.mark.parametrize("mode, packet_id", [("newworld", 177), ("kingdoms", 176)])
 def test_mode_packet_leads_the_game_login_and_is_exclusive(mode, packet_id):
     ids, all_ids = first_frame(mode)
     other = 176 if packet_id == 177 else 177
-    assert ids[:3] == [packet_id, 194, PLO.PLAYERPROPS]
+    assert ids[:5] == [packet_id, 194, PLO.STAFFGUILDS, PLO.STATUSLIST,
+                       PLO.PLAYERPROPS]
     assert other not in all_ids and all_ids.count(packet_id) == 1
 
 

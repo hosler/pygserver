@@ -370,6 +370,8 @@ class Player(LevelTransitions, MovementHandlers, CombatHandlers, ItemHandlers,
             PLPROP.COLORS: self.colors,
             PLPROP.MAGICPOINTS: self.mp,
             PLPROP.ALIGNMENT: self.ap,
+            # loginPropsClientOthers[53] (PlayerProps.h:153-165).
+            PLPROP.PSTATUSMSG: self.status_msg,
         }
         if gmap_info:
             props[PLPROP.GMAPLEVELX] = grid_x
@@ -478,6 +480,7 @@ _STATE_ALIASES: Dict[str, Tuple[str, str]] = {
     'is_frozen': ('status', 'is_frozen'),
     'is_ghost': ('status', 'is_ghost'),
     'is_muted': ('status', 'is_muted'),
+    'status_msg': ('status', 'status_msg'),
     'admin_rights': ('status', 'admin_rights'),
     'login_time': ('status', 'login_time'),
     'last_packet_time': ('status', 'last_packet_time'),

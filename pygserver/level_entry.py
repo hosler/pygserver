@@ -183,6 +183,10 @@ class LevelTransitions:
     async def _release_carried_state(self):
         """A level change breaks NPC carry and attachment links and drops a
         held bomb (TServerPlayer.cpp:140-160)."""
+        # The reference moves the carried NPC with the player
+        # (PlayerClient.cpp:1556-1583); pygserver releases the carry and leaves
+        # the NPC where it is until pickup, throw and disconnect are modelled
+        # together.
         if (getattr(self, 'npc_id', 0) or getattr(self, 'attach_npc', (0, 0))[1]
                 or getattr(self, '_attachment_position_unknown', False)):
             await self.send_props({PLPROP.CARRYNPC: 0, PLPROP.ATTACHNPC: (0, 0)})

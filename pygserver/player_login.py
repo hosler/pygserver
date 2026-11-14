@@ -26,6 +26,7 @@ from typing import TYPE_CHECKING
 from reborn_protocol.constants import PLTYPE
 
 from .protocol.constants import PLPROP
+from .handlers.versions import client_version
 from .spar_rating import decay_deviation
 from .protocol.builders.world import map_option_text
 from .protocol.packets import (
@@ -40,6 +41,7 @@ from .protocol.packets import (
     build_rc_max_upload_filesize,
     build_server_mode,
     build_staff_guilds,
+    build_status_list,
     parse_login_packet,
 )
 
@@ -275,6 +277,11 @@ class LoginService:
                 text = map_option_text(getattr(player.server.config, option, ''))
                 if text is not None:
                     lead += build(text)
+            # PlayerClient.cpp:524-536: stage 0 ends with the staff guilds,
+            # then (from 2.1) the status labels, both ahead of the props.
+            lead += self._staff_guilds_packet()
+            if client_version(player) >= 2.1:
+                lead += build_status_list(player.server.config.playerlisticons)
         elif is_rc:
             lead = build_clear_weapons() + serverlist_connected
         else:
@@ -402,6 +409,12 @@ class LoginService:
             player.add_weapon(name)
             await gs2.announce_weapon(player, name)
 
+    def _staff_guilds_packet(self) -> bytes:
+        config = self.player.server.config
+        guilds = getattr(config, 'staff_guilds', None) \
+            or getattr(config, 'staff', [])
+        return build_staff_guilds(guilds)
+
     async def send_rc_login_sequence(self):
         """Send the control-client welcome and current player roster."""
         player = self.player
@@ -409,11 +422,12 @@ class LoginService:
         manager = server.rc_manager
 
         await player.send_raw(build_rc_chat(f"Welcome to {server.config.name}."))
+        # PlayerRC.cpp:259-270: staff guilds, status list, then the upload size.
+        await player.send_raw(self._staff_guilds_packet())
+        await player.send_raw(build_status_list(
+            player.server.config.playerlisticons))
         await player.send_raw(build_rc_max_upload_filesize(
             manager.max_upload_size))
-        guilds = getattr(server.config, 'staff_guilds', None) \
-            or getattr(server.config, 'staff', [])
-        await player.send_raw(build_staff_guilds(guilds))
 
         for online_player in server.get_all_players():
             if (online_player.id != player.id
