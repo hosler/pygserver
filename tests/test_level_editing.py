@@ -58,7 +58,8 @@ def test_level_serializer_round_trip(tmp_path):
 
 
 def test_all_reachable_level_fixtures_round_trip():
-    roots = [Path(__file__).parent]
+    # levels/ holds the tracked QA fixture levels, so the list is never empty.
+    roots = [Path(__file__).parent, Path(__file__).parents[1] / 'levels']
     optional_world = Path(__file__).parents[2] / 'funtimes' / 'world'
     if optional_world.is_dir():
         roots.append(optional_world)

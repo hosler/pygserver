@@ -19,6 +19,9 @@ from pygserver.npc import NPC
 from pygserver.protocol.constants import LevelItemType
 
 CORPUS = os.path.join(os.path.dirname(__file__), "gs1_corpus")
+# The corpus is third-party level content kept out of git (.gitignore).
+needs_corpus = pytest.mark.skipif(
+    not os.path.isdir(CORPUS), reason="gs1_corpus not present")
 
 
 def FakePlayer(pid, account, x, y, hearts=3.0, level=None):
@@ -437,6 +440,7 @@ def test_callnpc_fires_custom_event_on_indexed_npc_with_params_and_not_created()
     assert this_vars(target)["p1"] == "b"
 
 
+@needs_corpus
 def test_callnpc_loop_from_real_corpus_script_reaches_every_npc():
     # treasurecave2.nw:249 `for (i=0; i<npcscount; i++) callnpc i,getdigmagic;`
     corpus = os.path.join(CORPUS, "treasurecave2.nw")
@@ -576,6 +580,7 @@ def test_shoot_from_character_npc_offsets_position():
 
 # -- real corpus fragment: gcarena8.nw players[this.i] loop ----------------------
 
+@needs_corpus
 def test_corpus_arena_switch_counts_foes_through_players_array():
     text = open(os.path.join(CORPUS, "gcarena8.nw"), encoding="latin-1").read()
     block = re.search(r"NPC - 18 20\n(.*?)\nNPCEND", text, re.S).group(1)
