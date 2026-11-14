@@ -12,6 +12,7 @@ import time
 from typing import Dict, Optional, Set, List
 from pathlib import Path
 
+from .level_cache import reset_for_all_players
 from .attachments import absolute_position, clear_attachment
 
 from .audience import Audience
@@ -381,20 +382,24 @@ class GameServer:
 
     async def resend_level(self, level_name: str,
                            retired_npc_ids=()):
-        """Re-warp occupants in place so client level stores are rebuilt.
-
-        A full same-level entry is intentional: client sign, chest, and link
-        stores append incremental arrival packets and otherwise retain stale
-        or duplicate definitions. Retired NPC ids must be deleted before the
-        replacement level state sends its new NPC property packets.
+        """Level::reload for the players on it (Level.cpp:945-996): they
+        leave, every player's record of the level is reset, and they are
+        warped back in, which is a first visit again and sends everything.
+        Retired NPC ids are deleted before the replacement level state sends
+        its new NPC property packets.
         """
         level = self.world.get_level(level_name)
         if level is None:
             raise FileNotFoundError(f"level not found: {level_name}")
+        occupants = []
         for player in list(self.get_players_on_level(level.name)):
             for npc_id in retired_npc_ids:
                 await player.send_raw(build_npc_del(npc_id))
-            await player.warp(level.name, *absolute_position(player))
+            occupants.append((player, absolute_position(player)))
+            await player.leave_level()
+        reset_for_all_players(self, level.name)
+        for player, position in occupants:
+            await player.warp(level.name, *position)
 
     async def _handle_connection(self, reader: asyncio.StreamReader,
                                   writer: asyncio.StreamWriter):

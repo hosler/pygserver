@@ -7,12 +7,10 @@ from reborn_protocol import PLSTATUS
 
 from ..attachments import absolute_position, set_attachment
 from ..protocol.colors import normalize_colors
-from ..protocol.constants import PLI, PLO, PLPROP
+from ..protocol.constants import PLI, PLPROP
 from ..protocol.packets import (
     PacketReader,
-    build_level_name,
     build_other_player_props,
-    build_raw_data_announcement,
     parse_player_props,
 )
 from ..text_safety import sanitize_value, strip_control_chars
@@ -56,30 +54,32 @@ def resolve_nickname(account_name: str, requested: str) -> str:
 class MovementHandlers:
     """Mixin: PLI_LEVELWARP/LEVELWARPMOD/PLAYERPROPS/ADJACENTLEVEL."""
 
-    @handles(PLI.LEVELWARP)
-    async def _handle_level_warp(self, data: bytes):
-        """Handle PLI_LEVELWARP packet."""
-        reader = PacketReader(data)
+    @staticmethod
+    def _read_warp(reader: PacketReader):
+        """x and y in half tiles, then the level name (the rest), as
+        msgPLI_LEVELWARP reads them (PlayerClientPackets.cpp:59-60)."""
         x = reader.read_gchar() / 2.0
         y = reader.read_gchar() / 2.0
         level_name = reader.remaining().decode('latin-1', errors='replace').strip()
+        return x, y, level_name
 
+    @handles(PLI.LEVELWARP)
+    async def _handle_level_warp(self, data: bytes):
+        """PLI_LEVELWARP: no cached time, so a level the player has left this
+        session keeps its board (PlayerClientPackets.cpp:54)."""
+        x, y, level_name = self._read_warp(PacketReader(data))
         if level_name:
-            await self.warp(level_name, x, y)
+            await self.client_warp(level_name, x, y, None)
 
     @handles(PLI.LEVELWARPMOD)
     async def _handle_level_warp_mod(self, data: bytes):
-        """Handle PLI_LEVELWARPMOD packet (modified warp).
-
-        Wire format (GServer-v2 msgPLI_LEVELWARP, PlayerClientPackets.cpp:
-        52-58): LEVELWARPMOD carries a leading GUINT5 modtime before the
-        x/y/level body that plain LEVELWARP has. Without consuming it first,
-        the 5 modtime bytes get read as x/y and the start of the level name,
-        corrupting every modified warp.
-        """
+        """PLI_LEVELWARPMOD: a GUInt5 mod time of the client's cached copy,
+        then the PLI_LEVELWARP body (PlayerClientPackets.cpp:56-57)."""
         reader = PacketReader(data)
-        reader.read_gint5()  # modtime, unused
-        await self._handle_level_warp(reader.remaining())
+        cached_time = reader.read_gint5()
+        x, y, level_name = self._read_warp(reader)
+        if level_name:
+            await self.client_warp(level_name, x, y, cached_time)
 
     @handles(PLI.PLAYERPROPS)
     async def _handle_player_props(self, data: bytes):
@@ -111,6 +111,17 @@ class MovementHandlers:
         elif PLPROP.Y in props:
             self.y = props[PLPROP.Y] / 2.0
         absolute_position(self)
+
+        # Crossing gmap cells: the client reports its new cell with
+        # GMAPLEVELX/Y and sends no warp for a level of its map (FourPlay
+        # TClient.cpp:1354-1356); the server records the cell left and sends
+        # the new cell's dynamic data (level_entry.gmap_hop). A client warp
+        # for such a hop is still accepted (client_warp).
+        map_axes = [(prop, value) for prop, value in props.items()
+                    if prop in (PLPROP.GMAPLEVELX, PLPROP.GMAPLEVELY)]
+        if map_axes and self.level:
+            await self.apply_client_map_position(map_axes)
+            absolute_position(self)
 
         # PlayerProps.cpp:495-511: Z (tiles) then Z2 (pixels), unless locked.
         z_changed = False
@@ -313,12 +324,14 @@ class MovementHandlers:
 
     @handles(PLI.ADJACENTLEVEL)
     async def _handle_adjacent_level(self, data: bytes):
-        """Handle PLI_ADJACENTLEVEL - client preloading a neighbouring GMAP
-        segment. Send that level's name + board so the client can stitch the
-        world together; no warp and no player-add (the player stays put)."""
+        """PLI_ADJACENTLEVEL: the client asks for a neighbour's static data,
+        its cached mod time first (PlayerClientPackets.cpp:994-1016). The
+        answer is the full static block with the visited rule; the request
+        records nothing, the player stays put and no dynamic data goes out.
+        Links and signs follow the reference's NPC-server rule
+        (PlayerClient.cpp:1495-1500), as nothing here is an entry."""
         reader = PacketReader(data)
-        # PlayerClientPackets.cpp:994-1014: cache time precedes the name.
-        reader.read_gint5()
+        cached_time = reader.read_gint5()
         level_name = reader.remaining().decode('latin-1', errors='replace')
         if not level_name:
             return
@@ -326,19 +339,7 @@ class MovementHandlers:
         if not level:
             logger.debug(f"Adjacent level not served: {level_name}")
             return
-
-        # Only the board — adjacent segments are for rendering. Their signs/links
-        # belong to that segment and are sent when the player actually warps in;
-        # sending them here leaks e.g. neighbouring signs into the current level.
-        # The base board without its change list: the reference answers with
-        # sendStaticLevelData (PlayerClientPackets.cpp:994-1014,
-        # PlayerClient.cpp:1432-1508); the changes come with the dynamic data
-        # once the player steps onto the segment (PlayerClient.cpp:1510-1523),
-        # and changes made meanwhile reach this player as live packets
-        # (board_changes.send_near).
-        level_name_pkt = build_level_name(level.name)
-        tile_data = level.get_base_board_packet()
-        board_packet = bytes([PLO.BOARDPACKET + 32]) + tile_data + b'\n'
-        announcement = build_raw_data_announcement(len(board_packet))
-        await self.send_raw(level_name_pkt + announcement + board_packet
-                            + self._board_layer_packets(level))
+        config = self.server.config
+        await self.send_static_level_data(
+            level, cached_time,
+            links_and_signs=not getattr(config, 'serverside', True))

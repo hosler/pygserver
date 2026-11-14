@@ -14,7 +14,7 @@ import time
 from typing import TYPE_CHECKING, Optional, Dict, Any, List, Callable, Tuple
 from pathlib import Path
 
-from . import collision, npc_motion
+from . import collision, level_cache, npc_motion
 from .attachments import absolute_position
 
 from .protocol.packets import (
@@ -398,6 +398,21 @@ class NPC:
         self._dirty = False
         self._script_dirty = False
 
+        # Per-prop modification times (NPC::modTime, NPC.h; sent when
+        # `>= since`, NPC.cpp:1777-1820). Stamped when a change is observed:
+        # at each props flush, when a player leaves the NPC's level and when
+        # the NPC is sent on an entry, so a stamp is never earlier than the
+        # change. A prop that never had a value has no stamp and is never
+        # sent. Show-image props are tracked the same way, per image.
+        self._prop_values: Dict[int, Any] = {}
+        self._prop_times: Dict[int, float] = {}
+        self._props_set: set = set()
+        self._showimg_values: Dict[Tuple[int, int], Any] = {}
+        self._showimg_times: Dict[Tuple[int, int], float] = {}
+        # When the NPC last joined a level (modTime[LEVEL], NPC.cpp:213),
+        # set by Level.add_npc; the delete rule reads it (Server.cpp:1625-1641).
+        self.level_time: Optional[float] = None
+
         # API wrapper for scripts
         self._api: Optional['NPCApi'] = None
 
@@ -608,6 +623,95 @@ class NPC:
         `include_position=False` leaves out X/Y/X2/Y2: a client that is
         animating a PLO_MOVE ends the move when it receives a position prop
         (NPC.cpp:493-500)."""
+        return build_npc_props(self.id, self.wire_props(
+            include_script=include_script, include_position=include_position))
+
+    #: Props the full send leaves out while empty, with that empty value; a
+    #: prop that is cleared after having a value is still news to a client
+    #: that saw the value.
+    _EMPTY_PROPS = {
+        NPCPROP.GANI: "", NPCPROP.NICKNAME: "", NPCPROP.MESSAGE: "",
+        NPCPROP.HEADIMAGE: "", NPCPROP.BODYIMAGE: "", NPCPROP.HORSEIMAGE: "",
+        NPCPROP.BLOCKFLAGS: 0, NPCPROP.SCRIPT: "", NPCPROP.CLASS: "",
+    }
+
+    def _tracked_props(self) -> Dict[int, Any]:
+        """Every prop value the change tracking compares: the full send plus
+        the empty value of each optional prop it currently leaves out."""
+        props = self.wire_props(include_script=True)
+        for prop_id, empty in self._EMPTY_PROPS.items():
+            props.setdefault(prop_id, empty)
+        props.setdefault(NPCPROP.SWORDIMAGE, (self.sword_power, self.sword_image))
+        props.setdefault(NPCPROP.SHIELDIMAGE, (self.shield_power, self.shield_image))
+        props.setdefault(NPCPROP.COLORS, list(self.colors))
+        return props
+
+    def observe_props(self, now: float) -> None:
+        """Stamp `now` on every prop whose value changed since last seen, and
+        on every show-image prop likewise. A prop counts as set from the
+        first time the full send carries it; an unset one is never sent
+        (`modTime[i].has_value()`, NPC.cpp:1789)."""
+        self._props_set.update(self.wire_props(include_script=True))
+        for prop_id, value in self._tracked_props().items():
+            if isinstance(value, list):
+                value = tuple(value)
+            if prop_id not in self._prop_values or self._prop_values[prop_id] != value:
+                self._prop_values[prop_id] = value
+                self._prop_times[prop_id] = now
+        seen = set()
+        for index, image in self.showimgs.items():
+            for prop_id, value in image.items():
+                key = (index, prop_id)
+                seen.add(key)
+                if isinstance(value, list):
+                    value = tuple(value)
+                if self._showimg_values.get(key, _REJECT) != value:
+                    self._showimg_values[key] = value
+                    self._showimg_times[key] = now
+        for key in list(self._showimg_values):
+            if key not in seen:
+                del self._showimg_values[key]
+                self._showimg_times.pop(key, None)
+
+    def refresh_prop_times(self, now: float) -> None:
+        """NPC::refreshModTimes (NPC.cpp:600-607), run by setLevel: every prop
+        that has a value counts as changed now."""
+        self.observe_props(now)
+        for prop_id in self._prop_times:
+            self._prop_times[prop_id] = now
+
+    def props_since(self, since: Optional[float]) -> Dict[int, Any]:
+        """getAllPropsPacket(since) (NPC.cpp:1777-1820): with no time the
+        full send; otherwise each prop stamped at or after `since`."""
+        self.observe_props(level_cache.clock())
+        full = self.wire_props(include_script=True)
+        if since is None:
+            return full
+        tracked = self._tracked_props()
+        return {prop_id: (full[prop_id] if prop_id in full else tracked[prop_id])
+                for prop_id, stamp in self._prop_times.items()
+                if stamp >= since and prop_id in tracked
+                and prop_id in self._props_set}
+
+    def showimgs_since(self, since: Optional[float]) -> Optional[bytes]:
+        """sendShowImagesToPlayer (NPC.cpp:269-292): once the NPC ever had
+        show-images, the reset (index 9) and every image with its props
+        stamped at or after `since`; with no time, all of them."""
+        if since is None:
+            return self.build_showimgs_packet()
+        if not self._had_showimgs and not self.showimgs:
+            return None
+        from .protocol.packets import build_npc_showimgs
+        self._had_showimgs = True
+        images = {
+            index: {prop_id: value for prop_id, value in image.items()
+                    if self._showimg_times.get((index, prop_id), since) >= since}
+            for index, image in self.showimgs.items()}
+        return build_npc_showimgs(self.id, images, reset=True)
+
+    def wire_props(self, *, include_script: bool = True,
+                   include_position: bool = True) -> Dict[int, Any]:
+        """The props of a full send, by NPCPROP id."""
         props = {
             NPCPROP.IMAGE: self.image,
             NPCPROP.X: self.x,
@@ -678,7 +782,7 @@ class NPC:
             props[NPCPROP.COLORS] = self.colors
         for prop_id, val in self.gattribs.items():
             props[prop_id] = val
-        return build_npc_props(self.id, props)
+        return props
 
     @property
     def bytecode_active(self) -> bool:
@@ -1487,16 +1591,38 @@ class NPCManager:
             level_name = npc.level.name
             npc.level.remove_npc(npc)
 
-            # Notify players on level
-            packet = build_npc_del(npc.id)
             if notify:
-                await self.server.broadcast_to_level(level_name, packet)
-                # Holders on a segment the NPC left. One that has since
-                # walked onto the NPC's own level just got the broadcast.
-                for player, home in list(getattr(npc, '_seam_players', {}).values()):
-                    if self._holds(player, home) and home != level_name:
-                        await player.send_raw(packet)
+                await self._send_npc_delete(npc, level_name)
         getattr(npc, '_seam_players', {}).clear()
+
+    async def _send_npc_delete(self, npc: NPC, level_name: str):
+        """Server::deleteNPC (Server.cpp:1625-1641): every client on the NPC's
+        level, every client that has not been to that level and every client
+        that left it after the NPC arrived is told. Clients elsewhere get
+        PLO_NPCDEL2 naming the level, so one that comes back later has
+        already dropped it. Players on another segment of the same gmap
+        hold it as a seam holder and get PLO_NPCDEL, as on the reference's
+        single gmap level."""
+        arrived = getattr(npc, 'level_time', None)
+        lookup = getattr(getattr(self.server, 'world', None),
+                         'get_gmap_for_level', None)
+        info = lookup(level_name) if lookup is not None else None
+        same_world = set(info[0].grid.values()) if info else {level_name}
+        delete = build_npc_del(npc.id)
+        delete2 = build_npc_del2(level_name, npc.id)
+        everyone = getattr(self.server, 'get_all_players', None)
+        players = (everyone() if everyone is not None
+                   else [p for p in getattr(self.server, 'players', {}).values()
+                         if getattr(p, 'logged_in', True)])
+        for player in list(players):
+            here = getattr(getattr(player, 'level', None), 'name', None)
+            if here in same_world:
+                await player.send_raw(delete)
+                continue
+            record = getattr(player, 'visited_levels', None)
+            left = record.left_at(level_name) if record is not None else None
+            if left is None or arrived is None or left >= arrived:
+                await player.send_raw(delete2)
 
     async def warp_npc(self, npc: NPC, level_name: str, x: float, y: float):
         """Warp an NPC to a new location (NPC::warp, NPC.cpp:166-240)."""
@@ -1526,15 +1652,23 @@ class NPCManager:
         old_level = npc.level
         if old_level is not None:
             old_level.remove_npc(npc)
-            await self.server.broadcast_to_level(
-                old_level.name,
-                build_npc_moved(npc.id, new_level.name, npc.x, npc.y))
+            # NPC.cpp:210: every player hears of the move, so one that left
+            # the old level earlier drops the copy it still holds.
+            moved = build_npc_moved(npc.id, new_level.name, npc.x, npc.y)
+            broadcast_to_all = getattr(self.server, 'broadcast_to_all', None)
+            if broadcast_to_all is not None:
+                await broadcast_to_all(moved)
+            else:
+                await self.server.broadcast_to_level(old_level.name, moved)
             # Players of the segment it left (not those it never reached).
             near = {level.name for level, _ in self.nearby_levels(new_level)}
             if old_level.name in near:
                 for player in self.server.audience.players_on_level(old_level.name):
                     npc._seam_players[player.id] = (player, old_level.name)
         new_level.add_npc(npc)
+        # setLevel -> refreshModTimes (NPC.cpp:247-254): a player who comes
+        # back after the move gets the whole NPC.
+        npc.refresh_prop_times(npc.level_time)
         if npc.initial_level is None:   # first warp (NPC.cpp:236-240)
             npc.record_initial_state(new_level.name)
         npc._dirty = False
@@ -1600,6 +1734,14 @@ class NPCManager:
         npc._resend_showimgs = True
         npc._script_dirty = True
         npc.mark_dirty()
+
+    def observe_level(self, level: 'Level', now: float) -> None:
+        """Stamp the prop changes of the NPCs on `level` before a player's
+        leave time is recorded (see NPC.observe_props)."""
+        for npc in self.get_npcs_on_level(level):
+            observe = getattr(npc, 'observe_props', None)
+            if observe is not None:
+                observe(now)
 
     def forget_player(self, player: 'Player') -> None:
         """A player left the server: no NPC may keep it as a holder (its id
@@ -1782,6 +1924,7 @@ class NPCManager:
                 npc._dirty = True
             if npc._dirty:
                 npc._dirty = False
+                npc.observe_props(level_cache.clock())
                 if npc.level:
                     script_update = npc._script_dirty
                     # A client keeps the VM it built from the old script, and

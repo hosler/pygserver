@@ -11,7 +11,7 @@ from pathlib import Path
 
 from reborn_protocol import coords
 
-from .level import Level, LevelManager
+from .level import Level, LevelManager, file_mod_time
 
 if TYPE_CHECKING:
     from .server import GameServer
@@ -251,7 +251,10 @@ class World:
         return self._level_manager.get_all_levels()
 
     async def reload_level(self, name: str) -> Level:
-        """Reload one cached level in place while retaining its players."""
+        """Reload one cached level in place while retaining its players. The
+        players' visited records are NOT reset here: the reference resets them
+        after the occupants left (Level.cpp:962-963), so every caller follows
+        with GameServer.resend_level."""
         level = self.get_level(name)
         if level is None:
             raise FileNotFoundError(f"level not found: {name}")
@@ -275,6 +278,7 @@ class World:
         if self.server.baddy_manager:
             self.server.baddy_manager._baddies.pop(level.name, None)
 
+        level.mod_time = file_mod_time(level.file_path)
         level._tiles = replacement._tiles
         level._base_tiles = replacement._base_tiles
         level.clear_board_changes()           # Level.cpp:656
@@ -288,8 +292,16 @@ class World:
         return level
 
     async def reload_levels(self) -> List[Level]:
-        """Reload every cached level in place."""
+        """Reload every cached level in place (`/updatelevelall`,
+        RC_UPDATELEVELS). Level::reload (Level.cpp:863-996) deletes the NPCs,
+        makes the players on the level leave, resets every player's record of
+        it AFTER they left (:962-963), then warps them back in; that is
+        GameServer.resend_level, which reload_level alone does not do."""
         reloaded = []
         for level in list(self.get_all_levels()):
-            reloaded.append(await self.reload_level(level.name))
+            retired = tuple(npc.id for npc in level.get_npcs()
+                            if getattr(npc, 'file_defined', False))
+            fresh = await self.reload_level(level.name)
+            await self.server.resend_level(fresh.name, retired_npc_ids=retired)
+            reloaded.append(fresh)
         return reloaded

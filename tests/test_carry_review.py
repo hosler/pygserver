@@ -12,6 +12,7 @@ from pygserver.combat import Bomb, CombatManager, ThrownObject
 from pygserver.gs1.builtins import _b_carrying, _b_carries_object
 from pygserver.handlers.combat import CombatHandlers
 from pygserver.level import Level
+from pygserver.level_cache import VisitedLevels
 from pygserver.player import Player
 from pygserver.protocol.constants import PLO
 from pygserver.server import GameServer
@@ -34,7 +35,8 @@ def arena(tmp_path, monkeypatch):
     def add_player(pid, current=level, x=20, y=20):
         player = SimpleNamespace(server=server, id=pid, x=x, y=y, level=current, bombs=3, hearts=3,
                                  direction=3, carrysprite=-1, send_raw=AsyncMock(),
-                                 send_props=AsyncMock(), account_name='test')
+                                 send_props=AsyncMock(), account_name='test',
+                                 visited_levels=VisitedLevels())
         server.players[pid] = player
         current.add_player(player)
         return player
@@ -74,13 +76,16 @@ def test_disconnect_releases_held_bomb_and_flight(arena):
 
 def test_warp_releases_held_bomb_and_carry_state(arena):
     server, level, manager, add = arena
-    player = add(2)
+    player = Player(server, 2, AsyncMock(), Mock())
+    player.send_raw = AsyncMock()
+    player.level = level
+    level.add_player(player)
+    server.players[2] = player
     hold(manager, player, level)
     target = Level('target.nw')
     server.world.add_level(target)
     server.npc_manager = SimpleNamespace(on_player_leaves=AsyncMock(), on_player_enters=AsyncMock())
-    player._send_level = AsyncMock()
-    asyncio.run(Player.warp(player, target.name, 5, 5))
+    asyncio.run(player.warp(target.name, 5, 5))
     assert player.id not in manager._held_bombs
     assert player.carrysprite == -1
     assert player.level is target

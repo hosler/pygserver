@@ -16,6 +16,7 @@ from typing import TYPE_CHECKING, Optional, List, Dict, Tuple, Set
 from enum import IntEnum
 
 from . import collision
+from .board_changes import respawn_context
 from .attachments import absolute_position
 
 from .ap_system import kill_penalty
@@ -926,11 +927,27 @@ class CombatManager:
                     if tuple(level.get_tile(x + dx, y + dy)
                              for dx, dy in offsets) != original:
                         continue
-                    for (dx, dy), tile in zip(offsets, replacement):
-                        level.set_tile(x + dx, y + dy, tile)
+                    # The reference server does not blast tiles: the client sends
+                    # the 2x2 edit as PLI_BOARDMODIFY and Level::alterBoard
+                    # records it (PlayerClientPackets.cpp:125, Level.cpp:1610-1749),
+                    # so a joiner or returning player is replayed it and it
+                    # respawns after `respawntime`.
+                    row_major = [replacement[0], replacement[2],
+                                 replacement[1], replacement[3]]
+                    now, respawn_seconds = respawn_context(self.server)
+                    corrections = []
+                    change = level.alter_board(x, y, 2, 2, row_major, now,
+                                               respawn_seconds,
+                                               corrections=corrections)
+                    if change is None:
+                        continue
+                    manager = getattr(self.server, 'board_changes', None)
+                    if manager is not None:
+                        for sent in [change] + corrections:
+                            await manager.send_to_level(level, sent)
+                        continue
                     builder = PacketBuilder()
-                    for tile in (replacement[0], replacement[2],
-                                 replacement[1], replacement[3]):
+                    for tile in row_major:
                         builder.write_gshort(tile)
                     tiles = builder.build()
                     gmap = self.server.world.get_gmap_for_level(level.name)

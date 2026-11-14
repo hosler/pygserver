@@ -195,6 +195,9 @@ def test_reload_deletes_retired_npcs_before_replacement_props(tmp_path):
         async def send_raw(self, packet):
             packets.append(packet)
 
+        async def leave_level(self):
+            pass
+
         async def warp(self, level_name, x, y):
             replacement = server.world.get_level(level_name)
             for npc in replacement.get_npcs():

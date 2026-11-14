@@ -789,24 +789,15 @@ class ItemManager:
                     opened.append(chest.chest_id)
         return opened
 
-    async def send_level_items(self, player: 'Player', level: 'Level'):
-        """
-        Send all items on a level to a player.
-
-        Args:
-            player: Player to send to
-            level: Level to send items from
-        """
-        # Send ground items
-        for item in self.get_items_on_level(level.name):
-            packet = build_item_add(item.x, item.y, item.item_type.value)
-            await player.send_raw(packet)
-
-        # Announce chests: opened ones as the 3-byte form, unopened with item/sign
+    def chest_packets(self, player: 'Player', level: 'Level') -> bytes:
+        """The level's chests for an entry: an opened one as the 3-byte form,
+        an unopened one with its item and sign (Level.cpp:142-154). Part of
+        every static block, visited or not (PlayerClient.cpp:1505)."""
+        out = bytearray()
         for chest in self.get_chests_on_level(level.name):
             opened = player.account_name in chest.opened_by
-            packet = build_level_chest(
+            out += build_level_chest(
                 opened, chest.x, chest.y,
-                chest.item_type.value, chest.sign_index
-            )
-            await player.send_raw(packet)
+                chest.item_type.value, chest.sign_index)
+        return bytes(out)
+

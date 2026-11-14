@@ -323,15 +323,15 @@ class GS1Host(Host):
             resolved = self._resolve_tile(indices, ctx)
             if resolved is not None:
                 level, x, y = resolved
-                level.set_tile(x, y, int(to_num(value)))
-                self._broadcast_tiles(level, x, y, 1, 1)
+                self._write_tile(level, x, y, int(to_num(value)))
             return True
         if name == "board":
             # 1641f88b (GS1Variables.cpp:41-59): board[i] = n writes the NPC's
             # own level board. Ignored without an index, outside 0..4095,
-            # without a level, or for a non-number. The reference sends no
-            # board-modify packet (unlike tiles[]), so neither do we: connected
-            # clients keep their copy until they re-enter the level.
+            # without a level, or for a non-number. The reference writes the
+            # tile array itself, records no board change and sends no
+            # board-modify packet, so neither do we: a player who already has
+            # the board keeps their copy, a first-time entrant gets the tile.
             level = getattr(npc, "level", None) if npc is not None else None
             if (indices and level is not None and hasattr(level, "set_tile")
                     and not isinstance(value, str)):
@@ -395,6 +395,25 @@ class GS1Host(Host):
         x = max(0, min(width - 1, x % width))
         y = max(0, min(height - 1, y % height))
         return level, x, y
+
+    def _write_tile(self, level, x, y, tile):
+        """GS1 tiles[x,y] = n: the write becomes a board change that later
+        entrants are replayed (Level.record_tile_write, Level.cpp:1751-1799),
+        sent to the level (and on a grid map the segments around it)."""
+        manager = getattr(self.server, "board_changes", None)
+        if (self.server is None or manager is None
+                or not hasattr(level, "record_tile_write")):
+            level.set_tile(x, y, tile)
+            self._broadcast_tiles(level, x, y, 1, 1)
+            return
+        from ..board_changes import respawn_context
+        now, _ = respawn_context(self.server)
+        corrections = []
+        change = level.record_tile_write(x, y, tile, now, corrections)
+        if change is None:
+            return
+        for sent in [change] + corrections:
+            _schedule(manager.send_to_level(level, sent))
 
     def _broadcast_tiles(self, level, x, y, width, height):
         if self.server is None or not hasattr(level, "_tiles"):

@@ -9,6 +9,7 @@ from pygserver.protocol.constants import BDPROP, BDMODE, PLO, PLPROP
 from pygserver.protocol.packets import (
     PacketBuilder,
     PacketReader,
+    build_player_left,
     build_private_message,
     parse_player_props,
 )
@@ -156,7 +157,9 @@ class TestLeaderPackets:
         server.players = {1: first, 2: second}
         asyncio.run(first._send_level(level))
         asyncio.run(second._send_level(level))
-        assert len(is_leader_packets(first)) == 1
+        # Once after the static data and once in the dynamic data
+        # (PlayerClient.cpp:1519,1549).
+        assert len(is_leader_packets(first)) == 2
         assert not is_leader_packets(second)
 
     def test_warp_hands_authority_to_remaining_player(self):
@@ -185,8 +188,8 @@ class TestLeaderPackets:
         server.players = {1: first, 2: second}
         asyncio.run(first._send_level(level))
         asyncio.run(second._send_level(level))
-        assert len(is_leader_packets(first)) == 1
-        assert len(is_leader_packets(second)) == 1
+        assert len(is_leader_packets(first)) == 2
+        assert len(is_leader_packets(second)) == 2
 
 
 class TestContiguousWorldPlayerProps:
@@ -217,7 +220,9 @@ class TestContiguousWorldPlayerProps:
 
         asyncio.run(player.warp(new.name, 1, 1))
 
-        server.broadcast_to_world.assert_not_awaited()
+        left = build_player_left(player.id)
+        assert all(call.args[1] != left
+                   for call in server.broadcast_to_world.await_args_list)
 
 
 def baddy_payload(baddy_id, props):

@@ -395,7 +395,10 @@ def test_adjacent_level_serves_a_sublevel_of_the_players_gmap(tmp_path):
     run(player._handle_adjacent_level(
         PacketBuilder().write_gint5(0).write_bytes(b"b.nw").build()))
 
-    player.send_raw.assert_awaited_once()
+    # The static block, then PLO_ISLEADER (always on a gmap,
+    # PlayerClient.cpp:1616).
+    first = player.send_raw.await_args_list[0].args[0]
+    assert first.startswith(bytes([PLO.LEVELNAME + 32]) + b"b.nw\n")
 
 
 def make_player_stub(server, level):

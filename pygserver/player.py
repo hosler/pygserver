@@ -12,9 +12,9 @@ it live in their own modules:
 - `handlers/` - the PLI packet handlers, as domain mixins whose `@handles`
   decorations build the dispatch table.
 
-What stays here: level membership and transitions (`warp`, `_send_level`), the
-connection lifecycle (`run`, `_cleanup`), the send helpers and the small
-player-data accessors the managers and NPC scripts use.
+What stays here: the connection lifecycle (`run`, `_cleanup`), the send
+helpers and the small player-data accessors the managers and NPC scripts use.
+Level transitions are `level_entry.LevelTransitions`.
 """
 
 import asyncio
@@ -22,7 +22,8 @@ import logging
 import time
 from typing import TYPE_CHECKING, Optional, Dict, Any, Set, Tuple
 
-from .attachments import absolute_position, clear_attachment
+from .level_cache import VisitedLevels
+from .level_entry import LevelTransitions
 from .handlers import (
     CombatHandlers,
     CommunicationHandlers,
@@ -36,17 +37,13 @@ from .handlers import (
 from .player_login import LoginService
 from .player_session import PlayerSession
 from .player_state import Character, Identity, Inventory, Status
-from .protocol.constants import PLI, PLO, PLPROP
+from .protocol.constants import PLI, PLPROP
 from .protocol.packets import (
     PacketBuilder,
     PacketReader,
     build_player_props,
     build_other_player_props,
-    build_warp,
-    build_warp2,
     build_player_left,
-    build_level_name,
-    build_raw_data_announcement,
     build_is_leader,
 )
 
@@ -60,8 +57,8 @@ logger = logging.getLogger(__name__)
 PLAYER_DATA_TIMEOUT = 300.0
 
 
-class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
-             CommunicationHandlers, FileHandlers, MiscHandlers):
+class Player(LevelTransitions, MovementHandlers, CombatHandlers, ItemHandlers,
+             EntityHandlers, CommunicationHandlers, FileHandlers, MiscHandlers):
     """
     Represents a connected player.
 
@@ -88,6 +85,11 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
         # Current level
         self.level: Optional['Level'] = None
         self.group: str = ""  # Stored only; no group level instancing.
+        # When this client last left each level (see level_cache).
+        self.visited_levels = VisitedLevels()
+        # PlayerClient::m_loaded: false until the login has sent the first
+        # level (PlayerClient.cpp:449,659); set by LoginService.
+        self.level_loaded = False
 
         # PLI packet id -> bound handler, from the mixins' @handles decorations.
         self._handlers: Dict[int, Any] = {
@@ -167,6 +169,8 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
                 new_leader = self.server.get_player(self.level.get_leader_id())
                 if new_leader:
                     await new_leader.send_raw(build_is_leader())
+        # Nothing of the record outlives the connection (PlayerClient.cpp:184-185).
+        self.visited_levels.clear()
 
         # Dismount horse if mounted
         horse_manager = getattr(self.server, 'horse_manager', None)
@@ -312,204 +316,6 @@ class Player(MovementHandlers, CombatHandlers, ItemHandlers, EntityHandlers,
             self._unhandled_packet_ids.add(packet_id)
             logger.debug(
                 f"Player {self.id}: no handler for packet id {packet_id}")
-
-    # =========================================================================
-    # Level transitions
-    # =========================================================================
-
-    async def warp(self, level_name: str, x: float, y: float):
-        """Warp player to a level."""
-        logger.info(f"Player {self.id} warping to {level_name} at ({x}, {y})")
-
-        # Find or load the destination FIRST: a bad/nonexistent level name
-        # must not detach the player from their current level (this used to
-        # remove_player + broadcast leave before validating, stranding the
-        # player in limbo server-side while the client kept playing).
-        level = self.server.world.get_level(level_name)
-        if not level:
-            logger.warning(f"Level not found: {level_name}")
-            if self.level:
-                # Snap the (possibly optimistic) client back to where it is:
-                # warp packet for position, full level re-send so the client
-                # (which may have already reset its local level state for the
-                # bogus name) recovers name/board/entities.
-                await self.send_raw(build_warp(*absolute_position(self), self.level.name))
-                await self._send_level(self.level)
-            return
-
-        # TServerPlayer.cpp:140-160: level teardown breaks attachment links.
-        if (getattr(self, 'npc_id', 0) or getattr(self, 'attach_npc', (0, 0))[1]
-                or getattr(self, '_attachment_position_unknown', False)):
-            await self.send_props({PLPROP.CARRYNPC: 0, PLPROP.ATTACHNPC: (0, 0)})
-        self.npc_id = 0
-        clear_attachment(self)
-        manager = getattr(self.server, 'combat_manager', None)
-        if manager is not None and manager.discard_held_bomb(self.id) is not None:
-            self.carrysprite = -1
-            await self.send_props({PLPROP.CARRYSPRITE: -1})
-        old_level = self.level
-        old_gmap_info = (
-            self.server.world.get_gmap_for_level(old_level.name)
-            if old_level else None
-        )
-        new_gmap_info = self.server.world.get_gmap_for_level(level.name)
-        same_gmap = (
-            old_gmap_info is not None
-            and new_gmap_info is not None
-            and old_gmap_info[0].name == new_gmap_info[0].name
-        )
-
-        # Update level membership FIRST and synchronously - no `await` between
-        # detaching from the old level and attaching to the new one. NPC/chest
-        # broadcasts are scoped by reading player.level live (see
-        # broadcast_to_level/get_players_on_level), so if self.level only
-        # flipped after the awaited leave-notification/broadcast below, a
-        # concurrently-scheduled coroutine (an NPC's dirty-tick push, another
-        # player's packet handler) could still see this player attached to
-        # the old level during that gap and send it the old level's NPC/chest
-        # props. The client, having already optimistically switched its own
-        # current-level tracking the moment it sent PLI_LEVELWARP, then tags
-        # those late old-level packets as belonging to the new level - the
-        # start level's villagers/chests bleeding into whatever the player
-        # warped to.
-        if old_level:
-            old_level.remove_player(self)
-            if (not self.server.world.get_gmap_for_level(old_level.name)
-                    and old_level.get_leader_id() is not None):
-                new_leader = self.server.get_player(old_level.get_leader_id())
-                if new_leader:
-                    await new_leader.send_raw(build_is_leader())
-        self.x = x
-        self.y = y
-        self._last_absolute_position = (x, y)
-        self.level = level
-        level.add_player(self)
-
-        # Leave current level. GS1's "playerleaves" event previously only
-        # fired on disconnect (_cleanup), never on a normal warp to another
-        # level, so NPCs never saw a player leave via warp.
-        if old_level:
-            if getattr(self.server, 'npc_manager', None):
-                await self.server.npc_manager.on_player_leaves(self, old_level)
-            if not same_gmap:
-                await self.server.broadcast_to_world(
-                    old_level.name, build_player_left(self.id), exclude={self.id}
-                )
-
-        # Handle horse warp
-        if hasattr(self.server, 'horse_manager'):
-            await self.server.horse_manager.handle_player_warp(self, old_level, level)
-
-        # Send level data
-        await self._send_level(level)
-
-        # Notify NPCs
-        await self.server.npc_manager.on_player_enters(self, level)
-
-    @staticmethod
-    def _board_layer_packets(level):
-        from .protocol.packets import build_board_layer_raw
-        packets = bytearray()
-        for layer, tiles in sorted(level.board_layers.items()):
-            packet = build_board_layer_raw(layer, bytes(tiles))
-            packets.extend(build_raw_data_announcement(len(packet)) + packet)
-        return bytes(packets)
-
-    async def _send_level(self, level: 'Level'):
-        """Send level data to player."""
-        logger.info(f"Sending level {level.name} to player {self.id}")
-
-        # Build packets
-        level_name_pkt = build_level_name(level.name)
-
-        # Board data format: [packet_id + 32] + [8192 tile bytes] + [\n]
-        # The base board; pending board changes follow below
-        # (Level.cpp:483-530, sent by BoardChangeManager.join_packets).
-        tile_data = level.get_base_board_packet()  # 8192 bytes
-        board_packet = bytes([PLO.BOARDPACKET + 32]) + tile_data + b'\n'
-
-        # Announce raw data size (1 + 8192 + 1 = 8194)
-        announcement = build_raw_data_announcement(len(board_packet))
-
-        # In a GMAP, warp via PLO_PLAYERWARP2, which carries LOCAL coords plus the
-        # segment's grid (gmap_x/gmap_y) separately. PLO_PLAYERWARP packs the
-        # position into a single gchar (max ~111 tiles), so world coords for grid
-        # cell 2+ (x >= 128) overflow and the player lands at the wrong spot; the
-        # client recombines local + grid*64 itself.
-        gmap_info = self.server.world.get_gmap_for_level(level.name)
-        if gmap_info:
-            _, gx, gy = gmap_info
-            warp_packet = build_warp2(*absolute_position(self), level.name, gx, gy)
-        else:
-            warp_packet = build_warp(*absolute_position(self), level.name)
-
-        combined = level_name_pkt + announcement + board_packet + self._board_layer_packets(level) + warp_packet
-        await self.send_raw(combined)
-
-        # If this level is a GMAP segment, announce the .gmap name. That makes the
-        # client request the gmap file (PLI_WANTFILE), build the grid, enter gmap
-        # mode and request adjacent segments — without it the client treats the
-        # segment as a standalone level (no stitching, broken edge warps).
-        if gmap_info:
-            gmap = gmap_info[0]
-            # The client keys gmap handling off the ".gmap" suffix; gmap.name is
-            # the bare stem ("chicken"), so announce the full filename.
-            gmap_file = gmap.name if gmap.name.endswith('.gmap') else gmap.name + '.gmap'
-            await self.send_raw(build_level_name(gmap_file))
-
-        # Send signs and links on level
-        from .protocol.packets import build_level_sign, build_level_link
-        for (sx, sy), text in level.get_signs().items():
-            await self.send_raw(build_level_sign(sx, sy, text))
-        for link in level.get_links():
-            await self.send_raw(build_level_link(
-                link['dest_level'], link['x'], link['y'],
-                link['width'], link['height'], link['dest_x'], link['dest_y'],
-            ))
-
-        # Send NPCs on level
-        for npc in level.get_npcs():
-            await self.send_raw(npc.build_props_packet())
-            bytecode = npc.build_bytecode_packet()  # Level.cpp:1475-1480
-            if bytecode:
-                await self.send_raw(bytecode)
-            showimgs = npc.build_showimgs_packet()
-            if showimgs is not None:
-                await self.send_raw(showimgs)
-            if npc.move_queue:  # Level::sendNPCToPlayer, Level.cpp:1484
-                from .npc_motion import send_queue_to_player
-                await send_queue_to_player(npc, self.server, self)
-
-        # Send items on level
-        if hasattr(self.server, 'item_manager'):
-            await self.server.item_manager.send_level_items(self, level)
-
-        # Board changes before horses and baddies
-        # (PlayerClient.cpp:1523-1528, SubLevel::sendBoardChangesToPlayer).
-        board_changes = getattr(self.server, 'board_changes', None)
-        if board_changes is not None:
-            from .handlers.versions import client_version
-            packets = board_changes.join_packets(level, client_version(self))
-            if packets:
-                await self.send_raw(b"".join(packets))
-
-        # Send baddies on level
-        if hasattr(self.server, 'baddy_manager'):
-            await self.server.baddy_manager.send_level_baddies(self, level)
-
-        # Send horses on level
-        if hasattr(self.server, 'horse_manager'):
-            await self.server.horse_manager.send_level_horses(self, level)
-
-        if level.is_player_leader(self) or gmap_info:
-            await self.send_raw(build_is_leader())
-
-        # Exchange props with everyone else already in the world (see
-        # audience.Audience for the one definition of who that is).
-        for other in self.server.audience.players_in_world(
-                level.name, exclude={self.id}):
-            await self.send_raw(other.build_props_packet())
-            await other.send_raw(self.build_props_packet())
 
     # =========================================================================
     # Sending

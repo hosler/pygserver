@@ -15,7 +15,7 @@ from pathlib import Path
 
 from reborn_protocol.coords import LEVEL_SIZE, in_level_bounds, level_index
 
-from . import tiletypes
+from . import level_cache, tiletypes
 from .board_changes import BoardChange, BoardChangeList
 
 if TYPE_CHECKING:
@@ -23,6 +23,14 @@ if TYPE_CHECKING:
     from .npc import NPC
 
 logger = logging.getLogger(__name__)
+
+
+def file_mod_time(path) -> int:
+    """Whole unix seconds of `path`'s mtime, 0 when it cannot be read."""
+    try:
+        return int(os.stat(path).st_mtime) if path else 0
+    except OSError:
+        return 0
 
 
 class LevelLoadError(ValueError):
@@ -66,6 +74,12 @@ class Level:
     def __init__(self, name: str):
         self.name = name
         self.file_path: Optional[str] = None
+        # Unix seconds of the level file's mtime, the value PLO_LEVELMODTIME
+        # carries and PLI_LEVELWARPMOD / PLI_ADJACENTLEVEL echo back
+        # (LevelLoader.cpp:270 reads the file time, PlayerClient.cpp:1452
+        # truncates it with to_time_t). Only a reload changes it; board
+        # changes, chests, NPCs and saves do not. 0 for a level with no file.
+        self.mod_time = 0
 
         # Tile data (64x64 = 4096 tiles, 2 bytes each)
         self._tiles = bytearray(self.BOARD_SIZE)
@@ -135,6 +149,7 @@ class Level:
                 data = f.read()
 
             level._parse_nw_file(data)
+            level.mod_time = file_mod_time(file_path)
             logger.debug(f"Loaded level {name} from {file_path}")
 
         except FileNotFoundError:
@@ -474,16 +489,34 @@ class Level:
         a respawn nor a joiner's replay brings the client's tile back. Client
         board edits go through alter_board instead.
 
-        The reference routes script tile writes through its own board-change
-        path (Level::applyBoardChangeFromScriptTiles -> alterBoard,
-        Level.cpp:1751-1799, on `updateboard`); pygserver's script writes are
-        immediate, so the entries over the cell are patched instead."""
+        Two script writers use this as it stands. GS1 `board[i] = n` writes the
+        level's own tile array in the reference too (GS1Variables.cpp:41-59,
+        through SubLevel::getTiles): no board change, no packet, so a client
+        that already holds the board keeps its copy and a first-time entrant
+        gets the new tile. GS1 `tiles[x,y] = n` goes through record_tile_write
+        below; a bomb blast is a client board edit in the reference and goes
+        through alter_board (combat.py)."""
         if in_level_bounds(x, y):
             idx = level_index(x, y) * 2
             for board in (self._tiles, self._base_tiles):
                 board[idx] = tile_id & 0xFF
                 board[idx + 1] = (tile_id >> 8) & 0xFF
             self._board_changes.patch_cell(level_index(x, y), tile_id & 0xFFFF)
+
+    def record_tile_write(self, x: int, y: int, tile_id: int, now: float,
+                          corrections: Optional[List[BoardChange]] = None
+                          ) -> Optional[BoardChange]:
+        """A script tile write that stays: set_tile plus a 1x1 board change that
+        does not respawn, so a player who enters later, or comes back, is
+        replayed the tile. The reference turns a script tile edit into a board
+        change in Level::applyBoardChangeFromScriptTiles -> alterBoard
+        (Level.cpp:1751-1799); the permanent variant is `updateboard2`, which
+        passes forceRespawn=false, allowRespawn=false (Level.cpp:1858-1862).
+        The reference only does that on `updateboard`; pygserver's `tiles[]`
+        write is immediate, so the change is recorded at the write."""
+        self.set_tile(x, y, tile_id)
+        return self.alter_board(x, y, 1, 1, [tile_id & 0xFFFF], now, 0,
+                                allow_respawn=False, corrections=corrections)
 
     # -- board changes (board_changes.py) --------------------------------------
 
@@ -634,6 +667,7 @@ class Level:
         """Add an NPC to this level."""
         self._npcs[npc.id] = npc
         npc.level = self
+        npc.level_time = level_cache.clock()
         self.check_sparring_zone(npc.client_script)
 
     def check_sparring_zone(self, client_script: str):

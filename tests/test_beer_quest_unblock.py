@@ -63,12 +63,16 @@ class FakeWorld:
     def get_level(self, name):
         return self._levels.get(name)
 
+    def get_gmap_for_level(self, name):
+        return None
+
 
 class FakeServer:
     def __init__(self):
         self.world = FakeWorld()
         self.npc_manager = NPCManager(self)
         self._players = {}
+        self.players = self._players
         self.broadcasts = []
 
     def get_player(self, pid):
@@ -249,8 +253,9 @@ def test_mountain_guard_destroy_notifies_client_no_ghost_npc():
 
         from pygserver.protocol.packets import build_npc_del
         expected = build_npc_del(mountain_guard.id)
-        assert any(pkt == expected for (_lvl, pkt, _exclude) in server.broadcasts), (
-            "PLO_NPCDEL was never broadcast - clients would keep a ghost NPC"
+        # Server::deleteNPC tells every client on the level (Server.cpp:1625-1641).
+        assert expected in player.sent, (
+            "PLO_NPCDEL was never sent - clients would keep a ghost NPC"
         )
 
     asyncio.run(main())

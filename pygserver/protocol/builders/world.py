@@ -539,6 +539,12 @@ def build_board_layer(layer: int, tiles: bytes) -> bytes:
     return builder.build()
 
 
+def build_board_packet_raw(tiles: bytes) -> bytes:
+    """The complete raw PLO_BOARDPACKET (the 8192 base tile bytes), sent after
+    a PLO_RAWDATA announcement of its length (Level.cpp:388-401)."""
+    return bytes([PLO.BOARDPACKET + 32]) + tiles + b'\n'
+
+
 def build_board_layer_raw(layer: int, tiles: bytes) -> bytes:
     """Build the complete raw board layer (Level.cpp:427-437)."""
     return bytes([PLO.BOARDLAYER + 32, layer, 0, 0, 64, 64]) + tiles + b'\n'

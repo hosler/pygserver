@@ -85,13 +85,21 @@ def adjacent_payload(modtime, name):
 
 @pytest.mark.parametrize('modtime', [0, 1, 1_700_000_000])
 def test_adjacent_level_reads_modtime_before_the_name(world, modtime):
+    """The answer is the static block (PlayerClient.cpp:1446-1522): the
+    neighbour's name, its board, the empty chest list, its mod time (0, it
+    has no file) and the player's own level name. A misread mod time would
+    turn into a wrong level name and no answer at all."""
     world.sender.level = world.level
+    world.sender.level_loaded = True
     run(world.sender._handle_adjacent_level(adjacent_payload(modtime, "cellar.nw")))
 
     board = bytes([PLO.BOARDPACKET + 32]) + bytes(8192) + b"\n"
     announcement = bytes([PLO.RAWDATA + 32]) + PacketBuilder().write_gint3(len(board)).build() + b"\n"
     name = bytes([PLO.LEVELNAME + 32]) + b"cellar.nw\n"
-    assert sent(world.sender) == [name + announcement + board]
+    mod_time = bytes([PLO.LEVELMODTIME + 32]) + b"\x20" * 5 + b"\n"
+    own_name = bytes([PLO.LEVELNAME + 32]) + b"lobby.nw\n"
+    assert sent(world.sender) == [name + announcement + board + mod_time + own_name,
+                                  bytes([PLO.ISLEADER + 32]) + b"\n"]
 
 
 def test_adjacent_level_unknown_name_sends_nothing(world):
@@ -116,11 +124,16 @@ def test_level_loads_extra_board_layers_and_sends_them_raw(world):
     assert level.get_tile(5, 5) == 1
     assert bytes(level.board_layers[2][:2]) == (64).to_bytes(2, "little")
 
-    packets = Player._board_layer_packets(level)
+    def board_only(lvl):
+        board = bytes([PLO.BOARDPACKET + 32]) + lvl.get_base_board_packet() + b"\n"
+        return bytes([PLO.RAWDATA + 32]) + PacketBuilder().write_gint3(len(board)).build() + b"\n" + board
+
+    packets = Player.board_bytes(level)
     body = bytes([PLO.BOARDLAYER + 32, 2, 0, 0, 64, 64]) + bytes(level.board_layers[2]) + b"\n"
     announcement = bytes([PLO.RAWDATA + 32]) + PacketBuilder().write_gint3(len(body)).build() + b"\n"
-    assert packets == announcement + body
-    assert Player._board_layer_packets(Level("plain.nw")) == b""
+    assert packets == board_only(level) + announcement + body
+    plain = Level("plain.nw")
+    assert Player.board_bytes(plain) == board_only(plain)
 
 
 def test_missing_layer_cells_are_the_reference_empty_tile():
@@ -139,9 +152,11 @@ def test_adjacent_level_sends_layers_after_the_board(world):
     world.other_level.board_layers[3] = bytearray(b"\x07\x00" * 4096)
     run(world.sender._handle_adjacent_level(adjacent_payload(0, "cellar.nw")))
 
-    [packet] = sent(world.sender)
+    packet = sent(world.sender)[0]
     layer = bytes([PLO.BOARDLAYER + 32, 3, 0, 0, 64, 64])
-    assert packet.endswith(layer + b"\x07\x00" * 4096 + b"\n")
+    end = layer + b"\x07\x00" * 4096 + b"\n"
+    assert end in packet
+    assert packet.index(bytes([PLO.BOARDPACKET + 32])) < packet.index(end)
 
 
 # -- PLI_SHOOT / PLI_SHOOT2 -------------------------------------------------

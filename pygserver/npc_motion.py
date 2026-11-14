@@ -41,10 +41,10 @@ from __future__ import annotations
 
 import math
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable, Deque, Optional, Tuple
 
-from . import collision
+from . import collision, level_cache
 
 # NPCMove option bits (NPC.h:244-248). Only five bits are stored; the client's
 # 0x20 / 0x40 are dropped, exactly like the reference's bitset<5>.
@@ -84,6 +84,9 @@ class NPCMove:
     elapsed_ms: int = 0
     on_complete: Optional[Callable[[], None]] = None
     sent: bool = False          # PLO_MOVE(2) already went to the level
+    # When the move was queued; an entry sends only the moves queued at or
+    # after the player last left the level (NPC.cpp:513-517).
+    mod_time: float = field(default_factory=lambda: level_cache.clock())
 
     def current_position(self) -> Tuple[int, int]:
         """NPCMove::getCurrentPosition (NPC.h:252-261): the lerp, truncated
@@ -409,13 +412,15 @@ def _ticks(move: NPCMove) -> int:
 
 
 def packet_moves(npc, server, only_unsent: bool = False,
-                 only_sent: bool = False):
+                 only_sent: bool = False, since=None):
     """The queue as `(x, y, dx, dy, ticks, options)` tuples for the packet
     builders: level-local pixel position and remaining delta (NPC.cpp:512-530)."""
     origin = level_origin_px(server, npc.level)
     moves = []
     for move in npc.move_queue:
         if (only_unsent and move.sent) or (only_sent and not move.sent):
+            continue
+        if since is not None and move.mod_time < since:
             continue
         current = move.current_position()
         moves.append((current[0] - origin[0], current[1] - origin[1],
@@ -437,15 +442,16 @@ async def send_move_packets(npc_id: int, moves, recipients) -> None:
         await player.send_raw(modern if client_version(player) >= 2.3 else classic)
 
 
-async def send_queue_to_player(npc, server, player) -> None:
+async def send_queue_to_player(npc, server, player, since=None) -> None:
     """NPC::sendMoveQueueToPlayer: a client that just met the NPC learns the
-    running queue (Level::sendNPCToPlayer, Level.cpp:1484).
+    running queue (Level::sendNPCToPlayer, Level.cpp:1484), or on a return
+    the moves queued since it left (`since`).
 
     Only moves the level has already been told about go out. An unsent one is
     still waiting for the next `send_unsent_moves`, which reaches the new
     arrival too, so every move arrives exactly once."""
     await send_move_packets(
-        npc.id, packet_moves(npc, server, only_sent=True), [player])
+        npc.id, packet_moves(npc, server, only_sent=True, since=since), [player])
 
 
 async def send_unsent_moves(npc, server, recipients) -> None:

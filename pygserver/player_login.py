@@ -316,6 +316,9 @@ class LoginService:
 
         config = player.server.config
         await player.warp(config.start_level, config.start_x, config.start_y)
+        # PlayerClient.cpp:659: the first level is out; later entries skip
+        # the first-load blank board and Z prop (PlayerClient.cpp:1465,1314).
+        player.level_loaded = True
 
         # PlayerClient.cpp:449,659: a client counts as loaded, and so is saved
         # on disconnect, only once the login and first level have gone out.

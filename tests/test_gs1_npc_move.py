@@ -391,9 +391,12 @@ def test_gmap_npc_rolls_into_the_neighbour_segment(tmp_path):
     assert npc.level is east and (npc.x, npc.y) == (0.5, 10.0)
     assert npc.id in {n.id for n in east.get_npcs()} and not west.get_npcs()
     calls = {call.args[0]: call.args[1] for call in server.broadcast_to_level.await_args_list}
-    assert calls["w.nw"] == build_npc_moved(npc.id, "e.nw", 0.5, 10.0)
+    # PLO_NPCMOVED goes to every player (NPC.cpp:210), the props to the new level.
+    moved = build_npc_moved(npc.id, "e.nw", 0.5, 10.0)
+    assert on_west.send_raw.await_args_list[0].args[0] == moved
+    assert on_east.send_raw.await_args_list[0].args[0] == moved
+    assert "w.nw" not in calls
     assert calls["e.nw"] == npc.build_props_packet()
-    assert on_west is not None and on_east is not None
 
 
 def test_gmap_npc_rolls_left_and_stays_put_off_the_map(tmp_path):
@@ -425,13 +428,15 @@ def test_warp_tells_the_old_level_and_shows_the_new_one(tmp_path):
     old, new = flat_level("o.nw"), flat_level("n.nw")
     server = make_server(tmp_path, old, new)
     server.broadcast_to_level = AsyncMock()
+    elsewhere = add_player(server, flat_level("x.nw"), 5)
     npc = add_npc(server, old, 3.0, 4.0)
     npc_motion.queue_move(npc, server, (16, 0), 1.0, 0)
     run(server.npc_manager.warp_npc(npc, "n.nw", 7.5, 9.0))
     assert npc.level is new and not npc.move_queue and not old.get_npcs()
+    # PLO_NPCMOVED to every player, wherever it is (NPC.cpp:210).
+    assert elsewhere.send_raw.await_args.args[0] == build_npc_moved(npc.id, "n.nw", 7.5, 9.0)
     calls = [(c.args[0], c.args[1]) for c in server.broadcast_to_level.await_args_list]
-    assert calls[0] == ("o.nw", build_npc_moved(npc.id, "n.nw", 7.5, 9.0))
-    assert calls[1] == ("n.nw", npc.build_props_packet())
+    assert calls[0] == ("n.nw", npc.build_props_packet())
 
 
 def test_warp_to_a_missing_level_leaves_the_npc_alone(tmp_path):
@@ -845,10 +850,11 @@ def test_the_old_segment_is_told_to_forget_an_npc_that_moves_out_of_reach(tmp_pa
     npc._last_relocate = 0.0
     run(server.npc_manager.confine_position(npc))
     assert npc.level is far
-    # Nothing is dirty and no tick runs: the roll itself tells the holder.
-    assert sent_ids(watcher) == [PLO.NPCDEL] and not npc._seam_players
+    # Nothing is dirty and no tick runs: the roll itself tells the holder,
+    # after the move every player hears (NPC.cpp:210).
+    assert sent_ids(watcher) == [PLO.NPCMOVED, PLO.NPCDEL] and not npc._seam_players
     run(server.npc_manager.tick())
-    assert sent_ids(watcher) == [PLO.NPCDEL]          # and only once
+    assert sent_ids(watcher) == [PLO.NPCMOVED, PLO.NPCDEL]   # and only once
 
 
 def test_a_warp_to_an_unrelated_level_tells_the_old_segment_to_forget_the_npc(tmp_path):
@@ -862,7 +868,7 @@ def test_a_warp_to_an_unrelated_level_tells_the_old_segment_to_forget_the_npc(tm
     run(server.npc_manager.warp_npc(npc, "z.nw", 5.0, 5.0))
     for _ in range(3):
         run(server.npc_manager.tick())
-    assert sent_ids(watcher) == [PLO.NPCDEL] and not npc._seam_players
+    assert sent_ids(watcher) == [PLO.NPCMOVED, PLO.NPCDEL] and not npc._seam_players
 
 
 def test_an_empty_queue_roll_gives_the_holder_the_exact_position(tmp_path):
@@ -874,7 +880,7 @@ def test_an_empty_queue_roll_gives_the_holder_the_exact_position(tmp_path):
     assert npc.x == 0.3125
     assert sent_ids(watcher) == [PLO.NPCMOVED, PLO.NPCPROPS]
     assert watcher.send_raw.await_args.args[0] == npc.build_props_packet()
-    assert sent_ids(resident) == [PLO.NPCPROPS]
+    assert sent_ids(resident) == [PLO.NPCMOVED, PLO.NPCPROPS]
 
 
 def test_a_holder_on_the_destroyed_npcs_own_segment_gets_one_delete(tmp_path):
@@ -945,7 +951,8 @@ def test_a_holder_is_dropped_when_the_npc_rolls_back_onto_its_segment(tmp_path):
     npc._last_relocate = 0.0
     run(server.npc_manager.confine_position(npc))
     assert npc.level is west and not npc._seam_players
-    assert sent_ids(watcher) == [PLO.NPCPROPS]        # one arrival, no extra copy
+    # The move every player hears, then one arrival and no extra copy.
+    assert sent_ids(watcher) == [PLO.NPCMOVED, PLO.NPCPROPS]
 
 
 def test_a_holder_who_walked_into_the_npc_segment_is_dropped(tmp_path):
