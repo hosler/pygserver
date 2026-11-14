@@ -214,7 +214,12 @@ def test_failed_periodic_save_still_yields_and_does_not_retry_each_tick(tmp_path
         server.npc_manager.tick = tick
         task = asyncio.create_task(server._main_loop())
         try:
-            await asyncio.wait_for(asyncio.sleep(0.11), timeout=1)
+            # Wait for the second tick itself: a loaded machine does not fit
+            # two ticks into a fixed sleep.
+            clock = asyncio.get_running_loop().time
+            deadline = clock() + 2
+            while ticks < 2 and clock() < deadline:
+                await asyncio.sleep(0.01)
             assert not task.done()
             assert ticks >= 2
             assert server._last_flag_save > previous_save
