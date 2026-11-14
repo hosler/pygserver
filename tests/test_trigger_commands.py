@@ -277,9 +277,11 @@ def test_attr_sets_correct_property_id_and_preserves_raw_csv_remainder(world, nu
 
     assert player.gattribs == {prop_id: value}
     player.send_raw.assert_awaited_once_with(build_player_props({prop_id: value}))
+    # gr.attr reaches the players around the player (PlayerProps.cpp:1244);
+    # off a gmap that is the level, so the level send is the one awaited.
     server.broadcast_to_level.assert_awaited_once_with(
         level.name, build_other_player_props(player.id, {prop_id: value}),
-        exclude={player.id})
+        {player.id})
     server.npc_manager.on_trigger_action.assert_not_awaited()
 
 
@@ -307,24 +309,32 @@ def test_attr_can_clear_a_value_and_skips_unchanged_values(world):
     assert player.send_raw.await_count == 1
 
 
-@pytest.mark.parametrize("requested,limit,maximum,current", [
-    (8, 20, 8, 8), (8, 3, 3, 8), (24, 30, 20, 24),
-    (260, 20, 4, 4), (-1, 20, 20, 127),
+@pytest.mark.parametrize("requested,limit,maximum,current,expected", [
+    (8, 20, 8, 8, b')!("0\n'),
+    (8, 3, 3, 8, b')!#"0\n'),
+    (24, 30, 20, 24, b')!4"P\n'),
+    (260, 20, 4, 4, b')!$"(\n'),
+    (-1, 20, 20, 127, b')!4"\xff\n'),
 ])
 def test_fullhearts_sets_maximum_refills_and_sends_props(
-        world, requested, limit, maximum, current):
+        world, requested, limit, maximum, current, expected):
     server, player, level = world
     server.config.triggerhack_props = True
     server.config.heart_limit = limit
     player.hearts = 1
+    other = Player(server, 2, AsyncMock(), MagicMock())
+    other.level = level
+    other.send_raw = AsyncMock()
+    server.players[other.id] = other
+    level.add_player(other)
+    server.broadcast_to_level = AsyncMock(
+        wraps=GameServer.broadcast_to_level.__get__(server))
     run(player._handle_trigger_action(trigger_payload(f"gr.fullhearts, {requested} ")))
     assert player.max_hearts == maximum
     assert player.hearts == current
-    # The reference sends the requested FULLHEARTS value and stored HALFHEARTS.
-    props = {PLPROP.MAXPOWER: requested & 255, PLPROP.CURPOWER: current * 2}
-    player.send_raw.assert_awaited_once_with(build_player_props(props))
-    server.broadcast_to_level.assert_awaited_once_with(
-        level.name, build_other_player_props(player.id, props), exclude={player.id})
+    player.send_raw.assert_awaited_once_with(expected)
+    other.send_raw.assert_not_awaited()
+    server.broadcast_to_level.assert_not_awaited()
     server.npc_manager.on_trigger_action.assert_not_awaited()
 
 

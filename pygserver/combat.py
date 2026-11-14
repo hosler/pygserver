@@ -955,7 +955,11 @@ class CombatManager:
                         packet = build_board_modify(x, y, 2, 2, tiles)
                     else:
                         packet = build_board_modify2(gmap[1], gmap[2], x, y, 2, 2, tiles)
-                    await self.server.broadcast_to_level(level.name, packet)
+                    # LevelBoardChange::sendToPlayersOnLevel
+                    # (LevelBoardChange.cpp:52-71): the 3x3 on a gmap.
+                    cast = (getattr(self.server, 'broadcast_nearby', None)
+                            or self.server.broadcast_to_level)
+                    await cast(level.name, packet)
 
     async def handle_arrow_add(self, player: 'Player', x: float, y: float,
                                 flags: int, sprite: int = 0,
@@ -1640,7 +1644,10 @@ class CombatManager:
                 builder.write_gchar(len(gani))
             builder.write_bytes(gani).write_gchar(len(params)).write_bytes(params)
             packets[use_modern] = builder.write_newline().build()
-        for other in self.server.audience.players_in_world(
+        # sendPacketToNearby, sender excluded, once per layout filtered by
+        # version (PlayerClientPackets.cpp:1368-1369, :1401-1402): the 3x3 on a
+        # gmap, the level otherwise.
+        for other in self.server.audience.players_in_range_for_data(
                 player.level.name, exclude={player.id}):
             await other.send_raw(packets[client_version(other) >= 5.07])
 
@@ -1675,13 +1682,15 @@ class CombatManager:
             return
 
         # Relay a notification to nearby OTHER players so their clients can
-        # show a hit effect too (GServer-v2 sendPacketToNearby(..., {m_id})
-        # excludes the sender, who already knows locally that it swung).
-        if hasattr(self.server, 'broadcast_to_level'):
-            packet = build_hit_objects(player.id, int(power * 2), x, y, npc_id)
-            await self.server.broadcast_to_level(
-                player.level.name, packet, exclude={player.id}
-            )
+        # show a hit effect too (GServer-v2 sendPacketToNearby(..., {m_id}),
+        # PlayerClientPackets.cpp:1049, excludes the sender, who already knows
+        # locally that it swung): the 3x3 on a gmap, the level otherwise.
+        cast = (getattr(self.server, 'broadcast_nearby', None)
+                or getattr(self.server, 'broadcast_to_level', None))
+        if cast is not None:
+            packet = build_hit_objects(
+                0 if npc_id is not None else player.id, int(power * 2), x, y, npc_id)
+            await cast(player.level.name, packet, exclude={player.id})
 
         npc_mgr = getattr(self.server, 'npc_manager', None)
         if npc_mgr is None or not hasattr(npc_mgr, 'get_npcs_on_level'):

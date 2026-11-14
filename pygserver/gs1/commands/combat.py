@@ -149,7 +149,11 @@ def _c_hitobjects(self, a, npc, player, ctx):
         from ...protocol.packets import build_hit_objects
         power = int(to_num(a[0]) * 2)
         pkt = build_hit_objects(0, power, to_num(a[1]), to_num(a[2]), npc_id=npc.id)
-        _schedule(self.server.broadcast_to_level(lvl.name, pkt))
+        # Server::hitObjectsAtPoint: sendPacketToNearby, nobody excluded
+        # (Server.cpp:1952-1956).
+        cast = (getattr(self.server, "broadcast_nearby", None)
+                or self.server.broadcast_to_level)
+        _schedule(cast(lvl.name, pkt))
     except Exception:
         logger.debug("hitobjects failed", exc_info=True)
 

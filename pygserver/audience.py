@@ -89,8 +89,9 @@ def contains(shape: Shape, cx: float, cy: float, radius: float,
 # two separate buffers (outAll / outLevel,
 # server/src/utilities/PropertySerializers.cpp:726-737), so a sendToAll prop
 # is never repeated in the nearby packet. The player-list status has no
-# storage in this server yet (prop 53 is also an alias of the last custom
-# attribute in the constants), so it is left out of the set.
+# storage in this server yet (prop 53 is PSTATUSMSG in PLPROP, the reference's
+# PLAYERLISTSTATUS, PlayerProps.h:76; GATTRIB10 is 54), so it is left out of
+# the set.
 SEND_TO_ALL_PROPS = frozenset({PLPROP.NICKNAME, PLPROP.HEADIMAGE})
 
 BOMB_BLAST_NPCS = Shape.CIRCLE

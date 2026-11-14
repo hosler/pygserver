@@ -114,7 +114,11 @@ def test_reported_held_blast_relays_and_changes_board_without_player_damage(aren
     victim.send_props.assert_not_awaited()
     carrier.send_raw.assert_not_awaited()
     calls = server.broadcast_to_level.await_args_list
-    assert sum(call.args[1][0] == PLO.BOARDMODIFY + 32 for call in calls) == 1
+    # The board change is a LevelBoardChange send: the 3x3 on a gmap, so it
+    # goes through broadcast_nearby (LevelBoardChange.cpp:52-71).
+    nearby = server.broadcast_nearby.await_args_list
+    assert sum(call.args[1][0] == PLO.BOARDMODIFY + 32 for call in nearby) == 1
+    assert not any(call.args[1][0] == PLO.BOARDMODIFY + 32 for call in calls)
     relays = [call for call in calls if call.args[1][0] == PLO.EXPLOSION + 32]
     assert len(relays) == 2
     assert all(call.kwargs['exclude'] == {carrier.id} for call in relays)

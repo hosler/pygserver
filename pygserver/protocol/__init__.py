@@ -58,6 +58,7 @@ from .packets import (
     build_npc_move2,
     build_world_time,
     build_show_img,
+    build_show_img_player,
     build_hit_objects,
 )
 
@@ -125,5 +126,6 @@ __all__ = [
     "build_npc_move2",
     "build_world_time",
     "build_show_img",
+    "build_show_img_player",
     "build_hit_objects",
 ]

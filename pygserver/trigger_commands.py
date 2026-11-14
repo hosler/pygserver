@@ -156,10 +156,13 @@ async def _setguild(server, player, fields, action):
     return True
 
 
-async def _send_player_props(server, player, props):
+async def _send_player_props(server, player, props, nearby=False):
     await player.send_props(props)
     if player.level is not None:
-        await server.broadcast_to_level(
+        # A shared-local prop reaches the players around the player: the 3x3
+        # on a gmap (PlayerProps.cpp:1244, Server::sendNonLevelBoundPacketToNearby).
+        cast = server.broadcast_nearby if nearby else server.broadcast_to_level
+        await cast(
             player.level.name, build_other_player_props(player.id, props),
             exclude={player.id})
 
@@ -179,7 +182,7 @@ async def _attr(server, player, fields, action):
         value = action.split(",", 2)[2]
         if player.gattribs.get(prop_id, "") != value:
             player.gattribs[prop_id] = value
-            await _send_player_props(server, player, {prop_id: value})
+            await _send_player_props(server, player, {prop_id: value}, nearby=True)
     return True
 
 
@@ -196,8 +199,8 @@ async def _fullhearts(server, player, fields, action):
         # PlayerProps.cpp:207-222 clamps the maximum, but refills from the
         # requested uint8 value. HALFHEARTS is itself stored as a uint8.
         player.hearts = ((hearts * 2) & 255) / 2.0
-        await _send_player_props(server, player, {
-            PLPROP.MAXPOWER: hearts,
+        await player.send_props({
+            PLPROP.MAXPOWER: player.max_hearts,
             PLPROP.CURPOWER: int(player.hearts * 2),
         })
     return True

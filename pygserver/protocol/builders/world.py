@@ -390,6 +390,16 @@ def build_show_img(code: int, x: float, y: float, image: str) -> bytes:
     return builder.build()
 
 
+def build_show_img_player(player_id: int, payload: bytes) -> bytes:
+    """Build the PLO_SHOWIMGPLAYER relay of a client's PLI_SHOWIMGPLAYER:
+    {GSHORT player_id} then the client's bytes unchanged
+    (GServer-v2 msgPLI_SHOWIMGPLAYER, PlayerClientPackets.cpp:816)."""
+    builder = PacketBuilder().write_gchar(PLO.SHOWIMGPLAYER).write_gshort(player_id)
+    builder.write_bytes(payload)
+    builder.write_newline()
+    return builder.build()
+
+
 # PLO_SHOWIMGNPC is absent from the shared beta4 enum, but is packet 166 in
 # the reference server's gs2lib IEnums.h. It is distinct from PLO_SHOWIMG (32),
 # which carries player-originated images/legacy level chat.

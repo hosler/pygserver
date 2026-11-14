@@ -8,6 +8,7 @@ from ..protocol.packets import (
     PacketReader,
     build_chat,
     build_private_message,
+    build_show_img_player,
     build_trigger_action,
 )
 from .registry import handles
@@ -83,17 +84,19 @@ class CommunicationHandlers:
 
     @handles(PLI.SHOWIMG)
     async def _handle_show_img(self, data: bytes):
-        """Handle PLI_SHOWIMG packet (used here for level chat).
+        """Handle PLI_SHOWIMGPLAYER (24).
 
-        The client parses PLO_SHOWIMG with the same layout as chat
-        (gshort id + message), so relay it via build_chat.
+        The reference relays the client's bytes unchanged as
+        PLO_SHOWIMGPLAYER with the sender's id to the players around the
+        sender, the sender excluded: the 3x3 on a gmap, the level otherwise
+        (msgPLI_SHOWIMGPLAYER, PlayerClientPackets.cpp:814-818). It does not
+        look at the mute state.
         """
-        reader = PacketReader(data)
-        message = reader.remaining().decode('latin-1', errors='replace')
-
-        if not self.is_muted:
-            packet = build_chat(self.id, message)
-            await self.server.broadcast_to_all(packet)
+        if not self.level:
+            return
+        await self.server.broadcast_nearby(
+            self.level.name, build_show_img_player(self.id, data),
+            exclude={self.id})
 
     @handles(PLI.FLAGSET)
     async def _handle_flag_set(self, data: bytes):
