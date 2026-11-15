@@ -46,6 +46,9 @@ def served(tmp_path):
     (tmp_path / "serverflags.txt").write_text("secret=1\n")
     server = MagicMock()
     server.config = ServerConfig(putnpc_enabled=True, serverside=False)
+    # A plain level: putnpc asks the world for a gmap, which a bare
+    # MagicMock would answer with a fake one.
+    server.world.get_gmap_for_level.return_value = None
     server.broadcast_to_level = AsyncMock()
     server.broadcast_nearby = AsyncMock()
     filesystem = FileSystem(server, str(tmp_path))

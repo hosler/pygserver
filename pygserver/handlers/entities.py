@@ -173,8 +173,12 @@ class EntityHandlers:
             return
 
         reader = PacketReader(data)
-        x = reader.read_gchar() / 2.0
-        y = reader.read_gchar() / 2.0
+        # toLocalPixelPosition wraps the half-tile position into the level,
+        # mod 64 tiles (include/utilities/Extents.h:432-437, called at
+        # PlayerClientPackets.cpp:565): a client's unwrapped 64+ lands back
+        # in the sender's own level, not the next gmap segment.
+        x = (reader.read_gchar() % 128) / 2.0
+        y = (reader.read_gchar() % 128) / 2.0
         baddy_type = reader.read_gchar()
         power = min(reader.read_gchar(), 12)
         image = strip_control_chars(
@@ -214,16 +218,27 @@ class EntityHandlers:
         if script_path is None or manager is None:
             return
 
+        # The wire x/y are whole-map tiles, as the reference server reads
+        # them: it takes the cell from the raw value (Server.cpp:1485-1498).
+        # The wire range ends at 111.5 tiles, so only the first two cells of
+        # each axis are reachable. The reference client has no sender for
+        # this packet. The NPC is filed in the segment holding the point;
+        # only a segment already in memory counts (a client packet reads no
+        # level from disk), and with none there nothing is created.
+        from ..gs1 import frame
+        placed = frame.segment_at(self.server, self.level, x, y,
+                                  loaded_only=True)
+        if placed is None:
+            return
+        level, x, y = placed
         code = script_path.read_text(encoding='latin-1').replace('\r', '')
-        npc = manager.create_npc(level=self.level, x=x, y=y)
+        npc = manager.create_npc(level=level, x=x, y=y)
         npc.image = image
         manager.attach_gs1(npc, code)
         # Server::addNPC sends to everyone around the NPC, the creator
         # included: the 3x3 on a gmap, the level otherwise (Server.cpp:1586-1590).
-        # The wire x/2, y/2 stay in the player's own segment: how a real
-        # client frames them on a gmap is not established.
         await self.server.broadcast_nearby(
-            self.level.name, npc.build_props_packet()
+            level.name, npc.build_props_packet()
         )
 
     @handles(PLI.NPCWEAPONDEL)

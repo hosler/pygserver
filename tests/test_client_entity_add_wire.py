@@ -27,6 +27,9 @@ def test_putnpc_decodes_file_image_and_position(tmp_path):
     level.add_npc.side_effect = lambda npc: setattr(npc, "level", level)
     server = MagicMock()
     server.config = ServerConfig(putnpc_enabled=True, serverside=False)
+    # A plain level: the handler now asks the world for a gmap (whole-map
+    # putnpc tiles, Server.cpp:1485-1498), which a bare MagicMock would fake.
+    server.world.get_gmap_for_level.return_value = None
     server.broadcast_to_level = AsyncMock()
     server.broadcast_nearby = AsyncMock()
     from pygserver.filesystem import FileSystem

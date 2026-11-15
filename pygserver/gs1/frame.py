@@ -71,16 +71,20 @@ def to_level_axis(server, level, axis: str, value):
     return value - (oy if axis == "y" else ox)
 
 
-def _segment(server, gmap, cell_x: int, cell_y: int):
+def _segment(server, gmap, cell_x: int, cell_y: int, loaded_only: bool = False):
+    """The segment Level at a grid cell, or None. `loaded_only` never reads a
+    level from disk (a segment nobody has entered stays absent)."""
     if not (0 <= cell_x < int(getattr(gmap, "width", 0) or 0)
             and 0 <= cell_y < int(getattr(gmap, "height", 0) or 0)):
         return None
     name = gmap.get_level_at(cell_x, cell_y)
     world = getattr(server, "world", None)
-    return world.get_level(name) if name and world is not None else None
+    if not name or world is None:
+        return None
+    return world.get_loaded_level(name) if loaded_only else world.get_level(name)
 
 
-def segment_at(server, level, x: float, y: float):
+def segment_at(server, level, x: float, y: float, loaded_only: bool = False):
     """The (segment, local x, local y) a whole-map position names on
     `level`'s gmap, or None when no segment is there (off the map or a hole).
     Off a gmap: (level, x, y) unchanged.
@@ -88,17 +92,45 @@ def segment_at(server, level, x: float, y: float):
     The cell is the global position / 64 tiles, C division toward zero
     (toMapPosition, include/utilities/Extents.h:559-562), and the local
     position the rest, so a small negative coordinate stays in cell 0 with a
-    negative local position, as in the reference."""
+    negative local position, as in the reference. With `loaded_only` a segment
+    that is not in memory counts as absent."""
     info = gmap_cell(server, level)
     if info is None:
         return level, x, y
     if not (math.isfinite(x) and math.isfinite(y)):
         return None
     cell_x, cell_y = math.trunc(x / LEVEL_SIZE), math.trunc(y / LEVEL_SIZE)
-    segment = _segment(server, info[0], cell_x, cell_y)
+    segment = _segment(server, info[0], cell_x, cell_y, loaded_only)
     if segment is None:
         return None
     return segment, x - cell_x * LEVEL_SIZE, y - cell_y * LEVEL_SIZE
+
+
+def segments_around(server, level, x: float, y: float):
+    """[(segment, x, y), ...] for the loaded segments in the 3x3 around the
+    cell that the `level`-relative position (x, y) falls in, with (x, y)
+    re-expressed relative to each of them. The position may lie outside
+    0..63 (a client packet's unwrapped local value). Off a gmap:
+    [(level, x, y)].
+
+    For a hit test on a point near a seam: an object of a neighbouring
+    segment may cover the point. Only segments already in memory are
+    returned: NPCs live on loaded levels, and a client packet must not make
+    the server read up to eight levels from disk."""
+    info = gmap_cell(server, level)
+    if info is None:
+        return [(level, x, y)]
+    if not (math.isfinite(x) and math.isfinite(y)):
+        return []
+    gx, gy = to_map(server, level, x, y)
+    cell_x, cell_y = math.floor(gx / LEVEL_SIZE), math.floor(gy / LEVEL_SIZE)
+    found = []
+    for cy in (cell_y - 1, cell_y, cell_y + 1):
+        for cx in (cell_x - 1, cell_x, cell_x + 1):
+            segment = _segment(server, info[0], cx, cy, True)
+            if segment is not None:
+                found.append((segment, gx - cx * LEVEL_SIZE, gy - cy * LEVEL_SIZE))
+    return found
 
 
 def map_size_tiles(server, level) -> Optional[Tuple[int, int]]:

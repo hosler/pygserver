@@ -2028,6 +2028,14 @@ class NPCManager:
 
     async def on_trigger_action(self, player: 'Player', x: float, y: float,
                                 action: str):
+        # PLI_TRIGGERACTION: the wire x/y are local to the sender's segment and
+        # unwrapped (64+ is the next segment); the reference adds the segment
+        # origin (PlayerClientPackets.cpp:1059) and delivers to the gmap's
+        # NPCs at that point (:1315). Its containment test then wraps the
+        # NPC box to local pixels (toLocalPixelRectangleArea,
+        # include/utilities/Extents.h:612-620) while the point stays global,
+        # so outside the origin cell it never hits; pygserver follows the
+        # whole-map intent instead.
         await self.fire_trigger_at(player.level, x, y, action, player, None)
 
     async def fire_trigger_at(self, level, x: float, y: float, action_csv: str,
@@ -2053,19 +2061,26 @@ class NPCManager:
         # does not matter. A shapeless non-character NPC keeps pygserver's
         # 2x2-tile box (the reference has no such default).
         # The point stays unrounded so a sub-pixel miss still misses.
-        point = (x * 16, y * 16)
-        for npc in self.get_npcs_on_level(level):
-            if npc is source_npc:
-                continue
-            rect = collision.npc_event_rect(npc)
-            if rect is None:
-                continue
-            if not getattr(npc, 'shape', None) and not collision.npc_is_character(npc):
-                rect = (rect[0], rect[1], 32, 32)
-            if collision.rect_contains_point(rect, *point):
-                self._fire_gs1(npc, 'action' + event, player,
-                               source='npc' if source_npc is not None else 'player',
-                               params=fields[1:])
+        # (x, y) is relative to `level` and may leave 0..63 (a client sends
+        # its local position unwrapped). On a gmap the reference tests the
+        # point against the NPCs of the whole map (one Level), so here every
+        # segment around the point is tested with the point re-expressed in
+        # that segment's frame (gs1/frame.py segments_around).
+        from .gs1 import frame
+        for segment, sx, sy in frame.segments_around(self.server, level, x, y):
+            point = (sx * 16, sy * 16)
+            for npc in self.get_npcs_on_level(segment):
+                if npc is source_npc:
+                    continue
+                rect = collision.npc_event_rect(npc)
+                if rect is None:
+                    continue
+                if not getattr(npc, 'shape', None) and not collision.npc_is_character(npc):
+                    rect = (rect[0], rect[1], 32, 32)
+                if collision.rect_contains_point(rect, *point):
+                    self._fire_gs1(npc, 'action' + event, player,
+                                   source='npc' if source_npc is not None else 'player',
+                                   params=fields[1:])
 
     async def check_touches(self, player: 'Player'):
         """Fire playertouchsme when the player newly overlaps an NPC.

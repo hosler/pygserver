@@ -5,6 +5,7 @@ from typing import Any, List, Mapping, Sequence
 
 from ...server_flags import serialize_flag
 from ..packet_codec import PacketBuilder
+from .core import _write_player_prop
 from ..constants import (
     PLO
 )
@@ -310,6 +311,23 @@ def build_rc_max_upload_filesize(size: int) -> bytes:
     """Build PLO_RC_MAXUPLOADFILESIZE packet."""
     builder = PacketBuilder().write_gchar(PLO.RC_MAXUPLOADFILESIZE)
     builder.write_gint5(size)
+    builder.write_newline()
+    return builder.build()
+
+
+def build_add_player(player_id: int, account: str,
+                     props: Sequence[tuple]) -> bytes:
+    """Build PLO_ADDPLAYER: {GSHORT id}{GCHAR len}{account} then each
+    (prop id, value) in the order given, as PLAYER_PROPS encodes it.
+
+    The order is the caller's: the reference player entry is LEVEL,
+    PLAYERLISTSTATUS, NICKNAME, COMMUNITYNAME (src/player/Player.cpp:789),
+    not ascending ids."""
+    builder = PacketBuilder().write_gchar(PLO.ADDPLAYER)
+    builder.write_gshort(player_id)
+    builder.write_gstring(account)
+    for prop_id, value in props:
+        _write_player_prop(builder, prop_id, value)
     builder.write_newline()
     return builder.build()
 

@@ -41,6 +41,7 @@ from .protocol.packets import (
     build_rc_file_browser_dir,
     build_rc_file_browser_message,
     build_player_props,
+    build_add_player as build_add_player_packet,
 )
 from reborn_protocol.props import PLAYER_PROPS, parse_prop_stream
 
@@ -359,22 +360,38 @@ class RCManager:
         return list(self._sessions.values())
 
     @staticmethod
-    def build_add_player(player: 'Player', flags: int = 0) -> bytes:
-        """Build the player-list entry shape consumed by control clients."""
-        return RCManager.build_add_player_fields(
-            player.id, player.account_name, player.nickname, flags)
+    def build_add_player(player: 'Player', level_name: Optional[str] = None) -> bytes:
+        """A game player's control-client roster entry: LEVEL,
+        PLAYERLISTSTATUS, NICKNAME, COMMUNITYNAME, one layout for every RC
+        version (src/player/Player.cpp:789, PlayerClient.cpp:1342-1346).
+
+        LEVEL is getLevelName(): the gmap on a gmap, else the level, and the
+        account's level while the player has none yet
+        (PlayerClient.cpp:1155-1162). `level_name` gives that pre-entry level
+        (the login join); without it the player's current level is used, "" if it has none.
+        The community name defaults to the account name
+        (src/loader/flatfile/FlatFileAccountLoader.cpp:538-540); pygserver
+        stores no other."""
+        wire_level_name = getattr(player, 'wire_level_name', None)
+        level = wire_level_name() if callable(wire_level_name) else ''
+        if not level and level_name:
+            level = level_name
+        return build_add_player_packet(player.id, player.account_name, (
+            (PLPROP.CURLEVEL, level),
+            (PLPROP.PSTATUSMSG, int(getattr(player, 'status_msg', 0) or 0)),
+            (PLPROP.NICKNAME, player.nickname),
+            (PLPROP.COMMUNITYNAME, player.account_name),
+        ))
 
     @staticmethod
     def build_add_player_fields(player_id: int, account: str, nickname: str,
                                 flags: int = 0) -> bytes:
-        """Build a control-client player-list entry from explicit fields."""
-        builder = PacketBuilder().write_gchar(PLO.ADDPLAYER)
-        builder.write_gshort(player_id)
-        builder.write_gstring(account)
-        builder.write_gchar(PLPROP.NICKNAME).write_gstring(nickname)
-        builder.write_gchar(PLPROP.UNKNOWN81).write_gchar(flags)
-        builder.write_newline()
-        return builder.build()
+        """An external roster entry (IRC channels and their members):
+        NICKNAME and PLAYERLISTCATEGORY (PlayerRequestText.cpp:189)."""
+        return build_add_player_packet(player_id, account, (
+            (PLPROP.NICKNAME, nickname),
+            (PLPROP.UNKNOWN81, flags),
+        ))
 
     @staticmethod
     def build_del_player(player_id: int) -> bytes:
@@ -384,11 +401,30 @@ class RCManager:
         builder.write_newline()
         return builder.build()
 
-    async def notify_player_join(self, player: 'Player'):
-        """Add a newly logged-in game player to every control roster."""
+    async def notify_player_join(self, player: 'Player',
+                                 level_name: Optional[str] = None):
+        """Add a newly logged-in game player to every RC roster
+        (exchangeMyPropsWithOthers skips NC, src/player/Player.cpp:801-802).
+        The login runs it before the first level entry (PlayerClient.cpp:618
+        then :634), so `level_name` is the level the player is about to
+        enter; the entry itself follows from the level entry."""
+        packet = self.build_add_player(player, level_name)
+        for session in self.get_all_sessions():
+            await session.player.send_raw(packet)
+
+    async def notify_level_entry(self, player: 'Player'):
+        """The roster entry again, at the end of every level entry, to every
+        RC and NC (PLTYPE_ANYCONTROL, PlayerClient.cpp:1341-1347): how a
+        control client learns the new level. A gmap hop and a same-level warp
+        are not entries and send nothing."""
         packet = self.build_add_player(player)
         for session in self.get_all_sessions():
             await session.player.send_raw(packet)
+        nc_manager = getattr(self.server, 'nc_manager', None)
+        if nc_manager is not None:
+            for session in nc_manager.get_all_sessions():
+                if session.player.id != player.id:
+                    await session.player.send_raw(packet)
 
     async def notify_player_leave(self, player_id: int):
         """Remove a departing game player from every control roster."""

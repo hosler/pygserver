@@ -322,6 +322,12 @@ class LoginService:
             await self._grant_protected_weapons(player, gs2)
 
         config = player.server.config
+        # Stage 4 before stage 5 (PlayerClient.cpp:618, :634): the RCs get
+        # the join entry first, with the level to be entered, and the level
+        # entry then sends the second one.
+        rc_manager = getattr(player.server, 'rc_manager', None)
+        if rc_manager:
+            await rc_manager.notify_player_join(player, config.start_level)
         await player.warp(config.start_level, config.start_x, config.start_y)
         # PlayerClient.cpp:659: the first level is out; later entries skip
         # the first-load blank board and Z prop (PlayerClient.cpp:1465,1314).
@@ -331,10 +337,6 @@ class LoginService:
         # on disconnect, only once the login and first level have gone out.
         # RC and NC never reach this line and never save their own state.
         player.account_loaded = True
-
-        rc_manager = getattr(player.server, 'rc_manager', None)
-        if rc_manager:
-            await rc_manager.notify_player_join(player)
         return True
 
     def _account_online(self, account_name: str) -> bool:

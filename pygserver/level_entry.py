@@ -308,6 +308,10 @@ class LevelTransitions:
         broadcast_to_all = getattr(self.server, 'broadcast_to_all', None)
         if broadcast_to_all is not None:
             await broadcast_to_all(minimap, exclude={self.id})
+        # :1341-1347: then the control clients get the roster entry again.
+        rc_manager = getattr(self.server, 'rc_manager', None)
+        if rc_manager is not None:
+            await rc_manager.notify_level_entry(self)
 
         npc_manager = getattr(self.server, 'npc_manager', None)
         if npc_manager is not None:
