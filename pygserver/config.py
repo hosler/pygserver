@@ -199,6 +199,9 @@ class ServerConfig:
     shield_limit: int = 3
     heal_swords: bool = False
     heart_limit: int = 3  # GServer-v2/server/include/Server.h:166.
+    # Tiles around a player within which an NPC hears the player events
+    # (GServer-v2/server/include/Server.h:129; used by queueNPCEvent, :449-458).
+    event_distance: int = 64
     # Client PLI_PUTNPC is opt-in, matching the reference server's
     # get<bool>(...).value_or(false).
     putnpc_enabled: bool = False
@@ -499,6 +502,8 @@ class ServerConfig:
                             config.heal_swords = scalar.lower() == 'true'
                         elif key == 'heartlimit':
                             config.heart_limit = int(scalar)
+                        elif key == 'eventdistance':
+                            config.event_distance = max(0, int(scalar))
                         elif key == 'dontupdateratingd':
                             config.dontupdateratingd = scalar.lower() == 'true'
                         elif key == 'apsystem':

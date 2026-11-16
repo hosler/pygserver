@@ -245,7 +245,12 @@ class MovementHandlers:
         if PLPROP.CURPOWER in props:
             new_hearts = props[PLPROP.CURPOWER] / 2.0
             was_alive = self.hearts > 0
+            old_hearts = self.hearts
             self.hearts = new_hearts
+            # A decrease queues `playerhurt` (PlayerProps.cpp:242); an
+            # unchanged value is ignored (:228) and a rise queues nothing.
+            if new_hearts < old_hearts and hasattr(self.server, 'combat_manager'):
+                await self.server.combat_manager.fire_player_hurt(self)
             if new_hearts <= 0 and was_alive and hasattr(self.server, 'combat_manager'):
                 await self.server.combat_manager.handle_player_death(self)
 

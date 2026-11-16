@@ -168,6 +168,11 @@ def _b_shotby(self, name, indices, ctx, npc, player):
     return getattr(ctx, "hit_source", None) == _SHOTBY_SOURCE[name]
 
 
+def _b_playerhurted(self, name, indices, ctx, npc, player):
+    # Alternate spelling of the playerhurt event flag (GS1Flags.cpp:40).
+    return ctx.active_event == "playerhurt"
+
+
 def _b_peltwith(self, name, indices, ctx, npc, player):
     if ctx.active_event != "waspelt":
         return False
@@ -276,6 +281,7 @@ _BUILTINS = {
     "playerlevelorgy": _b_player_levelorg,
     **{n: _b_carries_object for n in _CARRY_SPRITE},
     **{n: _b_nw_clock for n in _NW_CLOCK_FIELDS},
+    "playerhurted": _b_playerhurted,
     **{n: _b_shotby for n in _SHOTBY_SOURCE},
     **{n: _b_peltwith for n in _PELTWITH_TYPE},
 }

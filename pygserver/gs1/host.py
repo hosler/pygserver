@@ -670,12 +670,22 @@ class GS1Host(Host):
             base = absolute_position(player)[attr == 'y'] - getattr(player, attr)
             value = to_num(value) - base
         cur = getattr(player, attr, None)
+        hearts_before = to_num(cur) if attr == "hearts" else None
         if isinstance(cur, str) or attr in ("chat", "nickname", "account_name",
                                             "head_image", "body_image",
                                             "sword_image", "shield_image", "gani"):
             setattr(player, attr, to_str(value))
         else:
             setattr(player, attr, to_num(value))
+        # The reference's HALFHEARTS case does not look at who set the prop, so
+        # a script write that lowers the hearts queues `playerhurt` too
+        # (PlayerProps.cpp:228-242). One path for every GS1 hearts write.
+        if (hearts_before is not None
+                and math.floor(to_num(player.hearts) * 2) < math.floor(hearts_before * 2)):
+            combat = getattr(self.server, "combat_manager", None)
+            if combat is not None and hasattr(combat, "fire_player_hurt"):
+                from .execution import _schedule
+                _schedule(combat.fire_player_hurt(player))
         # queue the change for propagation (flushed after the event in
         # run_npc_event to the player and to the other clients); chat/account
         # are not client props
@@ -853,6 +863,12 @@ class GS1Host(Host):
         return tiletypes.get_tile_type(tile_id) in (tiletypes.WATER, tiletypes.LAVA)
 
     def _test_at(self, args, ctx, players):
+        # Divergence kept on purpose: the reference returns the position in
+        # the in-range candidate list, not in players[] / npcs[]
+        # (GS1Functions.cpp:1605, 1641). On a gmap that list is filtered by
+        # distance, so players[testplayer(x,y)] can select the wrong player.
+        # The index here is the players[] / npcs[] index, which on a plain
+        # level is also the reference's.
         miss = -2.0 if players else -1.0
         if len(args) < 2:
             return miss

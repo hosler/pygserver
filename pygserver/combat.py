@@ -1252,6 +1252,11 @@ class CombatManager:
         # not applied" report actually was; a playtester surfaced it again.)
         await player.send_props({PLPROP.CURPOWER: int(player.hearts * 2)})
 
+        # The reference queues `playerhurt` when the victim's HALFHEARTS drops
+        # (PlayerProps.cpp:242); the hearts are already stored by then.
+        if player.hearts < old_hearts:
+            await self.fire_player_hurt(player)
+
         # Check for death
         if player.hearts <= 0:
             await self.handle_player_death(player, attacker_id, damage_type)
@@ -1294,23 +1299,34 @@ class CombatManager:
                 await killer.send_props({PLPROP.ALIGNMENT: killer.ap})
         logger.info(f"  Killed by {killer.nickname}")
 
+    async def fire_player_hurt(self, player: 'Player'):
+        """Hand a hearts decrease to the GS1 `playerhurt` event."""
+        npc_mgr = getattr(self.server, 'npc_manager', None)
+        if npc_mgr is not None and player.level is not None and player.id:
+            await npc_mgr.on_player_hurt(player)
+
     async def handle_status_death(self, player: 'Player'):
         """The STATUS prop went from not-DEAD to DEAD (PlayerProps.cpp:573-580).
 
-        Counts the death and drops items, unless the player has no id or no
-        level, or stands in a sparring zone. The remaining reference steps
-        (leader handoff, lastDeadTime, PLAYERDIES) are handled by
-        handle_player_death.
+        Counts the death and drops items, unless the player stands in a
+        sparring zone, then queues the GS1 `playerdies` event (:597), which the
+        reference queues in the sparring zone too. A player with no id or no
+        level gets none of it. The leader handoff and lastDeadTime steps are
+        not modelled here.
         """
         level = player.level
-        if not player.id or level is None or level.is_sparring_zone:
+        if not player.id or level is None:
             return
-        # Only counted: the reference queues no DEATHS prop here
-        # (PlayerProps.cpp:578; the case at :573-598 adds none to the result).
-        player.deaths += 1
-        item_manager = getattr(self.server, 'item_manager', None)
-        if item_manager is not None:
-            await item_manager.drop_items_on_death(player)
+        if not level.is_sparring_zone:
+            # Only counted: the reference queues no DEATHS prop here
+            # (PlayerProps.cpp:578; the case at :573-598 adds none to the result).
+            player.deaths += 1
+            item_manager = getattr(self.server, 'item_manager', None)
+            if item_manager is not None:
+                await item_manager.drop_items_on_death(player)
+        npc_mgr = getattr(self.server, 'npc_manager', None)
+        if npc_mgr is not None:
+            await npc_mgr.on_player_status_dead(player)
 
     async def handle_player_death(self, player: 'Player',
                                    killer_id: Optional[int] = None,

@@ -158,6 +158,28 @@ def test_players_index_matches_testplayer_and_hitplayer_order():
     assert v["i"] == 1.0 and v["pid"] == 2.0 and v["miss"] == -2.0
 
 
+def test_testplayer_and_testnpc_index_the_hit_one_among_three():
+    """On a plain level the reference's candidate list is every player / NPC of
+    the level in array order (Level.cpp:3281-3284, 3396-3402), so the index
+    testplayer/testnpc return selects the same one in players[] / npcs[]."""
+    server, level = make_world(("alice", 10, 12), ("bob", 30, 40), ("cy", 50, 20))
+    target = npc_with("", level, name="t1", npc_id=5)
+    for npc_id, (x, y) in ((6, (20.0, 20.0)), (7, (40.0, 5.0))):
+        other = npc_with("", level, name=f"t{npc_id}", npc_id=npc_id)
+        other.x, other.y = x, y
+        other.image = "#c#"
+    target.x, target.y, target.image = 3.0, 4.0, "#c#"
+    host = npc_with(
+        "if (created) { this.i = testplayer(51, 22); this.pid = players[this.i].id;"
+        " this.j = testnpc(41, 6); this.nid = npcs[this.j].id; }",
+        level, name="host", npc_id=1)
+    host.x, host.y = 0.0, 0.0
+    run(host, server=server, player=server.players[1])
+    v = this_vars(host)
+    assert v["i"] == 2.0 and v["pid"] == 3.0
+    assert v["j"] == 2.0 and v["nid"] == 7.0
+
+
 def test_players_minus_one_is_the_initiator_and_other_negatives_are_nothing():
     server, level = make_world(("alice", 10, 12), ("bob", 30, 40))
     npc = npc_with(

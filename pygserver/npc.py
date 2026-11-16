@@ -2020,6 +2020,57 @@ class NPCManager:
                 pass
             self._fire_gs1(npc, 'playerchats', player)
 
+    def _npcs_in_event_range(self, player: 'Player') -> List[NPC]:
+        """The NPCs that hear a player event: Server::queueNPCEvent
+        (GServer-v2/server/include/Server.h:449-458). On a plain level that is
+        every NPC of the level; on a gmap it is the NPCs of the whole gmap
+        within `eventdistance` tiles of the player's whole-map position
+        (Level::findNPCsInRangeByDistance, src/level/Level.cpp:3396-3423).
+        The gmap is one Level that owns every segment's NPCs
+        (LevelLoader::loadGmap -> loadStaticDataNPCs(level, ...),
+        src/loader/LevelLoader.cpp:217; the NPC's level is the gmap name, :384) and is the player's level
+        (PlayerClient.cpp:1295), so the distance filter alone limits it."""
+        from .attachments import absolute_position
+        from .gs1 import frame
+        level = player.level
+        if level is None:
+            return []
+        info = frame.gmap_cell(self.server, level)
+        if info is None:
+            return list(self.get_npcs_on_level(level))
+        gmap = info[0]
+        px, py = absolute_position(player)
+        px, py = frame.to_map(self.server, level, px, py)
+        reach = float(self.server.config.event_distance)
+        heard: List[NPC] = []
+        for cell_y in range(int(gmap.height)):
+            for cell_x in range(int(gmap.width)):
+                segment = self.server.world.get_loaded_level(
+                    gmap.get_level_at(cell_x, cell_y) or "")
+                if segment is None:
+                    continue
+                for npc in self.get_npcs_on_level(segment):
+                    nx, ny = frame.to_map(self.server, segment, npc.x, npc.y)
+                    if math.hypot(nx - px, ny - py) <= reach:
+                        heard.append(npc)
+        return heard
+
+    async def on_player_hurt(self, player: 'Player'):
+        """GS1 `playerhurt`: the player's hearts went down, as the reference's
+        HALFHEARTS prop handler queues it (PlayerProps.cpp:242). Only GS1
+        scripts hear it; Python NPC callbacks are unchanged. The running
+        player is the hurt one."""
+        for npc in self._npcs_in_event_range(player):
+            self._fire_gs1(npc, 'playerhurt', player)
+
+    async def on_player_status_dead(self, player: 'Player'):
+        """GS1 `playerdies`: the STATUS prop went from alive to DEAD, as the
+        reference queues it (PlayerProps.cpp:597). Only GS1 scripts hear it.
+        Not named on_player_dies: combat.handle_player_death looks for that
+        hook at hearts 0, which is not the reference's trigger."""
+        for npc in self._npcs_in_event_range(player):
+            self._fire_gs1(npc, 'playerdies', player)
+
     async def on_player_touches(self, player: 'Player', npc: NPC):
         """Trigger on_player_touches for an NPC."""
         api = npc.get_api(self)

@@ -302,6 +302,23 @@ def test_testplayer_and_nearest_player_use_whole_map_tiles(tmp_path):
     assert scope["c"] == float(player.id)
 
 
+def test_testplayer_index_selects_the_hit_player_in_players_on_a_gmap(tmp_path):
+    """The reference indexes the in-range candidate list on a gmap, which is
+    not players[] (GS1Functions.cpp:1605); pygserver keeps the players[] index
+    (the segment's), so players[testplayer(...)] is the hit player and a
+    player in another segment does not shift it."""
+    server = gmap_world(tmp_path)
+    player_on(server, 0, 0, 30.0, 30.0, player_id=2)
+    player_on(server, 1, 1, 30.0, 30.0, player_id=3)
+    player_on(server, 1, 1, 10.0, 10.0, player_id=4)
+    hit = player_on(server, 1, 1, 50.0, 50.0, player_id=5)
+    npc = new_npc(server, cell(1, 1), 5.0, 5.0)
+    scope = script(server, npc,
+                   "this.i = testplayer(115,116); this.pid = players[this.i].id;",
+                   hit)
+    assert scope["i"] == 2.0 and scope["pid"] == 5.0
+
+
 def test_putbomb_lands_in_the_named_segment(tmp_path):
     server = gmap_world(tmp_path)
     watcher = player_on(server, 2, 1)

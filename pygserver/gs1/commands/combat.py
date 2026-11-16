@@ -254,6 +254,7 @@ def _c_hurt(self, a, npc, player, ctx):
         return
     halfhearts = math.floor(to_num(a[0]))
     new_hearts = max(0.0, to_num(getattr(player, "hearts", 0)) - halfhearts / 2.0)
+    # _set_player_attr queues `playerhurt` on the drop.
     self._set_player_attr(player, "hearts", new_hearts)
     if new_hearts <= 0:
         cm = getattr(self.server, "combat_manager", None) if self.server is not None else None
