@@ -164,16 +164,54 @@ class FileSystem:
         """
         logger.debug(f"Player {player.id} wants file: {filename}")
 
+        if await self.refuse_level_file(player, filename):
+            return
+
         # Find file
         file_path = self._find_file(filename)
         if not file_path:
             logger.warning(f"File not found: {filename}")
-            packet = build_file_send_failed(filename)
+            packet = build_file_send_failed(self.failure_file_name(filename))
             await player.send_raw(packet)
             return
 
         self.remember_sent_file(player, filename)
         await self.send_resolved_file(player, filename, file_path)
+
+    # Extensions Player::sendFile refuses (Player.cpp:561-563, origin/beta4):
+    # a level file never travels over the file path, only as board packets.
+    LEVEL_FILE_EXTENSIONS = ('.nw', '.graal', '.zelda')
+
+    @classmethod
+    def is_level_file_name(cls, filename: str) -> bool:
+        """std::filesystem::path::extension() of the name, compared exactly
+        (case-sensitive, last dot of the final component, a leading-dot-only
+        name has none) against the level extensions."""
+        last = str(filename).rsplit('/', 1)[-1]
+        dot = last.rfind('.')
+        if dot <= 0 or last in ('.', '..'):
+            return False
+        return last[dot:] in cls.LEVEL_FILE_EXTENSIONS
+
+    @staticmethod
+    def failure_file_name(filename: str) -> str:
+        """Name Player::sendFile puts in PLO_FILESENDFAILED: the final path
+        component, `fs::getANSIFileName(file)` = `file.filename()`
+        (File.cpp:51-58, Player.cpp:557). On the reference's POSIX build only
+        '/' separates components; a trailing '/' leaves an empty name."""
+        return str(filename).rsplit('/', 1)[-1]
+
+    async def refuse_level_file(self, player: 'Player', filename: str) -> bool:
+        """First check of Player::sendFile (Player.cpp:561-563): a level file
+        answers PLO_FILESENDFAILED with the final path component, before anything is
+        recorded or looked up. Every sendFile caller (PLI_WANTFILE, the
+        stale-copy branch of PLI_UPDATEFILE / PLI_VERIFYWANTSEND, update
+        packages, RC file download) is covered by calling this first.
+        True when the request was refused."""
+        if not self.is_level_file_name(filename):
+            return False
+        await player.send_raw(build_file_send_failed(self.failure_file_name(filename)))
+        return True
 
     async def send_resolved_file(self, player: 'Player', filename: str,
                                  file_path: Path):
@@ -181,14 +219,16 @@ class FileSystem:
         PLO_LARGEFILESTART/END above `large_file_threshold`
         (Player.cpp:608-651); PLO_FILESENDFAILED when it is gone or above
         `max_file_size`."""
+        if await self.refuse_level_file(player, filename):
+            return
         try:
             file_size = file_path.stat().st_size
         except OSError:
-            await player.send_raw(build_file_send_failed(filename))
+            await player.send_raw(build_file_send_failed(self.failure_file_name(filename)))
             return
         if file_size > self.max_file_size:
             logger.warning(f"File too large: {filename} ({file_size} bytes)")
-            packet = build_file_send_failed(filename)
+            packet = build_file_send_failed(self.failure_file_name(filename))
             await player.send_raw(packet)
             return
 
@@ -298,7 +338,7 @@ class FileSystem:
         # Find file
         file_path = self._find_file(filename)
         if not file_path:
-            packet = build_file_send_failed(filename)
+            packet = build_file_send_failed(self.failure_file_name(filename))
             await player.send_raw(packet)
             return
 
@@ -340,7 +380,7 @@ class FileSystem:
 
         except Exception as e:
             logger.error(f"Error sending file {filename}: {e}")
-            packet = build_file_send_failed(filename)
+            packet = build_file_send_failed(self.failure_file_name(filename))
             await player.send_raw(packet)
 
     @staticmethod
@@ -416,7 +456,7 @@ class FileSystem:
             logger.error(f"Error sending large file {filename}: {e}")
             if player.id in self._downloads:
                 del self._downloads[player.id]
-            packet = build_file_send_failed(filename)
+            packet = build_file_send_failed(self.failure_file_name(filename))
             await player.send_raw(packet)
 
     # =========================================================================
@@ -1169,9 +1209,11 @@ class FileSystem:
             player: Player to send to
             filename: File to send
         """
+        if await self.refuse_level_file(player, filename):
+            return
         file_path = self._find_file(filename)
         if not file_path:
-            packet = build_file_send_failed(filename)
+            packet = build_file_send_failed(self.failure_file_name(filename))
             await player.send_raw(packet)
             return
 

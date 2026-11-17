@@ -119,9 +119,10 @@ class MiscHandlers:
         target = self.server.get_player_by_name(account_name)
         if target is None or not target.logged_in:
             return
-        # ServerList.cpp:581-583 sends nothing when the TARGET is a 6.015+
-        # client. Deliberately not applied yet: it would switch profiles off
-        # for our own v6 client, so the maintainer decides.
+        # ServerList.cpp:581-583: no profile when the TARGET is 6.015 or later; an unlisted token is CLVER_UNKNOWN (IUtil.cpp:280), below 6.015, so it is answered.
+        target_version = getattr(target, 'client_version', None)
+        if isinstance(target_version, (int, float)) and target_version >= 6.015:
+            return
         profile = manager.get_profile(target.account_name)
         if not profile:
             return

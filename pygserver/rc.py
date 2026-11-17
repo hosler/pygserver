@@ -1987,6 +1987,9 @@ class RCManager:
             return
         resolved = self._resolve_browser_path(path)
         filesystem = self.server.filesystem
+        # PlayerRCPackets.cpp:1280 goes through sendFile, which refuses level files.
+        if await filesystem.refuse_level_file(session.player, filename):
+            return
         # Send this exact resolved file; the general lookup searches other folders.
         if resolved.is_file():
             if resolved.stat().st_size > filesystem.large_file_threshold:
@@ -1995,7 +1998,8 @@ class RCManager:
                 await filesystem._send_file(session.player, filename, resolved)
         else:
             from .protocol.packets import build_file_send_failed
-            await session.player.send_raw(build_file_send_failed(filename))
+            await session.player.send_raw(build_file_send_failed(
+                filesystem.failure_file_name(filename)))
 
     async def _handle_file_browser_up(self, session: RCSession, data: bytes):
         """Handle RC_FILEBROWSER_UP - Upload file."""

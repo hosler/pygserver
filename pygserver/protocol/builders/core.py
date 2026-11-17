@@ -201,7 +201,7 @@ def build_warp(x: float, y: float, level_name: str = "") -> bytes:
 
 
 def build_warp2(x: float, y: float, level_name: str, gmap_x: int = 0,
-                gmap_y: int = 0, z: int = 0) -> bytes:
+                gmap_y: int = 0, z: Optional[float] = None) -> bytes:
     """Build PLO_PLAYERWARP2 packet for GMAP warps.
 
     Format (GServer-v2 PlayerClient + client parse_playerwarp2):
@@ -212,10 +212,16 @@ def build_warp2(x: float, y: float, level_name: str, gmap_x: int = 0,
     builder = PacketBuilder().write_gchar(PLO.PLAYERWARP2)
     # PlayerClient.cpp:1262: X, Y and Z are the props' serialize() output.
     # X/Y are the shared tile coordinate; Z is PropertyTileCoordinateZ
-    # (PropertySerializers.cpp:530-535): tiles + 50 as a GCHAR.
+    # (PropertySerializers.cpp:524-535): tiles + 50 as a GCHAR. A Z that was
+    # never set (None) or lies outside -50..170 tiles is "unset" and writes
+    # Character::InvalidZTiles (-51, Character.h:76) + 50 = -1, which
+    # writeGCharUnsafe puts on the wire as byte 31 (no clamp, unlike write_gchar).
     builder.write_tile_coordinate(x)
     builder.write_tile_coordinate(y)
-    builder.write_gchar(max(-50, min(170, int(z))) + 50)
+    z_pixels = None if z is None else int(z * 16)
+    if z_pixels is None or not -50 * 16 <= z_pixels <= 170 * 16:
+        z_pixels = -51 * 16
+    builder.write_byte(int(z_pixels / 16) + 50 + 32)
     builder.write_gchar(gmap_x)
     builder.write_gchar(gmap_y)
     builder.write_string(level_name)

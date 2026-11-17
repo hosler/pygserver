@@ -400,6 +400,7 @@ class UpdatePackageManager:
         await player.send_raw(build_update_package_size(name, total))
         filesystem = self.filesystem
         for state in needed:
-            filesystem.remember_sent_file(player, state.name)
+            if not filesystem.is_level_file_name(state.name):
+                filesystem.remember_sent_file(player, state.name)
             await filesystem.send_resolved_file(player, state.name, state.path)
         await player.send_raw(build_update_package_done(name))

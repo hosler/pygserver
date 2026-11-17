@@ -164,7 +164,8 @@ class LevelTransitions:
         info = self._gmap_info(level)
         if info:
             _, gx, gy = info
-            warp_packet = build_warp2(x, y, gmap_file_name(info[0]), gx, gy)
+            warp_packet = build_warp2(x, y, gmap_file_name(info[0]), gx, gy,
+                                     getattr(self, 'z', None))
         else:
             warp_packet = build_warp(x, y, level.name)
         await self._change_level(level, x, y, cached_time, warp_packet)

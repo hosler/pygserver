@@ -407,6 +407,25 @@ def test_c_a_client_warp_into_a_gmap_sends_the_segment_twice(tmp_path, clock):
     assert warp2 == bytes([20 + 32, 24 + 32, 50 + 32, 1 + 32, 0 + 32]) + b"m.gmap"
 
 
+def test_c_gmap_warp_carries_the_players_real_z(tmp_path, clock):
+    """PlayerClient.cpp:1262 serializes the player's own Z prop."""
+    server = gmap_world(tmp_path)
+    player = loaded_player(server)
+    run(player.warp("a.nw", 30, 30))
+    player.z = 2.0
+    player.send_raw.reset_mock()
+    run(player._dispatch_packet(PLI.LEVELWARP, warp_plain(10, 12, "c1.nw")))
+    warp2 = sent(player)[len(S_FULL)][1]
+    assert warp2[2] == 52 + 32
+    # A Z outside -50..170 tiles is "unset": -51 + 50 = -1, byte 31.
+    other = loaded_player(server, 2)
+    run(other.warp("a.nw", 30, 30))
+    other.z = 500.0
+    other.send_raw.reset_mock()
+    run(other._dispatch_packet(PLI.LEVELWARP, warp_plain(10, 12, "c1.nw")))
+    assert sent(other)[len(S_FULL)][1][2] == 31
+
+
 def test_c_a_reloaded_level_is_a_first_visit_again(tmp_path, clock):
     """Level::reload: the occupants leave, every record of the level is reset
     and they are warped back in, so the board goes out again even to a

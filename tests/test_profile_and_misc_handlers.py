@@ -180,6 +180,9 @@ class TestProfileHandlers:
         # The reference answers only for an online target
         # (ServerList.cpp:577-579); the player asks for their own profile.
         player.logged_in = True
+        # ServerList.cpp:581-583 sends nothing for a 6.015+ target, so the
+        # target is a 2.22 client here.
+        player.client_version = 2.22
         from pygserver.config import ServerConfig
         mock_server.config = ServerConfig()
         mock_server.get_player_by_name.return_value = player
@@ -202,6 +205,82 @@ class TestProfileHandlers:
         reader.read_gchar()  # packet id
         assert reader.read_gstring() == "hosler"
         assert reader.read_gstring() == "Real Name"
+
+
+class TestProfileTargetGate:
+    """ServerList.cpp:581-583: no PLO_PROFILE when the TARGET is 6.015+;
+    the requester's version only picks the stat-line style (:598)."""
+
+    def _setup(self, tmp_path, target_version, requester_version):
+        from pygserver.account import AccountManager, ProfileManager
+        from pygserver.config import ServerConfig
+        server = MagicMock()
+        server.config = ServerConfig()
+        server.account_manager = AccountManager(server, accounts_dir=str(tmp_path))
+        server.profile_manager = ProfileManager(server)
+        server.account_manager.create_account("target", "pw")
+        server.account_manager.create_account("asker", "pw")
+        target = _make_player(server)
+        target.account_name = "target"
+        target.logged_in = True
+        if target_version is not None:
+            target.client_version = target_version
+        asker = _make_player(server)
+        asker.account_name = "asker"
+        asker.logged_in = True
+        asker.client_version = requester_version
+        server.get_player_by_name.side_effect = (
+            lambda name: target if name == "target" else None)
+        return server, target, asker
+
+    def _get(self, asker):
+        asyncio.run(asker._handle_profile_get(b"target"))
+
+    def test_v6_target_gets_no_profile_from_any_requester(self, tmp_path):
+        for requester in (2.22, 6.037):
+            _, _, asker = self._setup(tmp_path, 6.037, requester)
+            self._get(asker)
+            assert asker.send_raw.await_count == 0
+
+    def test_boundary_6_015_is_gated_and_below_is_answered(self, tmp_path):
+        _, _, asker = self._setup(tmp_path, 6.015, 6.037)
+        self._get(asker)
+        assert asker.send_raw.await_count == 0
+        _, _, asker = self._setup(tmp_path, 5.31, 6.037)
+        self._get(asker)
+        assert asker.send_raw.await_count == 1
+
+    def test_pre_6_015_target_with_v6_requester_gets_profilevars_tail(self, tmp_path):
+        from pygserver.protocol.constants import PLO
+        _, _, asker = self._setup(tmp_path, 2.22, 6.037)
+        self._get(asker)
+        sent = asker.send_raw.await_args.args[0]
+        assert sent[0] == PLO.PROFILE + 32
+        v6_len = len(sent)
+        _, _, old_asker = self._setup(tmp_path, 2.22, 2.0)
+        self._get(old_asker)
+        old_sent = old_asker.send_raw.await_args.args[0]
+        assert old_sent[0] == PLO.PROFILE + 32
+        assert old_sent != sent and len(old_sent) != v6_len
+
+    def test_unlisted_token_is_unknown_and_answered(self, tmp_path):
+        # getVersionID answers CLVER_UNKNOWN (IUtil.cpp:280), below 6.015.
+        _, _, asker = self._setup(tmp_path, None, 6.037)
+        self._get(asker)
+        assert asker.send_raw.await_count == 1
+
+    def test_offline_target_is_silent(self, tmp_path):
+        server, _, asker = self._setup(tmp_path, 2.22, 6.037)
+        server.get_player_by_name.side_effect = lambda name: None
+        self._get(asker)
+        assert asker.send_raw.await_count == 0
+
+    def test_profile_set_from_a_v6_client_is_still_stored(self, tmp_path):
+        from pygserver.protocol.packets import PacketBuilder
+        server, _, asker = self._setup(tmp_path, 6.037, 6.037)
+        payload = PacketBuilder().write_gstring("asker").write_gstring("Six")
+        asyncio.run(asker._handle_profile_set(payload.build()))
+        assert server.profile_manager.get_profile("asker")["name"] == "Six"
 
 
 class TestMiscNoOpHandlers:

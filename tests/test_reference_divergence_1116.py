@@ -354,7 +354,7 @@ def test_an_unknown_token_leaves_the_version_to_the_codec_fallback():
 def test_a_version_below_2_1_takes_the_old_profile_branch_via_the_token(tmp_path):
     server = _profile_server(tmp_path)
     from pygserver.handlers.versions import version_for_token
-    _online(server, 3, "target", 6.037)
+    _online(server, 3, "target", 2.22)
     requester = _online(server, 4, "asker", version_for_token("GNW24011"))
     assert len(_get(requester, "target")[11:]) == 8
 
@@ -375,11 +375,24 @@ def test_build_warp_writes_the_shared_tile_coordinate():
 
 def test_build_warp2_writes_tile_coordinates_and_z_plus_50():
     from pygserver.protocol.builders.core import build_warp2
-    assert build_warp2(10.0, 12.0, "m.gmap", 1, 0) == (
+    assert build_warp2(10.0, 12.0, "m.gmap", 1, 0, 0.0) == (
         bytes([PLO.PLAYERWARP2 + 32, 20 + 32, 24 + 32, 50 + 32, 1 + 32, 0 + 32])
         + b"m.gmap\n")
     assert build_warp2(-2.5, 111.5, "m.gmap", 2, 3, z=2)[1:6] == bytes(
         [-5 + 32, 255, 52 + 32, 2 + 32, 3 + 32])
+
+
+def test_build_warp2_unset_z_is_minus_one_on_the_wire():
+    # Character::InvalidZTiles is -51 (Character.h:76); serialize() writes
+    # (-816 / 16) + 50 = -1 with writeGCharUnsafe, i.e. byte 31
+    # (PropertySerializers.cpp:530-535). Out-of-range Z is reset to unset
+    # (fixCoordinate, :524-528).
+    from pygserver.protocol.builders.core import build_warp2
+    assert build_warp2(10.0, 12.0, "m.gmap", 1, 0)[3] == 31
+    assert build_warp2(10.0, 12.0, "m.gmap", 1, 0, None)[3] == 31
+    assert build_warp2(10.0, 12.0, "m.gmap", 1, 0, 171.0)[3] == 31
+    assert build_warp2(10.0, 12.0, "m.gmap", 1, 0, -50.0)[3] == 32
+    assert build_warp2(10.0, 12.0, "m.gmap", 1, 0, 170.0)[3] == 252
 
 
 # -- PLI_LEVELWARP reader (follow-up) -------------------------------------------------
