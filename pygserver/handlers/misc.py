@@ -3,7 +3,7 @@
 import logging
 
 from ..board_changes import respawn_context, send_near
-from ..protocol.constants import PLI
+from ..protocol.constants import PLI, PLTYPE
 from ..protocol.packets import PacketReader
 from .registry import handles
 from .versions import client_version
@@ -112,13 +112,25 @@ class MiscHandlers:
         reader = PacketReader(data)
         account_name = reader.remaining().decode('latin-1', errors='replace')
 
-        if hasattr(self.server, 'profile_manager'):
-            profile = self.server.profile_manager.get_profile(account_name)
-            if not profile:
-                return
-            from ..protocol.packets import build_profile
-            packet = build_profile(profile['account'], profile, profile.get('online_time', ''))
-            await self.send_raw(packet)
+        manager = getattr(self.server, 'profile_manager', None)
+        if manager is None:
+            return
+        # ServerList.cpp:577-579: an account that is not online gets no reply.
+        target = self.server.get_player_by_name(account_name)
+        if target is None or not target.logged_in:
+            return
+        # ServerList.cpp:581-583 sends nothing when the TARGET is a 6.015+
+        # client. Deliberately not applied yet: it would switch profiles off
+        # for our own v6 client, so the maintainer decides.
+        profile = manager.get_profile(target.account_name)
+        if not profile:
+            return
+        from ..protocol.packets import build_profile
+        stats = manager.stat_lines(
+            target, bool(self.connection_type & PLTYPE.ANYCLIENT),
+            client_version(self))
+        await self.send_raw(build_profile(
+            profile['account'], profile, profile.get('online_time', ''), stats))
 
     @handles(PLI.PROFILESET)
     async def _handle_profile_set(self, data: bytes):

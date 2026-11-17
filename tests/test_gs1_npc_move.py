@@ -527,15 +527,17 @@ def test_one_swing_fires_one_washit_even_with_the_client_report(tmp_path):
     server, player, npc = _swing(tmp_path, 148, 100)
     player.server = server
     run(server.npc_manager.on_player_gani(player))
+    # PLI_HITOBJECTS only touches character NPCs (PlayerClientPackets.cpp:1044).
+    npc.image = "#c#"
     from pygserver.combat import CombatManager
     manager = CombatManager.__new__(CombatManager)
     manager.server = server
     server.broadcast_to_level = AsyncMock()
-    run(manager.handle_hit_objects(player, 9.5, 6.5, 1.0))
+    run(manager.handle_hit_objects(player, 10.5, 8.0, 1.0))
     assert npc.gs1_scopes["this"]["hits"] == 1.0
     # A later swing, no gani rectangle hit: the client report fires on its own.
     server.npc_manager._sword_hits.clear()
-    run(manager.handle_hit_objects(player, 9.5, 6.5, 1.0))
+    run(manager.handle_hit_objects(player, 10.5, 8.0, 1.0))
     assert npc.gs1_scopes["this"]["hits"] == 2.0
 
 

@@ -403,7 +403,8 @@ def test_c_a_client_warp_into_a_gmap_sends_the_segment_twice(tmp_path, clock):
     names = [body for packet_id, body in packets if packet_id == PLO.LEVELNAME]
     assert names == [b"c1.nw", b"a.nw", b"c1.nw", b"m.gmap"]
     warp2 = packets[len(S_FULL)][1]
-    assert warp2 == bytes([20 + 32, 24 + 32, 32, 1 + 32, 0 + 32]) + b"m.gmap"
+    # Z is PropertyTileCoordinateZ: tiles + 50 (restated: was a bare 0).
+    assert warp2 == bytes([20 + 32, 24 + 32, 50 + 32, 1 + 32, 0 + 32]) + b"m.gmap"
 
 
 def test_c_a_reloaded_level_is_a_first_visit_again(tmp_path, clock):

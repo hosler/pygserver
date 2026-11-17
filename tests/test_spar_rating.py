@@ -181,8 +181,8 @@ async def test_login_decay_precedes_props_and_runs_once(
         # status list, ahead of the props. Those two carry text, so the loop
         # reads them to the packet terminator.
         packet_id = reader.read_gchar()
-        while packet_id in (PLO.SERVERLISTCONNECTED, PLO.RESETCLIENT,
-                            PLO.STAFFGUILDS, PLO.STATUSLIST):
+        while packet_id in (PLO.SIGNATURE, PLO.SERVERLISTCONNECTED,
+                            PLO.RESETCLIENT, PLO.STAFFGUILDS, PLO.STATUSLIST):
             while reader.read_byte() != ord('\n'):
                 pass
             packet_id = reader.read_gchar()

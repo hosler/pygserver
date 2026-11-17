@@ -177,8 +177,14 @@ class TestProfileHandlers:
         account_manager.create_account("hosler", "pw")
 
         player = _make_player(mock_server)
+        # The reference answers only for an online target
+        # (ServerList.cpp:577-579); the player asks for their own profile.
+        player.logged_in = True
+        from pygserver.config import ServerConfig
+        mock_server.config = ServerConfig()
+        mock_server.get_player_by_name.return_value = player
 
-        set_payload = PacketBuilder().write_gstring("hosler")
+        set_payload =PacketBuilder().write_gstring("hosler")
         for field in ("Real Name", "25", "male", "US", "icq", "a@b.c",
                       "web.site", "hangout", "a quote"):
             set_payload.write_gstring(field)

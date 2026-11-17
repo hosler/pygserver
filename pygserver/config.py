@@ -27,6 +27,12 @@ OPTIONS_FILE_ENCODING = 'latin-1'
 DEFAULT_PLAYERLISTICONS = ('Online', 'Away', 'DND', 'Eating', 'Hiding',
                            'No PMs', 'RPing', 'Sparring', 'PKing')
 
+# Server.h:176 profilevars default (origin/beta4).
+DEFAULT_PROFILEVARS = ('Kills:=playerkills', 'Deaths:=playerdeaths',
+                       'Maxpower:=playerfullhearts', 'Rating:=playerrating',
+                       'Alignment:=playerap', 'Gralat:=playerrupees',
+                       'Swordpower:=playerswordpower', 'Spin Attack:=canspin')
+
 # Characters str.splitlines() treats as a line end, beyond '\n' itself.
 LINE_BREAK_CHARS = frozenset('\r\x0b\x0c\x1c\x1d\x1e\x85\u2028\u2029')
 
@@ -312,6 +318,12 @@ class ServerConfig:
     # (prop 53) indexes this list (PlayerClient.cpp:529-536).
     playerlisticons: List[str] = field(default_factory=lambda: list(
         DEFAULT_PLAYERLISTICONS))
+    # PlayerClient.cpp:528 / PlayerRC.cpp:258: raw comma list of guild names
+    # for PLO_STAFFGUILDS; unset means empty (`value_or("")`).
+    staffguilds: str = ""
+    # Server.h:176: the stat lines a PLO_PROFILE carries for non-2.1 requesters.
+    profilevars: List[str] = field(default_factory=lambda: list(
+        DEFAULT_PROFILEVARS))
 
     # Server.h:125 / PlayerClientPackets.cpp:352: a client item drop is refused.
     disableitemdropping: bool = False
@@ -543,6 +555,13 @@ class ServerConfig:
                             config.playerlisticons = [
                                 w.strip() for w in value.split(',')
                                 if w.strip()]
+                        elif key == 'staffguilds':
+                            config.staffguilds = value
+                        elif key == 'profilevars':
+                            # Settings.h getList: split on commas, empty
+                            # tokens dropped; entries are trimmed when used.
+                            config.profilevars = [
+                                w for w in value.split(',') if w]
                         elif key == 'nofoldersconfig':
                             config.nofoldersconfig = scalar.lower() == 'true'
                         elif key in ('sharefolder', 'maps'):
@@ -673,6 +692,10 @@ class ServerConfig:
                   for name, rate in self.spawn_rates.items()]
         if self.playerlisticons != list(DEFAULT_PLAYERLISTICONS):
             lines.append(f"playerlisticons = {','.join(self.playerlisticons)}")
+        if self.staffguilds:
+            lines.append(f"staffguilds = {self.staffguilds}")
+        if self.profilevars != list(DEFAULT_PROFILEVARS):
+            lines.append(f"profilevars = {','.join(self.profilevars)}")
         if self.protectedweapons:
             lines.append(f"protectedweapons = {','.join(self.protectedweapons)}")
         return lines

@@ -235,14 +235,19 @@ def test_player_sword_swing_hitobjects_damages_npc_and_fires_washit():
         server, level = make_server_and_level()
         mgr = server.npc_manager
         target = mgr.create_npc(name="target", level=level, x=10, y=10)
+        target.image = "#c#"  # only character NPCs take part (:1044)
         mgr.attach_gs1(target, "if (washit) { this.hit = 1; }")
 
         attacker = FakePlayer(1)
         attacker.level = level
 
-        await server.combat_manager.handle_hit_objects(attacker, 10.0, 10.0, 1.0)
+        # Probe inside the character's collision box (x+8, y+16, 32x32 px);
+        # restated: it used to probe the NPC's top-left tile.
+        await server.combat_manager.handle_hit_objects(attacker, 11.5, 12.5, 1.0)
 
-        assert target.hearts == 2.0  # power=1.0 hearts
+        # power 1.0 hearts = wire byte 2 half hearts; the reference removes
+        # `byte * 2` half hearts (PlayerClientPackets.cpp:1046) = 2 hearts.
+        assert target.hearts == 1.0
         assert target.gs1_scopes["this"]["hit"] == 1.0
         assert server.broadcasts  # relay for nearby clients
 

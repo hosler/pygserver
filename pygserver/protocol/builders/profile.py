@@ -8,7 +8,7 @@ from ..constants import (
 )
 from ..constants import BDMODE, BDPROP, LevelItemType, NPCBLOCKFLAG, NPCPROP, NPCVISFLAG, PLI, PLPERM, PLPROP, PLSTATUS  # noqa: F401  - kept: original import block (star-import consumers rely on it)
 from reborn_protocol.props import COLORS_NEWWORLD, NPC_PROPS, PLAYER_PROPS, StreamPolicy, encode_value, parse_prop_stream, preset_power_image, with_gif_fallback  # noqa: F401  - kept: original import block (star-import consumers rely on it)
-from typing import Any, Dict, List, Optional, Tuple  # noqa: F401  - kept: original import block (star-import consumers rely on it)
+from typing import Any, Dict, List, Optional, Sequence, Tuple  # noqa: F401  - kept: original import block (star-import consumers rely on it)
 
 logger = logging.getLogger(__name__)
 
@@ -42,19 +42,23 @@ def parse_profile(data: bytes) -> dict:
     return profile
 
 
-def build_profile(account: str, profile: dict, online_time: str = '') -> bytes:
+def build_profile(account: str, profile: dict, online_time: str = '',
+                  stat_lines: Sequence[str] = ()) -> bytes:
     """Build PLO_PROFILE (75) packet - reply to PLI_PROFILEGET.
 
-    Format (ServerList.cpp msgSVI_PROFILE, modern client >= 2.1):
+    Format (origin/beta4 ServerList.cpp:568-761 msgSVI_PROFILE):
         {GSTRING account}{9 x GSTRING fields: name/age/gender/country/
         messenger/email/website/hangout/quote}{GSTRING online_time}
-    The pre-2.1 kills/deaths/rating/alignment/rupees fallback format isn't
-    implemented - this server targets modern (6.037) clients.
+        {GSTRING stat line}*
+    `stat_lines` is the requester-dependent tail (the 8 fixed lines for a
+    pre-2.1 client, the `profilevars` lines otherwise); the caller builds it.
     """
     builder = PacketBuilder().write_gchar(PLO.PROFILE)
     builder.write_gstring(account)
     for field in PROFILE_FIELDS:
         builder.write_gstring(profile.get(field, ''))
     builder.write_gstring(online_time)
+    for line in stat_lines:
+        builder.write_gstring(line)
     builder.write_newline()
     return builder.build()

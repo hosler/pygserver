@@ -1716,14 +1716,35 @@ class CombatManager:
                 0 if npc_id is not None else player.id, int(power * 2), x, y, npc_id)
             await cast(player.level.name, packet, exclude={player.id})
 
+        # PlayerClientPackets.cpp:1037: the damage step needs an NPC server;
+        # pygserver's serverside mode is that NPC server (player_login.py).
+        if not getattr(getattr(self.server, 'config', None), 'serverside', True):
+            return
         npc_mgr = getattr(self.server, 'npc_manager', None)
         if npc_mgr is None or not hasattr(npc_mgr, 'get_npcs_on_level'):
             return
         for npc in npc_mgr.get_npcs_on_level(player.level):
             if not getattr(npc, 'visible', True):
                 continue
-            if abs(npc.x - x) < 1.0 and abs(npc.y - y) < 1.0:
-                npc.hearts = max(0.0, npc.hearts - power)
+            # :1044 only character NPCs ("#c#") take part.
+            if not collision.npc_is_character(npc):
+                continue
+            # :1042 findIntersectingNPCsForCollision(point) tests the probe
+            # (static_cast<int16_t>(loc * 16) pixels) against the NPC's
+            # collision box (Level.cpp:3521-3535, NPC.h:573-584): for a
+            # character the 32x32 square at (x+8, y+16); none when NOBLOCK.
+            if collision.rect_contains_point(
+                    collision.npc_collision_rect(npc),
+                    int(x * 16), int(y * 16)):
+                # :1046 subtracts `power * 2` HALF hearts, where `power` is the
+                # wire byte (half hearts); here `power` is hearts (byte / 2),
+                # so that is byte hearts = 2 * power. The following
+                # hurtAndPush (:1047, NPC.cpp:664-709) only takes hearts and
+                # honours the 1.6 s invulnerability for a character NPC that ran
+                # enabledamagereactions (NPC.h:455 defaults it off); pygserver
+                # has no such switch, so for every NPC it reduces to the
+                # washit event below.
+                npc.hearts = min(127.5, max(0.0, npc.hearts - power * 2))
                 if hasattr(npc, 'mark_dirty'):
                     npc.mark_dirty()
                 # A sword gani already fired washit for this swing.

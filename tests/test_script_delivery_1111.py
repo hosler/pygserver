@@ -370,22 +370,24 @@ def first_frame(servermode, client_type=5, account="player", staff=()):
 def test_normal_mode_sends_neither_176_nor_177():
     ids, _ = first_frame("normal")
     assert 176 not in ids and 177 not in ids
-    assert ids[:4] == [194, PLO.STAFFGUILDS, PLO.STATUSLIST, PLO.PLAYERPROPS]
+    assert ids[:5] == [PLO.SIGNATURE, 194, PLO.STAFFGUILDS, PLO.STATUSLIST,
+                       PLO.PLAYERPROPS]
 
 
 @pytest.mark.parametrize("mode, packet_id", [("newworld", 177), ("kingdoms", 176)])
 def test_mode_packet_leads_the_game_login_and_is_exclusive(mode, packet_id):
     ids, all_ids = first_frame(mode)
     other = 176 if packet_id == 177 else 177
-    assert ids[:5] == [packet_id, 194, PLO.STAFFGUILDS, PLO.STATUSLIST,
-                       PLO.PLAYERPROPS]
+    # Player.cpp:751-759: the signature precedes the mode packet.
+    assert ids[:6] == [PLO.SIGNATURE, packet_id, 194, PLO.STAFFGUILDS,
+                       PLO.STATUSLIST, PLO.PLAYERPROPS]
     assert other not in all_ids and all_ids.count(packet_id) == 1
 
 
 def test_mode_packet_also_leads_rc_and_nc_logins():
     ids, _ = first_frame("newworld", client_type=1, account="hosler",
                          staff=("hosler",))
-    assert ids[:3] == [177, 194, PLO.PLAYERPROPS]
+    assert ids[:4] == [PLO.SIGNATURE, 177, 194, PLO.PLAYERPROPS]
     server = make_server(staff=("hosler",))
     server.server_mode = "kingdoms"
     from pygserver.nc import NCManager
@@ -393,7 +395,7 @@ def test_mode_packet_also_leads_rc_and_nc_logins():
     player, trace = make_wire_player(server, 3, False, "hosler")
     player.session.read.return_value = framed_login(3, include_key=False)
     assert asyncio.run(player._handle_login()) is True
-    assert trace[0][1][:2] == [176, PLO.PLAYERPROPS]
+    assert trace[0][1][:3] == [PLO.SIGNATURE, 176, PLO.PLAYERPROPS]
 
 
 # -- fix round: CLASS list (static scan) ---------------------------------------
@@ -1001,4 +1003,4 @@ def test_mode_announcement_follows_the_start_up_mode_not_a_later_option_write():
     restarted.server_mode = "newworld"           # what a start with the option gives
     player, trace = make_wire_player(restarted, 5, False, "player")
     assert asyncio.run(player._handle_login()) is True
-    assert trace[0][1][0] == 177
+    assert trace[0][1][:2] == [PLO.SIGNATURE, 177]

@@ -754,6 +754,121 @@ class ProfileManager:
         profile['online_time'] = self._format_online_time(account.online_time)
         return profile
 
+    # origin/beta4 ServerList.cpp:636-646: (builtin, caption of the default
+    # entry, caption when the bare default name is not at its own position).
+    _DEFAULT_PROFILE_VARS = (
+        ('playerkills', 'Kills:', 'kills'),
+        ('playerdeaths', 'Deaths:', 'deaths'),
+        ('playerfullhearts', 'Maxpower', 'maxpower'),
+        ('playerrating', 'Rating', 'rating'),
+        ('playerap', 'Alignment', 'alignment'),
+        ('playerrupees', 'Gralat', 'gelat'),
+        ('playerswordpower', 'Swordpower', 'swordpower'),
+        ('canspin', 'Spin', 'spin'),
+    )
+    # ServerList.cpp:650-652: the client overflows past 26 variables.
+    PROFILE_VARS_MAX = 26
+
+    @staticmethod
+    def _csv_field(text: str, index: int) -> str:
+        """The index-th field of a CSV string, "" when absent (fromCSV)."""
+        # fromCSV (StringUtils.h:1046-1135) unescapes `\\` and `""` and skips
+        # text after a closing quote; protocol/builders/admin.py ports it.
+        from .protocol.builders.admin import from_csv
+        row = from_csv(text)
+        return row[index] if 0 <= index < len(row) else ''
+
+    def _profile_value(self, target: 'Player', name: str) -> str:
+        """ServerList.cpp:657-714 collectValue for one built-in or flag."""
+        from .protocol.constants import PLSTATUS
+        if name == 'playerkills':
+            return str(int(target.kills))
+        if name == 'playerdeaths':
+            return str(int(target.deaths))
+        if name == 'playerfullhearts':
+            return str(int(target.max_hearts))
+        if name == 'playerrating':
+            return f"{int(target.elo_rating)}/{int(target.elo_deviation)}"
+        if name == 'playerap':
+            return str(int(target.ap))
+        if name == 'playerrupees':
+            return str(int(target.rupees))
+        if name == 'playerswordpower':
+            return str(int(target.sword_power))
+        if name == 'canspin':
+            has = getattr(target, 'client_status', 0) & PLSTATUS.HASSPIN
+            return 'true' if has else 'false'
+        if name == 'playerhearts':
+            halves = int(round(target.hearts * 2))
+            return f"{halves // 2}{'.5' if halves % 2 == 1 else ''}"
+        if name == 'playerdarts':
+            return str(int(target.arrows))
+        if name == 'playerbombs':
+            return str(int(target.bombs))
+        if name == 'playermp':
+            return str(int(target.mp))
+        if name == 'playershieldpower':
+            return str(int(target.shield_power))
+        if name == 'playerglovepower':
+            return str(int(target.glove_power))
+        sep = name.find('{')
+        flag = target.flags.get(name if sep < 0 else name[:sep])
+        if flag is None:
+            return ''
+        if sep < 0:
+            return str(flag)
+        end = name.find('}', sep)
+        digits = name[sep + 1:end if end >= 0 else None].strip()
+        return self._csv_field(str(flag), int(digits)) if digits.isdigit() else ''
+
+    def stat_lines(self, target: 'Player', requester_is_client: bool,
+                   requester_version: float) -> List[str]:
+        """The requester-dependent tail of PLO_PROFILE (ServerList.cpp:598-755).
+
+        A game client below 2.1 gets the 8 fixed lines; everyone else the
+        `profilevars` option lines (default list when the option is unset).
+        """
+        from .protocol.constants import PLSTATUS
+        if requester_is_client and requester_version < 2.1:
+            return [
+                str(int(target.kills)),
+                str(int(target.deaths)),
+                str(int(target.max_hearts)),
+                f"{int(target.elo_rating)}/{int(target.elo_deviation)}",
+                str(int(target.ap)),
+                str(int(target.rupees)),
+                str(int(target.sword_power)),
+                'true' if getattr(target, 'client_status', 0)
+                & PLSTATUS.HASSPIN else 'false',
+            ]
+        lines: List[str] = []
+        count = 0
+        for entry in self.server.config.profilevars:
+            count += 1
+            if count == self.PROFILE_VARS_MAX + 1:
+                break
+            if '=' in entry:
+                caption, _, value = entry.partition('=')
+                caption, value = caption.strip(), value.strip()
+                if not caption:
+                    caption = ' '
+            else:
+                value = entry.strip()
+                caption = ''
+                position = len(self._DEFAULT_PROFILE_VARS)
+                for position, (builtin, _, converted) in enumerate(
+                        self._DEFAULT_PROFILE_VARS):
+                    if value == builtin:
+                        caption = '' if position == count - 1 else converted
+                        break
+                else:
+                    position = len(self._DEFAULT_PROFILE_VARS)
+                if position >= 8 and not caption:
+                    caption = value
+            text = self._profile_value(target, value)
+            lines.append(f"{caption}={text}" if caption else text)
+        return lines
+
     @staticmethod
     def _format_online_time(seconds: int) -> str:
         """Format seconds as "H hrs M mins S secs" (ServerList.cpp msgSVI_PROFILE)."""

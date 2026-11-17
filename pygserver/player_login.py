@@ -26,7 +26,7 @@ from typing import TYPE_CHECKING
 from reborn_protocol.constants import PLTYPE
 
 from .protocol.constants import PLPROP
-from .handlers.versions import client_version
+from .handlers.versions import client_version, version_for_token
 from .spar_rating import decay_deviation
 from .protocol.builders.world import map_option_text
 from .protocol.packets import (
@@ -37,6 +37,7 @@ from .protocol.packets import (
     build_has_npc_server,
     build_player_props,
     build_serverlist_connected,
+    build_signature,
     build_rc_chat,
     build_rc_max_upload_filesize,
     build_server_mode,
@@ -120,6 +121,14 @@ class LoginService:
                     f"{raw_client_type!r}")
                 return False
             player.connection_type = ACCEPTED_LOGIN_TYPES[raw_client_type]
+            # Record the game client's version from its login token
+            # (getVersionID, gs2lib IUtil.cpp:271); an unknown token or an
+            # RC/NC login (own token tables, getRCVersionID) leaves it unset
+            # and client_version() falls back on the transport codec.
+            if player.connection_type & PLTYPE.ANYCLIENT:
+                known = version_for_token(protocol)
+                if known is not None:
+                    player.client_version = known
 
             # Store account info
             player.account_name = login.get('username', f'player_{player.id}')
@@ -291,6 +300,9 @@ class LoginService:
         # NC) where the reference puts PLO_SIGNATURE; `normal` sends neither.
         lead = build_server_mode(
             getattr(player.server, 'server_mode', 'normal')) + lead
+        # Player.cpp:751-753: PLO_SIGNATURE (one GCHAR 73) goes out of the
+        # shared login path for client, RC and NC, ahead of the mode packet.
+        lead = build_signature() + lead
 
         await self.send_login_response(lead)
 
@@ -412,9 +424,11 @@ class LoginService:
             await gs2.announce_weapon(player, name)
 
     def _staff_guilds_packet(self) -> bytes:
-        config = self.player.server.config
-        guilds = getattr(config, 'staff_guilds', None) \
-            or getattr(config, 'staff', [])
+        # PlayerClient.cpp:526-529 / PlayerRC.cpp:256-259 (origin/beta4): the
+        # `staffguilds` option split on ",", empty tokens dropped, each trimmed.
+        # Never the `staff` account list.
+        option = getattr(self.player.server.config, 'staffguilds', '') or ''
+        guilds = [t.strip() for t in option.split(',') if t]
         return build_staff_guilds(guilds)
 
     async def send_rc_login_sequence(self):

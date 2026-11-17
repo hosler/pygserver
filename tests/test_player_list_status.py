@@ -69,7 +69,14 @@ def real_login_stream(client_type, account="someone", staff=(), version=None):
     server.config.playerlisticons = ["A", "B"]
     player = make_login_player(server, 2, account, client_type)
     if version is not None:
-        player.client_version = version
+        # The login records the version from the version token the client
+        # sends (getVersionID), so the version is chosen through the token
+        # (restated: this used to set player.client_version before login).
+        from pygserver.handlers.versions import CLIENT_VERSION_TOKENS
+        from tests.test_player_facade import login_frame
+        token = next(t for t, v in CLIENT_VERSION_TOKENS.items() if v == version)
+        player.session.read = AsyncMock(return_value=login_frame(
+            username=account, client_type=client_type, protocol=token))
     login = player.login_service
     login.send_login_response = type(login).send_login_response.__get__(login)
     stream = []

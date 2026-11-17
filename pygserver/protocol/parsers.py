@@ -219,6 +219,24 @@ def parse_player_props(data: bytes, start_pos: int = 0,
 # Packet Parsers (Additional)
 # =============================================================================
 
+def read_level_warp_axis(reader: PacketReader) -> float:
+    """One X or Y byte of PLI_LEVELWARP/LEVELWARPMOD, in tiles.
+
+    msgPLI_LEVELWARP (origin/beta4 server/src/player/packets/
+    PlayerClientPackets.cpp:59) reads `static_cast<int16_t>(readGChar() * 8)`
+    local pixels. gs2lib's readGChar returns a signed `char` of `byte - 32`
+    (CString.cpp:1824-1829), so the half-tile count is that value wrapped into
+    -128..127 (bytes 0xA0..0xFF and below 0x20 are negative), a pixel value
+    of -1024..1016, i.e. -64..63.5 tiles. The C# client sends
+    floor(2 * tile) + 0x20 as one byte (FourPlay TClient.cpp:1215-1233), the
+    same half tiles.
+    """
+    half = (reader.read_byte() - 32) & 0xFF
+    if half > 127:
+        half -= 256
+    return half * 8 / 16.0
+
+
 def parse_level_warp(data: bytes) -> Tuple[float, float, str]:
     """Parse PLI_LEVELWARP packet.
 
@@ -226,8 +244,8 @@ def parse_level_warp(data: bytes) -> Tuple[float, float, str]:
         Tuple of (x, y, level_name)
     """
     reader = PacketReader(data)
-    x = reader.read_gchar() / 2.0
-    y = reader.read_gchar() / 2.0
+    x = read_level_warp_axis(reader)
+    y = read_level_warp_axis(reader)
     level_name = reader.remaining().decode('latin-1', errors='replace').strip()
     return x, y, level_name
 

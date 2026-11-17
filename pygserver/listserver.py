@@ -20,7 +20,6 @@ from reborn_protocol import (
 )
 from reborn_protocol.props import PLAYER_PROPS, encode_value
 
-from .attachments import absolute_position
 
 if TYPE_CHECKING:
     from .server import GameServer
@@ -601,8 +600,12 @@ class ServerListClient:
             (PLPROP.ACCOUNTNAME, player.account_name),
             (PLPROP.NICKNAME, player.nickname),
             (PLPROP.CURLEVEL, player.level.name if player.level else ""),
-            (PLPROP.X, absolute_position(player)[0]),
-            (PLPROP.Y, absolute_position(player)[1]),
+            # ServerList.cpp:344-345: the player's own X and Y props, which the
+            # reference stores as level-local pixels (PlayerProps.cpp:466-502).
+            # player.x / player.y are those level-local axes; absolute_position
+            # would add the attached NPC's position on top.
+            (PLPROP.X, player.x),
+            (PLPROP.Y, player.y),
             (PLPROP.ALIGNMENT, getattr(player, 'ap', 0)),
             (PLPROP.IPADDR, 0),  # 0, not the real IP, for privacy
         ):

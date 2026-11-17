@@ -190,8 +190,10 @@ def build_chat(player_id: int, message: str) -> bytes:
 def build_warp(x: float, y: float, level_name: str = "") -> bytes:
     """Build PLO_PLAYERWARP packet."""
     builder = PacketBuilder().write_gchar(PLO.PLAYERWARP)
-    builder.write_gchar(int(x * 2))
-    builder.write_gchar(int(y * 2))
+    # PlayerClient.cpp:1273: the X and Y props' serialize(), i.e. the shared
+    # one-byte tile coordinate (negative tiles included).
+    builder.write_tile_coordinate(x)
+    builder.write_tile_coordinate(y)
     if level_name:
         builder.write_string(level_name)
     builder.write_byte(ord('\n'))
@@ -208,9 +210,12 @@ def build_warp2(x: float, y: float, level_name: str, gmap_x: int = 0,
     is self-terminating and must come last in its frame.
     """
     builder = PacketBuilder().write_gchar(PLO.PLAYERWARP2)
-    builder.write_gchar(int(x * 2))
-    builder.write_gchar(int(y * 2))
-    builder.write_gchar(int(z))
+    # PlayerClient.cpp:1262: X, Y and Z are the props' serialize() output.
+    # X/Y are the shared tile coordinate; Z is PropertyTileCoordinateZ
+    # (PropertySerializers.cpp:530-535): tiles + 50 as a GCHAR.
+    builder.write_tile_coordinate(x)
+    builder.write_tile_coordinate(y)
+    builder.write_gchar(max(-50, min(170, int(z))) + 50)
     builder.write_gchar(gmap_x)
     builder.write_gchar(gmap_y)
     builder.write_string(level_name)
@@ -298,8 +303,11 @@ def build_level_sign(x: int, y: int, text: str) -> bytes:
 # =============================================================================
 
 def build_signature() -> bytes:
-    """Build PLO_SIGNATURE packet."""
+    """Build PLO_SIGNATURE packet: id 25 and the single GCHAR 73
+    (origin/beta4 Player.cpp:751-753; 73 tells the client that more than
+    eight players will be playing)."""
     builder = PacketBuilder().write_gchar(PLO.SIGNATURE)
+    builder.write_gchar(73)
     builder.write_newline()
     return builder.build()
 
@@ -333,10 +341,26 @@ def build_has_npc_server(has: bool = True) -> bytes:
     return PacketBuilder().write_gchar(PLO.HASNPCSERVER).write_newline().build()
 
 
+def to_csv_words(words: List[str]) -> str:
+    """string::toCSV (origin/beta4 utilities/StringUtils.h:975-1015).
+
+    A word is quoted when it holds `"`, `,`, `\\` or a char outside 32-126;
+    a quoted word doubles its `"` and `\\`; words are comma-joined with no
+    trailing comma.
+    """
+    out = []
+    for word in words:
+        if any(ord(c) < 32 or ord(c) > 126 or c in '",\\' for c in word):
+            word = '"' + ''.join(c * 2 if c in '"\\' else c for c in word) + '"'
+        out.append(word)
+    return ','.join(out)
+
+
 def build_staff_guilds(guilds: List[str]) -> bytes:
-    """Build PLO_STAFFGUILDS packet."""
+    """Build PLO_STAFFGUILDS packet (PlayerClient.cpp:526-529,
+    PlayerRC.cpp:256-259): the guild names as a toCSV body."""
     builder = PacketBuilder().write_gchar(PLO.STAFFGUILDS)
-    builder.write_string(','.join(guilds))
+    builder.write_string(to_csv_words(guilds))
     builder.write_newline()
     return builder.build()
 

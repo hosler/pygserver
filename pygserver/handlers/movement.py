@@ -10,6 +10,7 @@ from ..audience import SEND_TO_ALL_PROPS
 from ..link_sign_touch import run_touches, touches_for_props
 from ..protocol.colors import normalize_colors
 from ..protocol.constants import PLI, PLPROP
+from ..protocol.parsers import read_level_warp_axis
 from ..protocol.packets import (
     PacketReader,
     build_other_player_props,
@@ -60,8 +61,8 @@ class MovementHandlers:
     def _read_warp(reader: PacketReader):
         """x and y in half tiles, then the level name (the rest), as
         msgPLI_LEVELWARP reads them (PlayerClientPackets.cpp:59-60)."""
-        x = reader.read_gchar() / 2.0
-        y = reader.read_gchar() / 2.0
+        x = read_level_warp_axis(reader)
+        y = read_level_warp_axis(reader)
         level_name = reader.remaining().decode('latin-1', errors='replace').strip()
         return x, y, level_name
 

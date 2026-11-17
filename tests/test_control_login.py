@@ -199,7 +199,8 @@ def test_game_login_leads_with_serverlist_connected_then_reset_then_props(
     assert asyncio.run(player._handle_login()) is True
 
     # Literal wire ids: 190 = PLO_SERVERLISTCONNECTED, 194 = PLO_RESETCLIENT.
-    lead = [190, 194] if connected else [194]
+    # PLO_SIGNATURE (25, Player.cpp:751-753) now leads every login frame.
+    lead = [25, 190, 194] if connected else [25, 194]
     first_kind, first = trace[0]
     assert first_kind == "login-frame"
     assert first[:len(lead) + 3] == lead + [
@@ -229,7 +230,9 @@ def test_rc_login_resets_first_then_reports_serverlist(client_type, frame, conne
 
     assert asyncio.run(player._handle_login()) is True
 
-    expected = [194, PLO.SERVERLISTCONNECTED] if connected else [194]
+    # PLO_SIGNATURE (Player.cpp:751-753) leads every login type.
+    expected = ([PLO.SIGNATURE, 194, PLO.SERVERLISTCONNECTED] if connected
+                else [PLO.SIGNATURE, 194])
     assert trace[0][0] == "login-frame"
     assert trace[0][1][:len(expected) + 1] == expected + [PLO.PLAYERPROPS]
     assert flat_ids(trace).count(194) == 1
@@ -247,7 +250,7 @@ def test_nc_login_sends_neither_reset_nor_serverlist_connected(connected):
     assert asyncio.run(player._handle_login()) is True
 
     ids = flat_ids(trace)
-    assert trace[0][1][0] == PLO.PLAYERPROPS
+    assert trace[0][1][:2] == [PLO.SIGNATURE, PLO.PLAYERPROPS]
     assert 194 not in ids
     assert PLO.SERVERLISTCONNECTED not in ids
 
